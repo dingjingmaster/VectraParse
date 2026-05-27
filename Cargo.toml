@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "crates/vectraparse-core",
+  "crates/vectraparse-mime",
+  "crates/vectraparse-parsers",
+  "crates/vectraparse-enhance",
+  "crates/vectraparse-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+vectraparse-core = { path = "crates/vectraparse-core" }
+vectraparse-mime = { path = "crates/vectraparse-mime" }
+vectraparse-parsers = { path = "crates/vectraparse-parsers" }
+vectraparse-enhance = { path = "crates/vectraparse-enhance" }

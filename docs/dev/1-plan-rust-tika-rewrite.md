@@ -62,7 +62,7 @@
 | 步骤 | 修改内容 | 验证方式 | 状态 |
 |------|----------|----------|------|
 | P0-01 | 确认目标平台、musl/Windows/macOS、native 依赖许可、Tika 兼容级别、FFI 消费语言和默认 feature 策略 | 在 Plan/Summary 记录确认项；未确认项保持 feature-gate 默认关闭 | 完成 |
-| P0-02 | 建立 Rust workspace 和 crate 边界：core、mime、parsers、enhance、ffi、测试/bench/fuzz | `cargo metadata`、`cargo check --workspace` | 待开始 |
+| P0-02 | 建立 Rust workspace 和 crate 边界：core、mime、parsers、enhance、ffi、测试/bench/fuzz | `cargo metadata`、`cargo check --workspace` | 完成 |
 | P0-03 | 配置 `rlib`、`staticlib`、`cdylib` 输出、符号命名、版本脚本或导出控制 | `cargo build --release` 后检查 `.a`/`.so` 和导出符号 | 待开始 |
 | P0-04 | 设计 C ABI：opaque handle、options、result buffer、error code、free 函数、version/capabilities API | C 示例编译链接并调用 detect/parse/free；ABI header 审查 | 待开始 |
 | P0-05 | 定义配置模型：启用 parser、资源限制、外部命令、模型路径、服务密钥引用、metadata 输出选项 | 配置反序列化单测；非法配置错误路径单测 | 待开始 |
@@ -177,6 +177,7 @@
 |------|------|------|
 | 2026-05-27 | 创建完整 Plan 和 todo 清单 | 用户要求把调研结论整合为完整计划并列出详细 todo |
 | 2026-05-27 | 完成 P0-01 约束确认 | 按默认策略固定第一阶段执行边界，避免后续任务阻塞 |
+| 2026-05-27 | 完成 P0-02 workspace 骨架 | 建立多 crate 工作区和依赖边界，进入可编译状态 |
 
 ## 10. P0-01 默认确认结果
 
