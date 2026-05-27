@@ -1,4 +1,5 @@
 pub mod config;
+pub mod runtime;
 
 pub const API_VERSION: &str = "0.1.0";
 pub const CAPABILITIES_JSON: &str =
@@ -27,4 +28,22 @@ pub fn parse_json(input: &[u8]) -> String {
         "{{\"mime_type\":\"{mime}\",\"metadata\":{{\"Content-Length\":[\"{}\"]}},\"content\":\"\",\"embedded\":[],\"warnings\":[],\"error\":null}}",
         input.len()
     )
+}
+
+pub fn detect_with_limits_json(input: &[u8], max_input_bytes: usize) -> Result<String, String> {
+    let limits = runtime::ResourceLimits {
+        max_input_bytes,
+        ..runtime::ResourceLimits::default()
+    };
+    runtime::validate_input_size(input.len(), &limits).map_err(|e| format!("{e:?}"))?;
+    Ok(detect_json(input))
+}
+
+pub fn parse_with_limits_json(input: &[u8], max_input_bytes: usize) -> Result<String, String> {
+    let limits = runtime::ResourceLimits {
+        max_input_bytes,
+        ..runtime::ResourceLimits::default()
+    };
+    runtime::validate_input_size(input.len(), &limits).map_err(|e| format!("{e:?}"))?;
+    Ok(parse_json(input))
 }
