@@ -143,16 +143,16 @@
 
 ## 6. 里程碑验收
 
-| 里程碑 | 验收范围 | 出口标准 |
-|--------|----------|----------|
-| M0 基础架构 | workspace、core、FFI、配置、资源限制、测试框架 | `detect`/空 parser 可通过 Rust 和 C ABI 调用，错误路径可释放资源 |
-| M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 |
-| M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 |
-| M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 |
-| M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 |
-| M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 |
-| M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 |
-| M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 |
+| 里程碑 | 验收范围 | 出口标准 | 状态 |
+|--------|----------|----------|------|
+| M0 基础架构 | workspace、core、FFI、配置、资源限制、测试框架 | `detect`/空 parser 可通过 Rust 和 C ABI 调用，错误路径可释放资源 | 完成 |
+| M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 待开始 |
+| M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 待开始 |
+| M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 待开始 |
+| M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 待开始 |
+| M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 待开始 |
+| M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 | 待开始 |
+| M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 | 待开始 |
 
 ## 7. 验证计划
 
@@ -186,6 +186,7 @@
 | 2026-05-27 | 完成 P0-08 provider registry 初版 | 建立 detector/parser 注册、排序、feature 标记和能力查询机制 |
 | 2026-05-27 | 完成 P0-09 golden corpus 骨架 | 建立 manifest、期望结果文件和最小差异比较脚本 |
 | 2026-05-27 | 完成 P0-10 统一验证入口 | 增加 Makefile 验证目标和 README 命令文档，形成最小本地流水线 |
+| 2026-05-27 | 完成里程碑 M0 基础架构 | P0-01 到 P0-10 全部完成，`make pipeline` 通过 |
 
 ## 10. P0-01 默认确认结果
 
