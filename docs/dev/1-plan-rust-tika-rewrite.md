@@ -65,7 +65,7 @@
 | P0-02 | 建立 Rust workspace 和 crate 边界：core、mime、parsers、enhance、ffi、测试/bench/fuzz | `cargo metadata`、`cargo check --workspace` | 完成 |
 | P0-03 | 配置 `rlib`、`staticlib`、`cdylib` 输出、符号命名、版本脚本或导出控制 | `cargo build --release` 后检查 `.a`/`.so` 和导出符号 | 完成 |
 | P0-04 | 设计 C ABI：opaque handle、options、result buffer、error code、free 函数、version/capabilities API | C 示例编译链接并调用 detect/parse/free；ABI header 审查 | 完成 |
-| P0-05 | 定义配置模型：启用 parser、资源限制、外部命令、模型路径、服务密钥引用、metadata 输出选项 | 配置反序列化单测；非法配置错误路径单测 | 待开始 |
+| P0-05 | 定义配置模型：启用 parser、资源限制、外部命令、模型路径、服务密钥引用、metadata 输出选项 | 配置反序列化单测；非法配置错误路径单测 | 完成 |
 | P0-06 | 定义错误、告警和资源限制模型，保证 panic 不跨 FFI 边界 | 单测覆盖错误分类、panic catch、资源释放 | 待开始 |
 | P0-07 | 定义 metadata schema 与多值存储，映射 Tika `AccessPermissions`、`Office`、`PDF`、`XMP*` 等命名空间 | schema 对照测试；JSON round-trip 测试 | 待开始 |
 | P0-08 | 建立 parser/detector registry，替代 Java ServiceLoader，支持排序、feature 裁剪和能力查询 | registry 单测；provider 列表快照测试 | 待开始 |
@@ -180,6 +180,7 @@
 | 2026-05-27 | 完成 P0-02 workspace 骨架 | 建立多 crate 工作区和依赖边界，进入可编译状态 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
+| 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
 
 ## 10. P0-01 默认确认结果
 

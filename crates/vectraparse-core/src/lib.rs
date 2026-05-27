@@ -1,3 +1,5 @@
+pub mod config;
+
 pub const API_VERSION: &str = "0.1.0";
 pub const CAPABILITIES_JSON: &str =
     "{\"detect\":true,\"parse\":true,\"parse_file\":false,\"enhance\":false}";
