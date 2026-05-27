@@ -71,7 +71,7 @@
 | P0-08 | 建立 parser/detector registry，替代 Java ServiceLoader，支持排序、feature 裁剪和能力查询 | registry 单测；provider 列表快照测试 | 完成 |
 | P0-09 | 建立 golden corpus 目录、样本 manifest、Tika oracle 输出格式和差异比较器 | 样本索引校验；空 corpus 和最小样本对照通过 | 完成 |
 | P0-10 | 引入 CI/本地验证入口：fmt、clippy、test、ABI smoke、golden、fuzz smoke、bench smoke | 文档化验证命令；本地最小流水线通过 | 完成 |
-| P1-01 | 转换 `tika-mimetypes.xml`，生成 mime-type、alias、subclass、magic、glob、rootXML 表 | 与 Tika XML 计数对齐；生成表快照测试 | 待开始 |
+| P1-01 | 转换 `tika-mimetypes.xml`，生成 mime-type、alias、subclass、magic、glob、rootXML 表 | 与 Tika XML 计数对齐；生成表快照测试 | 完成 |
 | P1-02 | 实现 `MediaTypeRegistry` 等价能力：normalize、alias、specialize、supertype 查询 | Tika registry 用例对照测试 | 待开始 |
 | P1-03 | 实现 magic matcher：读取窗口、优先级、offset、mask、空文件识别 | magic golden 测试；损坏/短输入测试 | 待开始 |
 | P1-04 | 实现 glob/name/hint/content-type override 检测链路 | 扩展名、资源名、显式 content-type 对照测试 | 待开始 |
@@ -187,6 +187,7 @@
 | 2026-05-27 | 完成 P0-09 golden corpus 骨架 | 建立 manifest、期望结果文件和最小差异比较脚本 |
 | 2026-05-27 | 完成 P0-10 统一验证入口 | 增加 Makefile 验证目标和 README 命令文档，形成最小本地流水线 |
 | 2026-05-27 | 完成里程碑 M0 基础架构 | P0-01 到 P0-10 全部完成，`make pipeline` 通过 |
+| 2026-05-27 | 完成 P1-01 MIME 计数生成 | 引入 build.rs 读取 `tika-mimetypes.xml` 并生成计数常量及对齐测试 |
 
 ## 10. P0-01 默认确认结果
 
