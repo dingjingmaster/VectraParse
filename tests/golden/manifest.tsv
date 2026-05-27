@@ -1,0 +1,2 @@
+# id	file	media_type	expected_json
+minimal_pdf	tests/fixtures/minimal.pdf	application/pdf	tests/golden/expected/minimal_pdf.detect.json
