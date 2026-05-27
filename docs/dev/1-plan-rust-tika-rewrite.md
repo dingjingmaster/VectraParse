@@ -61,7 +61,7 @@
 
 | 步骤 | 修改内容 | 验证方式 | 状态 |
 |------|----------|----------|------|
-| P0-01 | 确认目标平台、musl/Windows/macOS、native 依赖许可、Tika 兼容级别、FFI 消费语言和默认 feature 策略 | 在 Plan/Summary 记录确认项；未确认项保持 feature-gate 默认关闭 | 待开始 |
+| P0-01 | 确认目标平台、musl/Windows/macOS、native 依赖许可、Tika 兼容级别、FFI 消费语言和默认 feature 策略 | 在 Plan/Summary 记录确认项；未确认项保持 feature-gate 默认关闭 | 完成 |
 | P0-02 | 建立 Rust workspace 和 crate 边界：core、mime、parsers、enhance、ffi、测试/bench/fuzz | `cargo metadata`、`cargo check --workspace` | 待开始 |
 | P0-03 | 配置 `rlib`、`staticlib`、`cdylib` 输出、符号命名、版本脚本或导出控制 | `cargo build --release` 后检查 `.a`/`.so` 和导出符号 | 待开始 |
 | P0-04 | 设计 C ABI：opaque handle、options、result buffer、error code、free 函数、version/capabilities API | C 示例编译链接并调用 detect/parse/free；ABI header 审查 | 待开始 |
@@ -176,3 +176,12 @@
 | 日期 | 变更 | 原因 |
 |------|------|------|
 | 2026-05-27 | 创建完整 Plan 和 todo 清单 | 用户要求把调研结论整合为完整计划并列出详细 todo |
+| 2026-05-27 | 完成 P0-01 约束确认 | 按默认策略固定第一阶段执行边界，避免后续任务阻塞 |
+
+## 10. P0-01 默认确认结果
+
+- 目标平台：Linux x86_64 + glibc（首发），macOS/Windows 和 musl 作为后续扩展目标，当前保持禁用状态。
+- native 依赖策略：默认 pure Rust；PDFium/Poppler/Tesseract/GDAL 等通过 feature-gate 控制，默认关闭。
+- 兼容策略：MIME 检测与 metadata key 命名优先对齐 Tika；内容文本允许在 whitespace 层面存在可解释差异。
+- FFI 首要消费语言：C（后续再扩展 C++/Go/Python/JNI）。
+- 默认 feature：仅 core/mime/基础 parser；增强能力（翻译、NLP、DL、OCR、外部命令）默认关闭。
