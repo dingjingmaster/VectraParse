@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "vectraparse_ffi"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 vectraparse-core.workspace = true
 vectraparse-mime.workspace = true
