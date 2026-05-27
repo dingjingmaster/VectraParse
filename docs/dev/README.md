@@ -15,4 +15,4 @@
 
 | ID | 日期 | 级别 | 类型 | 文档 | 状态 | 摘要 |
 |----|------|------|------|------|------|------|
-| 1 | 2026-05-27 | L4 | research | [1-research-rust-tika-rewrite.md](1-research-rust-tika-rewrite.md) | 已完成 | 调研 `/data/source/tika` 项目结构，明确 Rust 静态库/动态库重写的完整功能范围、架构边界、风险和 Plan 阶段排序依据。 |
+| 1 | 2026-05-27 | L4 | research | [1-research-rust-tika-rewrite.md](1-research-rust-tika-rewrite.md) | 已完成 | 调研 `/data/source/tika` 项目结构，明确 Rust 静态库/动态库重写的完整功能范围、架构边界、对照遗漏、风险和 Plan 阶段排序依据。 |
