@@ -1,4 +1,5 @@
 pub mod config;
+pub mod metadata;
 pub mod runtime;
 
 pub const API_VERSION: &str = "0.1.0";

@@ -67,7 +67,7 @@
 | P0-04 | 设计 C ABI：opaque handle、options、result buffer、error code、free 函数、version/capabilities API | C 示例编译链接并调用 detect/parse/free；ABI header 审查 | 完成 |
 | P0-05 | 定义配置模型：启用 parser、资源限制、外部命令、模型路径、服务密钥引用、metadata 输出选项 | 配置反序列化单测；非法配置错误路径单测 | 完成 |
 | P0-06 | 定义错误、告警和资源限制模型，保证 panic 不跨 FFI 边界 | 单测覆盖错误分类、panic catch、资源释放 | 完成 |
-| P0-07 | 定义 metadata schema 与多值存储，映射 Tika `AccessPermissions`、`Office`、`PDF`、`XMP*` 等命名空间 | schema 对照测试；JSON round-trip 测试 | 待开始 |
+| P0-07 | 定义 metadata schema 与多值存储，映射 Tika `AccessPermissions`、`Office`、`PDF`、`XMP*` 等命名空间 | schema 对照测试；JSON round-trip 测试 | 完成 |
 | P0-08 | 建立 parser/detector registry，替代 Java ServiceLoader，支持排序、feature 裁剪和能力查询 | registry 单测；provider 列表快照测试 | 待开始 |
 | P0-09 | 建立 golden corpus 目录、样本 manifest、Tika oracle 输出格式和差异比较器 | 样本索引校验；空 corpus 和最小样本对照通过 | 待开始 |
 | P0-10 | 引入 CI/本地验证入口：fmt、clippy、test、ABI smoke、golden、fuzz smoke、bench smoke | 文档化验证命令；本地最小流水线通过 | 待开始 |
@@ -182,6 +182,7 @@
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
 | 2026-05-27 | 完成 P0-06 错误与资源限制模型 | 增加 limits/failure/warning 模型并在 FFI 边界加入 panic 捕获 |
+| 2026-05-27 | 完成 P0-07 metadata schema 初版 | 引入多值 metadata 存储和 JSON round-trip，覆盖 AccessPermissions/Office/PDF/XMP 命名空间 |
 
 ## 10. P0-01 默认确认结果
 
