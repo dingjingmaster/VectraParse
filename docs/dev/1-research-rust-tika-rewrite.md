@@ -4,7 +4,7 @@
 > - 文件编号：1
 > - 文档类型：research
 > - 文件路径：docs/dev/1-research-rust-tika-rewrite.md
-> - 文档版本：v1.0.2
+> - 文档版本：v1.0.4
 > - 最后更新：2026-05-27
 > - 关联需求：分析 `/data/source/tika` 项目结构，面向 Rust 静态库和动态库重写内容提取与文件类型提取能力；忽略 `tika-server` 等服务/应用层项目。
 
@@ -74,7 +74,7 @@
 
 | 功能族 | Tika 对应模块/类族 | Rust 侧规划要点 | Plan 排序依据 |
 |--------|---------------------|------------------|---------------|
-| MIME/文件类型识别 | `tika-core/mime`、`DefaultDetector`、`MimeTypes`、ZIP/OLE detector、`tika-java7` FileTypeDetector | 移植 MIME 数据库和 detector 调度；`infer`/`mime_guess` 只能做辅助，不能替代 Tika 的 specialization 规则 | 所有解析入口依赖它，应作为架构基础 |
+| MIME/文件类型识别 | `tika-core/mime`、`DefaultDetector`、`MimeTypes`、`POIFSContainerDetector`、`ZipContainerDetector`、`BPListDetector`、`tika-java7` `TikaFileTypeDetector` | 移植 MIME 数据库和 detector 调度；`infer`/`mime_guess` 只能做辅助，不能替代 Tika 的 specialization 规则 | 所有解析入口依赖它，应作为架构基础 |
 | 高级检测模型与 override | `OverrideDetector`、`ZeroSizeFileDetector`、`NameDetector`、`TypeDetector`、`TrainedModelDetector`、`NNExampleModelDetector` | 规划 content-type override、空文件检测、文件名/显式类型 hint、训练模型检测和神经网络示例模型的 Rust 等价能力 | 影响 MIME 准确率和兼容性，需与基础检测合并设计 |
 | 纯文本、CSV、HTML、XML | `txt`、`csv`、`html`、`xml`、encoding detector | 规划编码检测、文本归一化、结构化文本和正文抽取；可评估 `encoding_rs`/`chardetng`、`csv`、`html2text`、`quick-xml` | 覆盖面广，可作为提取结果模型验证基线 |
 | 文本衍生格式与源码 | `code`、`strings`、`iptc`、`xliff`、`feed`、`dif`、`envi` | 规划源码高亮/语言识别、二进制 strings 提取、IPTC ANPA、XLIFF/XLZ、本地化文本、RSS/Atom feed、DIF、ENVI header 等文本型格式 | 这些格式容易被纯文本兜底吞掉，Plan 中需单独验收 |
@@ -86,22 +86,27 @@
 | 邮件、邮箱与附件 | `mail`、`mbox`、`OutlookPSTParser` | 规划 RFC822/MIME、MBOX、PST/MSG、附件递归和 charset 处理；可评估 `mail-parser` | 与递归嵌入文档共享结果模型 |
 | 图片、音频、视频 metadata | `image`、`jpeg`、`mp3`、`mp4`、`audio`、`video`、`captioning` | 规划 EXIF/XMP/IPTC、音频标签、视频容器 metadata、图片格式特化、图像/视频 captioning、必要时的缩略图/嵌入资源；可评估 `image`、`nom-exif`、`lofty` | metadata 覆盖面广，依赖选择影响发布体积 |
 | OCR 与外部解析器 | `ocr/TesseractOCRParser`、`external/ExternalParser`、PDF OCR 集成 | 规划外部命令/系统库调用策略、超时、沙箱、可选依赖、错误降级和跨平台配置 | 风险高但属于功能范围，Plan 中明确启用条件 |
-| 语言识别、翻译、NLP、NER、医学文本、深度学习 | `tika-langdetect`、`tika-translate`、`tika-nlp`、`tika-dl`、`ner`、`sentiment`、`recognition`、`ctakes` | 规划为内容增强层，定义语言识别、翻译服务、NER、情感分析、对象识别、医学文本 cTAKES、模型资源、可选依赖和失败降级 | 与核心提取解耦，但纳入总体库能力 |
+| 语言识别、翻译、NLP、NER、医学文本、深度学习 | `language`、`tika-langdetect`、`tika-translate`、`tika-nlp`、`tika-dl`、`ner`、`sentiment`、`recognition`、`ctakes` | 规划为内容增强层，定义语言识别、翻译服务、NER、情感分析、对象识别、医学文本 cTAKES、模型资源、可选依赖和失败降级 | 与核心提取解耦，但纳入总体库能力 |
 | 数据库、表格与专业数据格式 | `jdbc`、`dbf`、`isatab`、`gdal`、`netcdf`、`grib`、`hdf`、`mat`、`sas`、`dwg`、`geoinfo`、`geo`、`pot`、`prt` | 规划 SQLite/JDBC、DBF、ISA-Tab、GDAL、NetCDF、GRIB、HDF、MAT、SAS、DWG、地理信息、地理主题、Pooled Time Series、PRT 等 metadata/文本提取 | 依赖和格式复杂度高，需要独立验收 |
 | 加密、签名与安全相关格式 | `crypto/Pkcs7Parser`、`crypto/TSDParser`、加密 PDF/Office、`PasswordProvider` | 规划 PKCS#7、timestamp、密码/加密文档处理、权限 metadata 和错误降级 | 涉及安全、合规和错误模型，不能只按普通 parser 处理 |
 | Java/二进制与可执行文件 | `asm/ClassParser`、`executable/ExecutableParser`、`strings` | 规划 Java class、ELF/PE、Mach-O 或平台可执行文件 metadata、二进制 strings 提取 | 与安全扫描和文件类型识别关联强 |
 | 字体格式 | `font/AdobeFontMetricParser`、`font/TrueTypeParser` | 规划 AFM、TTF/OTF 等字体 metadata 和命名表提取 | 单独格式族，当前不应被图片/文档大类覆盖 |
 | XMP 与序列化输出 | `tika-xmp`、`tika-serialization` | 规划多值 metadata、XMP 映射、JSON/结构化输出、C ABI 内存释放约定 | 直接影响动态库/静态库对外使用体验 |
 | 内容处理器与抽取基础设施 | `sax`、`sax/xpath`、`extractor`、`embedder`、`parser/digest`、`parser/multiple`、`fork`、`NetworkParser` | 规划正文/HTML/XML 输出、链接/电话/标准号抽取、XPath 过滤、ContainerExtractor、Embedder、digest/hash、fallback/supplementing parser、fork 隔离、网络解析器等运行时基础能力 | 这些不是单一格式 parser，但决定 Tika 行为兼容度和库 API 形态 |
+| 核心运行支撑 | `config`、`concurrent`、`exception`、`io`、`utils`、`internal` | 规划 XML 配置加载、ServiceLoader 等插件注册、线程池/并发执行、错误类型体系、`TikaInputStream`/临时资源/mark-reset 语义、XML 安全工具、内部 parser 工具类 | 这些不是用户可见格式能力，但决定库稳定性、安全边界和行为一致性 |
 
 ### 5.1 与 Tika 对照后的当前遗漏
 
-- Parser 目录仍需显式跟踪：`apple`、`asm`、`captioning`、`chm`、`code`、`crypto`、`ctakes`、`dbf`、`dif`、`envi`、`executable`、`feed`、`font`、`hwp`、`isatab`、`jdbc`、`journal`、`multiple`、`pot`、`prt`、`rtf`、`strings`、`wordperfect`、`xliff`。这些在 v1.0.1 中多被隐含在大类里，Plan 阶段容易漏掉。
-- SPI 注册 parser 中未逐项落表的能力：AppleSingle/PList、Java class、PKCS#7/TSD、DWG、ENVI、executable、feed、font、HWP、IPTC ANPA、MBOX/PST、EMF/WMF、MS owner file、旧 Excel、Word 2006 XML、SpreadsheetML、NetCDF/HDF/GRIB/MAT/SAS、RTF、WordPerfect/Quattro Pro、DIF、CHM、source code、SQLite、ISA-Tab、Grobid/Journal、ICNS、XLIFF/XLZ。
+- Parser 目录仍需显式跟踪：`apple`、`asm`、`captioning`、`chm`、`code`、`crypto`、`ctakes`、`dbf`、`dif`、`envi`、`executable`、`feed`、`font`、`hwp`、`internal`、`isatab`、`jdbc`、`journal`、`multiple`、`pot`、`prt`、`rtf`、`strings`、`utils`、`wordperfect`、`xliff`。这些在 v1.0.1/v1.0.2 中多被隐含在大类里，Plan 阶段容易漏掉。
+- SPI 注册 parser 中未逐项落表的能力：AppleSingle/PList、Java class、PKCS#7/TSD、MIDI、DWG、ENVI、executable、feed、AFM/TrueType font、HWP、BPG/PSD/WebP/HEIF/ICNS、IPTC ANPA、iWork、MBOX/PST、EMF/WMF、MS owner file、旧 Excel、Word 2006 XML、WordML、SpreadsheetML、MP3/MP4/FLV、NetCDF/HDF/GRIB/MAT/SAS、RTF、WordPerfect/Quattro Pro、DIF、CHM、source code、Pooled Time Series、SQLite、ISA-Tab、Grobid/Journal、GeographicInformation、CompositeExternalParser、XLIFF/XLZ。
+- SPI 类名级追踪清单：`AdobeFontMetricParser`、`AppleSingleFileParser`、`AudioParser`、`BPGParser`、`ChmParser`、`ClassParser`、`CompositeExternalParser`、`CompressorParser`、`DBFParser`、`DIFParser`、`DWGParser`、`DcXMLParser`、`EMFParser`、`EnviHeaderParser`、`EpubParser`、`ExecutableParser`、`FLVParser`、`FeedParser`、`FictionBookParser`、`GDALParser`、`GeoParser`、`GeographicInformationParser`、`GribParser`、`HDFParser`、`HeifParser`、`HtmlParser`、`HwpV5Parser`、`ICNSParser`、`ISArchiveParser`、`IWorkPackageParser`、`ImageParser`、`IptcAnpaParser`、`JackcessParser`、`JournalParser`、`JpegParser`、`MP4Parser`、`MSOwnerFileParser`、`MatParser`、`MboxParser`、`MidiParser`、`Mp3Parser`、`NetCDFParser`、`OOXMLParser`、`OfficeParser`、`OldExcelParser`、`OneNoteParser`、`OpenDocumentParser`、`OutlookPSTParser`、`PDFParser`、`PListParser`、`PSDParser`、`PackageParser`、`Pkcs7Parser`、`PooledTimeSeriesParser`、`QuattroProParser`、`RFC822Parser`、`RTFParser`、`RarParser`、`SAS7BDATParser`、`SQLite3Parser`、`SourceCodeParser`、`SpreadsheetMLParser`、`TNEFParser`、`TSDParser`、`TesseractOCRParser`、`TextAndCSVParser`、`TiffParser`、`TrueTypeParser`、`WMFParser`、`WebPParser`、`Word2006MLParser`、`WordMLParser`、`WordPerfectParser`、`XLIFF12Parser`、`XLZParser`。这些功能已在上表覆盖，但 Plan 阶段应保留类名级映射，便于逐项对齐 Tika SPI。
 - 非 SPI 但和 Tika 功能面相关的 parser/增强能力：captioning TensorFlow REST、object recognition、cTAKES、NER 多后端、sentiment、strings/Latin1 strings、PDF preflight、RTF object data、fallback/supplementing parser、digest parser、external parser XML 配置。
-- Core 层遗漏：`TrainedModelDetector`/`NNExampleModelDetector`、`LanguageIdentifier` n-gram 资源、`PasswordProvider`、`ContainerExtractor`/`ParserContainerExtractor`、`Embedder`/`ExternalEmbedder`、`LinkContentHandler`、`PhoneExtractingContentHandler`、`StandardsExtractingContentHandler`、`XMPContentHandler`、`XPathParser`、`fork` 隔离能力和 `NetworkParser`。
+- Core 层遗漏：`TrainedModelDetector`/`NNExampleModelDetector`、`LanguageIdentifier` n-gram 资源、`LanguageDetector` API、`PasswordProvider`、`ContainerExtractor`/`ParserContainerExtractor`、`Embedder`/`ExternalEmbedder`、`LinkContentHandler`、`PhoneExtractingContentHandler`、`StandardsExtractingContentHandler`、`XMPContentHandler`、`XPathParser`、`fork` 隔离能力、`NetworkParser`、`TikaInputStream`/`TemporaryResources`、`XMLReaderUtils`、异常类型体系和并发执行器。
+- Service provider 需逐项映射：detector provider 包括 `OverrideDetector`、`POIFSContainerDetector`、`ZipContainerDetector`、`BPListDetector`；encoding provider 包括 `HtmlEncodingDetector`、`UniversalEncodingDetector`、`Icu4jEncodingDetector`；Java NIO 文件类型 provider 包括 `TikaFileTypeDetector`。
+- 语言与翻译 provider 需显式纳入：`OptimaizeLangDetector`、`TextLangDetector`、`Lingo24LangDetector`、`MicrosoftTranslator`、`GoogleTranslator`、`Lingo24Translator`、`CachedTranslator`、`JoshuaNetworkTranslator`、`MosesTranslator`、`YandexTranslator`；其中服务型 provider 需要网络、密钥、缓存和错误降级设计。
 - 元数据命名空间遗漏：`AccessPermissions`、`Database`、`Font`、`Geographic`、`IPTC`、`Office`、`OfficeOpenXML*`、`PDF`、`PagedText`、`Photoshop`、`QuattroPro`、`RTFMetadata`、`TIFF`、`WordPerfect`、`XMP*`、`XMPDM` 等 key 集合需要作为 Rust metadata schema 对照输入。
-- 验证资产遗漏：`tika-eval`、`tika-fuzzing`、各模块测试资源不属于库运行时功能，但应进入 Plan 的 golden corpus、差异测试、fuzzing 和压力测试规划。
+- 包装与发布形态需记录：`tika-bundle` 是 Java/OSGi 打包层，不是提取功能本身；Rust 侧对应问题是 `staticlib`/`cdylib` 的符号、头文件、feature 组合、许可证清单和可选依赖发布包。
+- 验证资产遗漏：`tika-eval`、`tika-fuzzing`、各模块测试资源、`tika-core` 测试 SPI `MockParser`、`tika-eval` Lucene TokenFilterFactory `AlphaIdeographFilterFactory`/`CJKBigramAwareLengthFilterFactory`/`URLEmailNormalizingFilterFactory`、`tika-fuzzing` Transformer `GeneralTransformer` 不属于库运行时提取功能，但应进入 Plan 的 golden corpus、差异测试、fuzzing、分词/质量评估和压力测试规划。
 
 ## 6. 候选方案
 
