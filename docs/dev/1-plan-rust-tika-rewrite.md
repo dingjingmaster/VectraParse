@@ -114,7 +114,7 @@
 | P5-04 | 实现图片 metadata：通用 image、JPEG、TIFF、BPG、PSD、WebP、HEIF、ICNS、EXIF/XMP/IPTC | 图片格式 golden；损坏图片 fuzz smoke | 完成 |
 | P5-05 | 实现音频 metadata：Audio、MP3、MIDI | mp3/id3/midi golden；坏 tag 测试 | 完成 |
 | P5-06 | 实现视频 metadata：MP4、FLV 和通用 video | mp4/flv golden；大文件读取窗口测试 | 完成 |
-| P5-07 | 实现 captioning 和对象识别接入点 | 模型/服务禁用、超时、失败降级测试 | 待开始 |
+| P5-07 | 实现 captioning 和对象识别接入点 | 模型/服务禁用、超时、失败降级测试 | 完成 |
 | P6-01 | 实现数据库/表格：DBF、SQLite、Access、JDBC 等价边界 | dbf/sqlite/access golden；连接型能力默认禁用审查 | 待开始 |
 | P6-02 | 实现科学数据：NetCDF、HDF、GRIB、MAT、SAS | 每格式 metadata/text golden；native 依赖 feature 测试 | 待开始 |
 | P6-03 | 实现地理/工程数据：GDAL、DWG、Geo、GeographicInformation | 样本 golden；GDAL/native 依赖隔离测试 | 待开始 |
@@ -149,7 +149,7 @@
 | M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 完成 |
 | M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 完成 |
 | M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 完成 |
-| M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 待开始 |
+| M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 完成 |
 | M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 待开始 |
 | M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 | 待开始 |
 | M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 | 待开始 |
@@ -184,6 +184,7 @@
 | 2026-05-28 | 完成 P5-04 图片 metadata parser | 覆盖 JPEG/TIFF/BPG/PSD/WebP/HEIF/ICNS 和 EXIF/XMP/IPTC 标记提取 |
 | 2026-05-28 | 完成 P5-05 音频 metadata parser | 新增 Audio/MP3/MIDI 提取与坏 MP3 tag 告警测试 |
 | 2026-05-28 | 完成 P5-06 视频 metadata parser | 覆盖 MP4/FLV 识别并增加大文件读取窗口告警测试 |
+| 2026-05-28 | 完成 P5-07 captioning/recognition 接入点 | 增加禁用、超时、失败降级分支及测试，M4 里程碑达成 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
