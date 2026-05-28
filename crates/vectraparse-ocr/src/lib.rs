@@ -1,14 +1,21 @@
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 
 use image::imageops::FilterType;
 use image::DynamicImage;
 use tract_onnx::prelude::*;
 
+const EMBED_DET_ONNX: &[u8] = include_bytes!("../../../data/det.onnx");
+const EMBED_REC_ZH_ONNX: &[u8] = include_bytes!("../../../data/chinese/rec.onnx");
+const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx");
+const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
+const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
+
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
-    pub det_model_path: String,
-    pub rec_model_path: String,
+    pub det_model_path: Option<String>,
+    pub rec_model_path: Option<String>,
     pub rec_dict_path: Option<String>,
     pub rec_img_h: usize,
     pub rec_img_w: usize,
@@ -36,28 +43,16 @@ pub struct TractOcrEngine {
 
 impl TractOcrEngine {
     pub fn load(cfg: &OcrConfig) -> TractResult<Self> {
-        let det = tract_onnx::onnx()
-            .model_for_path(Path::new(&cfg.det_model_path))?
-            .into_optimized()?
-            .into_runnable()?;
-        let rec = tract_onnx::onnx()
-            .model_for_path(Path::new(&cfg.rec_model_path))?
-            .into_optimized()?
-            .into_runnable()?;
+        let det = load_model(cfg.det_model_path.as_deref(), EMBED_DET_ONNX)?;
+        let rec = load_model(cfg.rec_model_path.as_deref(), EMBED_REC_ZH_ONNX)?;
         let rec_alt = cfg
             .rec_alt_model_path
             .as_deref()
             .and_then(|p| {
-                tract_onnx::onnx()
-                    .model_for_path(Path::new(p))
-                    .ok()?
-                    .into_optimized()
-                    .ok()?
-                    .into_runnable()
-                    .ok()
+                load_model(Some(p), EMBED_REC_EN_ONNX).ok()
             });
-        let alphabet = load_dict(cfg.rec_dict_path.as_deref());
-        let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref());
+        let alphabet = load_dict(cfg.rec_dict_path.as_deref(), EMBED_DICT_ZH);
+        let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref(), EMBED_DICT_EN);
         Ok(Self {
             det,
             rec,
@@ -130,8 +125,8 @@ impl TractOcrEngine {
 impl Default for OcrConfig {
     fn default() -> Self {
         Self {
-            det_model_path: "data/ch_PP-OCRv4_det.onnx".to_string(),
-            rec_model_path: "data/ch_PP-OCRv4_rec.onnx".to_string(),
+            det_model_path: None,
+            rec_model_path: None,
             rec_dict_path: None,
             rec_img_h: 48,
             rec_img_w: 320,
@@ -142,6 +137,16 @@ impl Default for OcrConfig {
             det_min_box_area: 20,
         }
     }
+}
+
+fn load_model(path: Option<&str>, embedded: &[u8]) -> TractResult<TypedRunnableModel<TypedModel>> {
+    let model = if let Some(p) = path {
+        tract_onnx::onnx().model_for_path(Path::new(p))?
+    } else {
+        let mut cursor = Cursor::new(embedded);
+        tract_onnx::onnx().model_for_read(&mut cursor)?
+    };
+    model.into_optimized()?.into_runnable()
 }
 
 type BoxRect = (u32, u32, u32, u32);
@@ -170,24 +175,11 @@ impl TractOcrEngine {
     }
 }
 
-fn load_dict(path: Option<&str>) -> Vec<String> {
-    let candidates: Vec<&str> = match path {
-        Some(p) => vec![p],
-        None => vec![
-            "data/chinese/dict.txt",
-            "data/english/dict.txt",
-            "data/ppocr_keys_v1.txt",
-        ],
-    };
-    let mut content_opt = None;
-    for p in candidates {
-        if let Ok(content) = fs::read_to_string(p) {
-            content_opt = Some(content);
-            break;
-        }
-    }
-    let Some(content) = content_opt else {
-        return Vec::new();
+fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
+    let content = if let Some(p) = path {
+        fs::read_to_string(p).unwrap_or_else(|_| embedded.to_string())
+    } else {
+        embedded.to_string()
     };
     content
         .lines()
