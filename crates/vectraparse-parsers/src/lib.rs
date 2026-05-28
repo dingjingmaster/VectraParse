@@ -819,6 +819,39 @@ impl Parser for MsSpecialParser {
     }
 }
 
+pub struct RtfParser;
+impl Parser for RtfParser {
+    fn name(&self) -> &'static str {
+        "RtfParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/rtf" || media_type == "text/rtf"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        if !content.starts_with("{\\rtf") {
+            return None;
+        }
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "RtfParser");
+        let object_count = content.matches("\\object").count() + content.matches("\\objdata").count();
+        metadata.insert("rtf.object_count", object_count.to_string());
+        let embedded_levels = content.matches("\\objdata").count();
+        metadata.insert("rtf.object_depth_hint", embedded_levels.to_string());
+        let plain = strip_rtf_control_words(&content);
+        let mut warnings = Vec::new();
+        if object_count > 32 {
+            warnings.push("rtf-object-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(plain),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -993,6 +1026,28 @@ fn strip_html_tags(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn strip_rtf_control_words(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            while let Some(nc) = chars.peek() {
+                if nc.is_ascii_alphabetic() || nc.is_ascii_digit() || *nc == '-' {
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '{' || ch == '}' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn extract_xml_root(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -1144,7 +1199,7 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        MsSpecialParser, OleLegacyParser, PdfParser, SourceCodeParser, StringsParser,
+        MsSpecialParser, OleLegacyParser, PdfParser, RtfParser, SourceCodeParser, StringsParser,
         TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -1712,6 +1767,25 @@ mod tests {
         assert_eq!(
             pst.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
             Some("pst")
+        );
+    }
+
+    #[test]
+    fn rtf_parser_extracts_text_and_object_metadata() {
+        let p = RtfParser;
+        let out = p
+            .parse(
+                br"{\rtf1\ansi hello {\object\objdata 0102} world}",
+                "application/rtf",
+            )
+            .expect("rtf");
+        assert!(out.content.as_deref().unwrap_or("").contains("hello"));
+        assert_eq!(
+            out.metadata
+                .values("rtf.object_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
         );
     }
 }
