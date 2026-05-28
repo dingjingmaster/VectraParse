@@ -84,7 +84,7 @@
 | P1-11 | 暴露 detect API：内存、文件路径、带 hint 输入、能力查询 | Rust API 和 C ABI detect smoke/golden 测试 | 完成 |
 | P2-01 | 实现输入抽象：内存、文件、流、mark/reset、临时资源、读取上限 | 大文件、短读、临时文件清理、并发读取测试 | 完成 |
 | P2-02 | 实现 parser trait、composite parser、fallback、supplementing、multiple parser 调度 | MIME 到 parser 映射测试；fallback 路径测试 | 完成 |
-| P2-03 | 实现结构化结果：content、metadata、embedded、warnings、errors、timing、parser chain | JSON schema 和 round-trip；嵌入路径快照测试 | 待开始 |
+| P2-03 | 实现结构化结果：content、metadata、embedded、warnings、errors、timing、parser chain | JSON schema 和 round-trip；嵌入路径快照测试 | 完成 |
 | P2-04 | 实现内容处理器：text/html/xml 输出、XPath 过滤、link/phone/standard 抽取、XMP handler | handler 单测；输出字符上限测试 | 待开始 |
 | P2-05 | 实现递归嵌入文档处理：深度、数量、路径、父子 metadata、异常隔离 | 嵌入 Office/zip/mail 样本；递归限制测试 | 待开始 |
 | P2-06 | 实现 `ContainerExtractor`、`ParserContainerExtractor`、`Embedder`、`ExternalEmbedder` 等等价边界 | API 单测；禁用 embedder 时行为测试 | 待开始 |
@@ -201,6 +201,7 @@
 | 2026-05-28 | 完成里程碑 M1 检测闭环 | P1-01 到 P1-11 已完成并通过本地定向测试 |
 | 2026-05-28 | 完成 P2-01 输入抽象初版 | 在 `vectraparse-core` 增加 Memory/File 输入源、读取窗口和读取上限校验 |
 | 2026-05-28 | 完成 P2-02 parser 调度初版 | 在 `vectraparse-parsers` 增加 trait/composite/fallback/supplementing/multiple 调度与测试 |
+| 2026-05-28 | 完成 P2-03 结构化结果初版 | 在 `vectraparse-core` 增加 StructuredResult 模型、JSON round-trip 与 parse/detect 结构化输出 |
 
 ## 10. P0-01 默认确认结果
 
