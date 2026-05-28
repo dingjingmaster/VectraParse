@@ -98,7 +98,7 @@
 | P3-07 | 实现 feed parser：RSS、Atom 等 | feed golden；坏 XML 降级测试 | 完成 |
 | P3-08 | 实现 IPTC ANPA、XLIFF/XLZ、DIF、ENVI header 等文本衍生格式 | 每格式最小 golden；MIME 检测联动测试 | 完成 |
 | P3-09 | 实现 AppleSingle、PList、FictionBook、DcXML 等轻量专用 parser | SPI 类名映射快照；格式样本测试 | 完成 |
-| P4-01 | 实现压缩/包 parser：Package、Compressor、RAR，以及 zip/tar/gzip/bzip2/xz/zstd/7z 策略 | 解压 golden；解压比例/深度/数量限制测试 | 待开始 |
+| P4-01 | 实现压缩/包 parser：Package、Compressor、RAR，以及 zip/tar/gzip/bzip2/xz/zstd/7z 策略 | 解压 golden；解压比例/深度/数量限制测试 | 完成 |
 | P4-02 | 实现 OOXML：docx/xlsx/pptx、关系文件、core props、嵌入文件、旧 Excel XML/WordML/SpreadsheetML | Office golden；嵌入附件和公式/表格样本测试 | 待开始 |
 | P4-03 | 实现 ODF/OpenDocument/OpenOffice parser | odt/ods/odp golden；manifest 和 metadata 测试 | 待开始 |
 | P4-04 | 实现 EPUB parser | EPUB spine/metadata/嵌入资源 golden | 待开始 |
@@ -216,6 +216,7 @@
 | 2026-05-28 | 完成 P3-08 文本衍生格式 parser 初版 | 在 `vectraparse-parsers` 增加 IPTC/XLIFF/DIF/ENVI 最小识别与 derived.format metadata 输出 |
 | 2026-05-28 | 完成 P3-09 轻量专用 parser 初版 | 在 `vectraparse-parsers` 增加 AppleSingle/PList/FictionBook/DcXML profile 识别与测试 |
 | 2026-05-28 | 完成里程碑 M2 基础提取 | P3-01 到 P3-09 全部完成并通过定向测试 |
+| 2026-05-28 | 完成 P4-01 压缩/包 parser 初版 | 在 `vectraparse-parsers` 增加 zip/tar/gzip/bzip2/xz/zstd/7z/rar 识别与基础限制告警 |
 
 ## 10. P0-01 默认确认结果
 
