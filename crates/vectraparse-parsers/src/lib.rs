@@ -3619,4 +3619,54 @@ mod tests {
             .iter()
             .any(|w| w == "json-legacy-compat-applied"));
     }
+
+    #[test]
+    fn extraction_golden_matrix_matches() {
+        let cases = vec![
+            (
+                "text/plain",
+                b"hello world".as_slice(),
+                "TxtParser",
+                true,
+                "encoding",
+            ),
+            (
+                "text/csv",
+                b"a,b\n1,2\n",
+                "TextAndCsvParser",
+                true,
+                "csv.rows",
+            ),
+            (
+                "text/html",
+                b"<html><title>x</title><body>y</body></html>",
+                "HtmlParser",
+                true,
+                "html.title",
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (mime, input, parser_name, expect_content, key) in cases {
+            let out = match parser_name {
+                "TxtParser" => TxtParser.parse(input, mime),
+                "TextAndCsvParser" => TextAndCsvParser.parse(input, mime),
+                _ => HtmlParser.parse(input, mime),
+            }
+            .expect("parse outcome");
+            if expect_content && out.content.as_deref().unwrap_or("").is_empty() {
+                mismatches.push(format!("{parser_name}: content missing"));
+            }
+            if out.metadata.values(key).is_none() {
+                mismatches.push(format!("{parser_name}: metadata key missing {key}"));
+            }
+            if !out.parser_chain.is_empty() {
+                mismatches.push(format!("{parser_name}: parser_chain should be empty at leaf"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "extraction golden mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
 }
