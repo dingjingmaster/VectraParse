@@ -600,6 +600,41 @@ impl Parser for OdfParser {
     }
 }
 
+pub struct EpubParser;
+impl Parser for EpubParser {
+    fn name(&self) -> &'static str {
+        "EpubParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/epub+zip"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "EpubParser");
+        if lower.contains("meta-inf/container.xml") {
+            metadata.insert("epub.container", "true");
+        }
+        if lower.contains("spine") || lower.contains("<itemref") {
+            metadata.insert("epub.spine", "true");
+        }
+        if lower.contains("dc:title") || lower.contains("dc:creator") {
+            metadata.insert("epub.metadata", "true");
+        }
+        let embedded = lower.matches("images/").count()
+            + lower.matches("audio/").count()
+            + lower.matches("video/").count();
+        metadata.insert("epub.embedded_resources", embedded.to_string());
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -924,8 +959,8 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser, SourceCodeParser, StringsParser,
-        TextAndCsvParser, TxtParser, XmlParser,
+        EpubParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
+        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1282,6 +1317,38 @@ mod tests {
         assert_eq!(
             out.metadata
                 .values("odf.meta")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn epub_parser_extracts_spine_metadata_and_embeds() {
+        let p = EpubParser;
+        let out = p
+            .parse(
+                b"PK\x03\x04...META-INF/container.xml...<spine><itemref/></spine>...<dc:title>T</dc:title>...images/a.jpg",
+                "application/epub+zip",
+            )
+            .expect("epub");
+        assert_eq!(
+            out.metadata
+                .values("epub.container")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("epub.spine")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("epub.metadata")
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("true")
