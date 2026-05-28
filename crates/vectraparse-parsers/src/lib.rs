@@ -303,15 +303,21 @@ impl Parser for StringsParser {
         media_type == "application/octet-stream"
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
-        let strings = extract_ascii_strings(input, 4, 4096);
+        let mut strings = extract_ascii_strings(input, 4, 4096);
+        strings.extend(extract_latin1_strings(input, 4, 4096));
+        strings.sort();
+        strings.dedup();
         if strings.is_empty() {
             return None;
         }
+        let joined = strings.join("\n");
+        let truncated: String = joined.chars().take(4096).collect();
         let mut metadata = Metadata::default();
         metadata.insert("parser", "StringsParser");
         metadata.insert("strings.count", strings.len().to_string());
+        metadata.insert("strings.charset", "ascii+latin1");
         Some(ParseOutcome {
-            content: Some(strings.join("\n")),
+            content: Some(truncated),
             metadata,
             warnings: Vec::new(),
             parser_chain: Vec::new(),
@@ -557,6 +563,29 @@ fn extract_ascii_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<
     out
 }
 
+fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    for &b in input {
+        let printable = (0x20..=0x7e).contains(&b) || (0xa0..=0xff).contains(&b);
+        if printable {
+            buf.push(b);
+            continue;
+        }
+        if buf.len() >= min_len {
+            out.push(buf.iter().map(|c| *c as char).collect::<String>());
+        }
+        buf.clear();
+        if out.iter().map(|s| s.len()).sum::<usize>() >= max_chars {
+            break;
+        }
+    }
+    if buf.len() >= min_len && out.iter().map(|s| s.len()).sum::<usize>() < max_chars {
+        out.push(buf.iter().map(|c| *c as char).collect::<String>());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -727,5 +756,12 @@ mod tests {
             .parse(b"\x00ABCDEF\x00xyz\x00", "application/octet-stream")
             .expect("strings");
         assert!(out.content.as_deref().unwrap_or("").contains("ABCDEF"));
+        assert_eq!(
+            out.metadata
+                .values("strings.charset")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("ascii+latin1")
+        );
     }
 }
