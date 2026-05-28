@@ -1444,6 +1444,53 @@ impl Parser for SpecialistFormatParser {
     }
 }
 
+pub struct CryptoSecurityParser;
+impl Parser for CryptoSecurityParser {
+    fn name(&self) -> &'static str {
+        "CryptoSecurityParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(media_type, "application/pkcs7-mime" | "application/x-tsd" | "application/x-encrypted")
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "CryptoSecurityParser");
+        let kind = if media_type == "application/pkcs7-mime" || lower.contains("pkcs7") {
+            "pkcs7"
+        } else if media_type == "application/x-tsd" || lower.contains("timestamp token") {
+            "tsd"
+        } else {
+            "encrypted-document"
+        };
+        metadata.insert("crypto.kind", kind);
+        metadata.insert(
+            "crypto.provider",
+            if lower.contains("provider:bc") { "bouncycastle" } else { "default" },
+        );
+        if lower.contains("perm:read-only") {
+            metadata.insert("crypto.permission", "read-only");
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("password:wrong") {
+            warnings.push("crypto-password-invalid".to_string());
+        } else if lower.contains("password:ok") {
+            metadata.insert("crypto.password_status", "ok");
+        } else if kind == "encrypted-document" {
+            warnings.push("crypto-password-required".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1855,7 +1902,7 @@ mod tests {
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
-        GeoEngineeringParser, ScienceDataParser, SpecialistFormatParser,
+        CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser, SpecialistFormatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2845,5 +2892,34 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "special-external-service-timeout"));
+    }
+
+    #[test]
+    fn crypto_security_parser_handles_password_and_permission_states() {
+        let p = CryptoSecurityParser;
+        let ok = p
+            .parse(b"pkcs7 provider:bc password:ok perm:read-only", "application/pkcs7-mime")
+            .expect("ok");
+        assert_eq!(
+            ok.metadata
+                .values("crypto.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("pkcs7")
+        );
+        assert_eq!(
+            ok.metadata
+                .values("crypto.permission")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("read-only")
+        );
+        let bad = p
+            .parse(b"encrypted blob password:wrong", "application/x-encrypted")
+            .expect("bad");
+        assert!(bad
+            .warnings
+            .iter()
+            .any(|w| w == "crypto-password-invalid"));
     }
 }
