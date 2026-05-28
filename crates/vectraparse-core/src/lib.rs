@@ -1,6 +1,7 @@
 pub mod config;
 pub mod metadata;
 pub mod registry;
+pub mod result;
 pub mod runtime;
 
 pub const API_VERSION: &str = "0.1.0";
@@ -20,18 +21,39 @@ fn detect_mime(input: &[u8]) -> String {
 }
 
 pub fn detect_json(input: &[u8]) -> String {
-    let mime = detect_mime(input);
-    format!(
-        "{{\"mime_type\":\"{mime}\",\"metadata\":{{}},\"content\":null,\"embedded\":[],\"warnings\":[],\"error\":null}}"
-    )
+    let result = result::StructuredResult {
+        mime_type: detect_mime(input),
+        content: None,
+        metadata: metadata::Metadata::default(),
+        embedded: Vec::new(),
+        warnings: Vec::new(),
+        errors: Vec::new(),
+        parser_chain: Vec::new(),
+        timing: result::ParseTiming {
+            detect_ms: 0,
+            parse_ms: 0,
+        },
+    };
+    result.to_json()
 }
 
 pub fn parse_json(input: &[u8]) -> String {
-    let mime = detect_mime(input);
-    format!(
-        "{{\"mime_type\":\"{mime}\",\"metadata\":{{\"Content-Length\":[\"{}\"]}},\"content\":\"\",\"embedded\":[],\"warnings\":[],\"error\":null}}",
-        input.len()
-    )
+    let mut md = metadata::Metadata::default();
+    md.insert("Content-Length", input.len().to_string());
+    let result = result::StructuredResult {
+        mime_type: detect_mime(input),
+        content: Some(String::new()),
+        metadata: md,
+        embedded: Vec::new(),
+        warnings: Vec::new(),
+        errors: Vec::new(),
+        parser_chain: vec!["CoreParseStub".to_string()],
+        timing: result::ParseTiming {
+            detect_ms: 0,
+            parse_ms: 0,
+        },
+    };
+    result.to_json()
 }
 
 pub fn detect_with_limits_json(input: &[u8], max_input_bytes: usize) -> Result<String, String> {
