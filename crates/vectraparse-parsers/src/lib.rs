@@ -1708,6 +1708,40 @@ impl Parser for NlpNerParser {
     }
 }
 
+pub struct CtakesParser;
+impl Parser for CtakesParser {
+    fn name(&self) -> &'static str {
+        "CtakesParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/ctakes"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "CtakesParser");
+        metadata.insert("ctakes.integration", "enabled");
+        if lower.contains("disease:") {
+            metadata.insert("ctakes.entity.disease", "detected");
+        }
+        if lower.contains("medication:") {
+            metadata.insert("ctakes.entity.medication", "detected");
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("dependency=off") || lower.contains("service=off") {
+            metadata.insert("ctakes.integration", "disabled");
+            warnings.push("ctakes-dependency-disabled".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2141,7 +2175,7 @@ mod tests {
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
-        TranslationProviderParser, NlpNerParser,
+        TranslationProviderParser, NlpNerParser, CtakesParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3299,5 +3333,30 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "nlp-model-missing-degraded"));
+    }
+
+    #[test]
+    fn ctakes_parser_handles_medical_entities_and_disabled_dependency() {
+        let p = CtakesParser;
+        let out = p
+            .parse(
+                b"disease: diabetes medication: metformin",
+                "application/ctakes",
+            )
+            .expect("ctakes");
+        assert_eq!(
+            out.metadata
+                .values("ctakes.entity.disease")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("detected")
+        );
+        let disabled = p
+            .parse(b"service=off dependency=off", "application/ctakes")
+            .expect("disabled");
+        assert!(disabled
+            .warnings
+            .iter()
+            .any(|w| w == "ctakes-dependency-disabled"));
     }
 }
