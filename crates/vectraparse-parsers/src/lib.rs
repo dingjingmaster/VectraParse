@@ -771,6 +771,54 @@ impl Parser for OleLegacyParser {
     }
 }
 
+pub struct MsSpecialParser;
+impl Parser for MsSpecialParser {
+    fn name(&self) -> &'static str {
+        "MsSpecialParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/x-tika-msoffice"
+            || media_type == "application/vnd.ms-outlook"
+            || media_type == "application/x-tnef"
+            || media_type == "image/emf"
+            || media_type == "image/wmf"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "MsSpecialParser");
+        let kind = if lower.contains("onenote") || lower.contains(".one") {
+            "onenote"
+        } else if lower.contains("standard jet db") || lower.contains("msysobjects") {
+            "access"
+        } else if lower.contains("tnef") || lower.contains("winmail.dat") {
+            "tnef"
+        } else if lower.contains(" emf") || lower.contains("emf+") {
+            "emf"
+        } else if lower.contains("wmf") || lower.contains("metafile") {
+            "wmf"
+        } else if lower.contains("__substg1.0_") {
+            "msg"
+        } else if lower.contains("!bdn") || lower.contains("pst") {
+            "pst"
+        } else {
+            "ms-special-unknown"
+        };
+        metadata.insert("ms.kind", kind);
+        if kind == "msg" || kind == "pst" {
+            let attachments = lower.matches("attach").count();
+            metadata.insert("ms.mail.attachments", attachments.to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1096,8 +1144,8 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        OleLegacyParser, PdfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
-        XmlParser,
+        MsSpecialParser, OleLegacyParser, PdfParser, SourceCodeParser, StringsParser,
+        TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1618,6 +1666,52 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("ppt")
+        );
+    }
+
+    #[test]
+    fn ms_special_parser_detects_onenote_access_tnef_emf_wmf_msg_pst() {
+        let p = MsSpecialParser;
+        let one = p.parse(b"...OneNote section...", "application/x-tika-msoffice").expect("one");
+        assert_eq!(
+            one.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("onenote")
+        );
+        let access = p
+            .parse(b"...Standard Jet DB...MSysObjects...", "application/x-tika-msoffice")
+            .expect("access");
+        assert_eq!(
+            access.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("access")
+        );
+        let tnef = p.parse(b"...winmail.dat...TNEF...", "application/x-tnef").expect("tnef");
+        assert_eq!(
+            tnef.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("tnef")
+        );
+        let emf = p.parse(b"... EMF+ ...", "image/emf").expect("emf");
+        assert_eq!(
+            emf.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("emf")
+        );
+        let wmf = p.parse(b"...metafile...WMF...", "image/wmf").expect("wmf");
+        assert_eq!(
+            wmf.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("wmf")
+        );
+        let msg = p
+            .parse(b"...__substg1.0_...attach...", "application/vnd.ms-outlook")
+            .expect("msg");
+        assert_eq!(
+            msg.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("msg")
+        );
+        let pst = p
+            .parse(b"...!BDN...attach...", "application/vnd.ms-outlook")
+            .expect("pst");
+        assert_eq!(
+            pst.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            Some("pst")
         );
     }
 }
