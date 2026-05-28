@@ -852,6 +852,47 @@ impl Parser for RtfParser {
     }
 }
 
+pub struct LegacyDocParser;
+impl Parser for LegacyDocParser {
+    fn name(&self) -> &'static str {
+        "LegacyDocParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/x-hwp"
+                | "application/vnd.ms-htmlhelp"
+                | "application/wordperfect"
+                | "application/x-quattro-pro"
+                | "application/octet-stream"
+        )
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "LegacyDocParser");
+        let kind = if lower.contains("hwp document") || lower.contains("hangul word processor") {
+            "hwp"
+        } else if lower.contains("itsf") || lower.contains("hhc") || lower.contains("chm") {
+            "chm"
+        } else if lower.contains("wordperfect") || lower.contains("wpd") {
+            "wordperfect"
+        } else if lower.contains("quattro") || lower.contains("wb3") {
+            "quattro-pro"
+        } else {
+            return None;
+        };
+        metadata.insert("legacy.kind", kind);
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1199,8 +1240,8 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        MsSpecialParser, OleLegacyParser, PdfParser, RtfParser, SourceCodeParser, StringsParser,
-        TextAndCsvParser, TxtParser, XmlParser,
+        LegacyDocParser, MsSpecialParser, OleLegacyParser, PdfParser, RtfParser, SourceCodeParser,
+        StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1786,6 +1827,51 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[test]
+    fn legacy_doc_parser_detects_hwp_chm_wordperfect_quattro() {
+        let p = LegacyDocParser;
+        let hwp = p
+            .parse(b"...HWP Document...Hangul Word Processor...", "application/x-hwp")
+            .expect("hwp");
+        assert_eq!(
+            hwp.metadata
+                .values("legacy.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("hwp")
+        );
+        let chm = p
+            .parse(b"ITSF...chm...", "application/vnd.ms-htmlhelp")
+            .expect("chm");
+        assert_eq!(
+            chm.metadata
+                .values("legacy.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("chm")
+        );
+        let wpd = p
+            .parse(b"...WordPerfect...WPD...", "application/wordperfect")
+            .expect("wpd");
+        assert_eq!(
+            wpd.metadata
+                .values("legacy.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("wordperfect")
+        );
+        let qpro = p
+            .parse(b"...Quattro...WB3...", "application/x-quattro-pro")
+            .expect("qpro");
+        assert_eq!(
+            qpro.metadata
+                .values("legacy.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("quattro-pro")
         );
     }
 }
