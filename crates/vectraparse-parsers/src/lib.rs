@@ -506,8 +506,60 @@ impl Parser for PackageParser {
         if input.windows(3).any(|w| w == b"../") || input.windows(3).any(|w| w == b"..\\") {
             warnings.push("package-path-traversal-blocked".to_string());
         }
+        let mut content = String::new();
+        if pkg == "zip" {
+            use std::io::Read;
+            if let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(input)) {
+                let mut names = Vec::new();
+                let mut text_parts = Vec::new();
+                for i in 0..archive.len() {
+                    if let Ok(mut file) = archive.by_index(i) {
+                        let name = file.name().to_string();
+                        names.push(name.clone());
+                        if !file.is_file() {
+                            continue;
+                        }
+                        let lower = name.to_ascii_lowercase();
+                        let is_text_like = lower.ends_with(".txt")
+                            || lower.ends_with(".md")
+                            || lower.ends_with(".csv")
+                            || lower.ends_with(".json")
+                            || lower.ends_with(".xml")
+                            || lower.ends_with(".html")
+                            || lower.ends_with(".log");
+                        if is_text_like && file.size() <= 128 * 1024 {
+                            let mut buf = Vec::new();
+                            if file.read_to_end(&mut buf).is_ok()
+                                && let Ok(s) = String::from_utf8(buf)
+                            {
+                                let snippet: String = s.chars().take(800).collect();
+                                if !snippet.trim().is_empty() {
+                                    text_parts.push(format!("[{name}]\n{snippet}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                names.sort();
+                if !names.is_empty() {
+                    content.push_str("ZIP Entries:\n");
+                    for name in names.iter().take(200) {
+                        content.push_str("- ");
+                        content.push_str(name);
+                        content.push('\n');
+                    }
+                }
+                if !text_parts.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str("Extracted Text Snippets:\n");
+                    content.push_str(&text_parts.join("\n\n"));
+                }
+            }
+        }
         Some(ParseOutcome {
-            content: None,
+            content: if content.trim().is_empty() { None } else { Some(content) },
             metadata,
             warnings,
             parser_chain: Vec::new(),
