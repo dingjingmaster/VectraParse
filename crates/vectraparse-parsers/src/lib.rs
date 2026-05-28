@@ -1785,6 +1785,46 @@ impl Parser for DlVisionModelParser {
     }
 }
 
+pub struct OcrExternalParser;
+impl Parser for OcrExternalParser {
+    fn name(&self) -> &'static str {
+        "OcrExternalParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/ocr-external"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "OcrExternalParser");
+        metadata.insert(
+            "ocr.engine",
+            if lower.contains("engine=tesseract") {
+                "tesseract"
+            } else {
+                "external"
+            },
+        );
+        if lower.contains("<parser ") || lower.contains("<tesseract") {
+            metadata.insert("ocr.config.xml", "detected");
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("timeout=true") {
+            warnings.push("ocr-timeout".to_string());
+        }
+        if lower.contains("sandbox=violation") || lower.contains("path=../") {
+            warnings.push("ocr-path-restricted".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2219,6 +2259,7 @@ mod tests {
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
         TranslationProviderParser, NlpNerParser, CtakesParser, DlVisionModelParser,
+        OcrExternalParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3430,5 +3471,25 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "dl-inference-failed-degraded"));
+    }
+
+    #[test]
+    fn ocr_external_parser_handles_xml_timeout_and_path_restriction() {
+        let p = OcrExternalParser;
+        let out = p
+            .parse(
+                b"<parser type=\"tesseract\"/> engine=tesseract timeout=true path=../secret",
+                "application/ocr-external",
+            )
+            .expect("ocr");
+        assert_eq!(
+            out.metadata
+                .values("ocr.engine")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("tesseract")
+        );
+        assert!(out.warnings.iter().any(|w| w == "ocr-timeout"));
+        assert!(out.warnings.iter().any(|w| w == "ocr-path-restricted"));
     }
 }
