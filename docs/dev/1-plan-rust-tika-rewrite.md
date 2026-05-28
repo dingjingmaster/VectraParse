@@ -132,7 +132,7 @@
 | P8-02 | 实现 JSON 序列化、稳定字段、schema version 和兼容策略 | JSON schema 测试；旧字段兼容测试 | 完成 |
 | P8-03 | 实现 FFI 包装完整链路：detect/parse/options/result/free/capabilities | C 集成测试；重复 free/空指针/错误路径测试 | 完成 |
 | P8-04 | 实现发布包：头文件、pkg-config/cmake 文件、license manifest、feature 矩阵 | 本地 install/link smoke；license 审查 | 完成 |
-| P8-05 | 编写使用文档：Rust API、C ABI、错误码、资源限制、feature、样例 | 文档示例编译；README 审查 | 待开始 |
+| P8-05 | 编写使用文档：Rust API、C ABI、错误码、资源限制、feature、样例 | 文档示例编译；README 审查 | 完成 |
 | P9-01 | 建立 Tika 对照检测 golden：magic/glob/rootXML/container/encoding | 差异报告；必须解释所有偏差 | 待开始 |
 | P9-02 | 建立格式提取 golden：content、metadata、embedded、warnings、errors | 按功能族生成差异报告和通过门槛 | 待开始 |
 | P9-03 | 建立安全测试：zip bomb、深递归 XML、损坏 PDF/Office、超大 metadata、路径穿越 | 所有资源限制命中后状态一致且资源释放 | 待开始 |
@@ -202,6 +202,7 @@
 | 2026-05-28 | 完成 P8-02 JSON 兼容 parser | 覆盖 schema version、稳定字段与 legacy 字段兼容策略测试 |
 | 2026-05-28 | 完成 P8-03 FFI 链路测试补齐 | 覆盖 detect/parse/hints/capabilities/result_free 与空指针/重复释放 |
 | 2026-05-28 | 完成 P8-04 发布包资产 | 新增 C 头文件、pkg-config/cmake、license manifest 与 feature 矩阵并通过 release 构建 |
+| 2026-05-28 | 完成 P8-05 使用文档 | 新增 Rust/C ABI 使用说明、错误码与资源限制文档并通过 abi smoke |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
