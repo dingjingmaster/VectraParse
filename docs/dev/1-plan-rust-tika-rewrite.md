@@ -81,7 +81,7 @@
 | P1-08 | 实现 BPList detector 和 Apple plist 识别 | binary plist/XML plist 样本对照 | 完成 |
 | P1-09 | 实现高级 detector：`OverrideDetector`、`ZeroSizeFileDetector`、`NameDetector`、`TypeDetector`、`TrainedModelDetector`、`NNExampleModelDetector` | provider 映射测试；模型 detector 可关闭/可配置测试 | 完成 |
 | P1-10 | 实现 encoding detector：HTML、universal、ICU4J 等价或替代策略 | 多编码文本、HTML charset、BOM、错误编码对照测试 | 完成 |
-| P1-11 | 暴露 detect API：内存、文件路径、带 hint 输入、能力查询 | Rust API 和 C ABI detect smoke/golden 测试 | 待开始 |
+| P1-11 | 暴露 detect API：内存、文件路径、带 hint 输入、能力查询 | Rust API 和 C ABI detect smoke/golden 测试 | 完成 |
 | P2-01 | 实现输入抽象：内存、文件、流、mark/reset、临时资源、读取上限 | 大文件、短读、临时文件清理、并发读取测试 | 待开始 |
 | P2-02 | 实现 parser trait、composite parser、fallback、supplementing、multiple parser 调度 | MIME 到 parser 映射测试；fallback 路径测试 | 待开始 |
 | P2-03 | 实现结构化结果：content、metadata、embedded、warnings、errors、timing、parser chain | JSON schema 和 round-trip；嵌入路径快照测试 | 待开始 |
@@ -146,7 +146,7 @@
 | 里程碑 | 验收范围 | 出口标准 | 状态 |
 |--------|----------|----------|------|
 | M0 基础架构 | workspace、core、FFI、配置、资源限制、测试框架 | `detect`/空 parser 可通过 Rust 和 C ABI 调用，错误路径可释放资源 | 完成 |
-| M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 待开始 |
+| M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 完成 |
 | M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 待开始 |
 | M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 待开始 |
 | M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 待开始 |
@@ -197,6 +197,8 @@
 | 2026-05-28 | 完成 P1-08 plist 检测初版 | 在 `vectraparse-mime` 增加 binary plist magic 和 XML plist 特征识别 |
 | 2026-05-28 | 完成 P1-09 高级 detector 配置初版 | 在 `vectraparse-mime` 增加 detector 开关、provider 映射与模型 detector 可配置测试 |
 | 2026-05-28 | 完成 P1-10 编码检测初版 | 在 `vectraparse-mime` 增加 BOM、HTML charset 与 UTF-8/binary 回退检测 |
+| 2026-05-28 | 完成 P1-11 detect API 对外暴露 | 在 Rust/C ABI 提供内存、文件路径、hints 检测接口并更新 capabilities |
+| 2026-05-28 | 完成里程碑 M1 检测闭环 | P1-01 到 P1-11 已完成并通过本地定向测试 |
 
 ## 10. P0-01 默认确认结果
 
