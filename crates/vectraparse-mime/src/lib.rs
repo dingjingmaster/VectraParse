@@ -176,7 +176,13 @@ pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
     {
         return by_name;
     }
-    MagicMatcher::default_rules().detect(input, 64).mime
+    let magic = MagicMatcher::default_rules().detect(input, 64).mime;
+    if magic == "application/octet-stream" {
+        if let Some(refined) = detect_xml_html_or_text(input) {
+            return refined;
+        }
+    }
+    magic
 }
 
 fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
@@ -196,6 +202,81 @@ fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
         "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         _ => None,
     }
+}
+
+fn detect_xml_html_or_text(input: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(input).ok()?.trim_start_matches('\u{feff}').trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with("<!DOCTYPE html")
+        || s.starts_with("<html")
+        || s.starts_with("<HTML")
+        || s.contains("<meta charset=")
+    {
+        return Some("text/html".to_string());
+    }
+    if s.starts_with("<?xml") || s.starts_with('<') {
+        if let Some(root) = first_xml_root(s) {
+            let root_lower = root.to_ascii_lowercase();
+            if root_lower == "html" {
+                return Some("text/html".to_string());
+            }
+            if root_lower == "feed" {
+                return Some("application/atom+xml".to_string());
+            }
+            if root_lower == "rss" {
+                return Some("application/rss+xml".to_string());
+            }
+            return Some("application/xml".to_string());
+        }
+    }
+    if looks_like_plain_text(input) {
+        return Some("text/plain".to_string());
+    }
+    None
+}
+
+fn first_xml_root(s: &str) -> Option<&str> {
+    let mut in_tag = false;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_tag && b == b'<' {
+            if i + 1 < bytes.len() && (bytes[i + 1] == b'?' || bytes[i + 1] == b'!') {
+                i += 1;
+            } else {
+                in_tag = true;
+                start = i + 1;
+            }
+        } else if in_tag {
+            if b == b'>' || b.is_ascii_whitespace() || b == b'/' {
+                return s.get(start..i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn looks_like_plain_text(input: &[u8]) -> bool {
+    if std::str::from_utf8(input).is_ok() {
+        let mut printable = 0usize;
+        let mut total = 0usize;
+        for &b in input.iter().take(4096) {
+            total += 1;
+            if b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7e).contains(&b) {
+                printable += 1;
+            }
+        }
+        if total == 0 {
+            return false;
+        }
+        return printable * 100 / total >= 90;
+    }
+    false
 }
 
 #[derive(Debug, Default)]
@@ -471,6 +552,28 @@ mod tests {
                 }
             ),
             "application/pdf"
+        );
+    }
+
+    #[test]
+    fn detect_xml_html_root_and_text_fallback() {
+        assert_eq!(
+            detect_media_type(
+                br#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>"#,
+                &DetectHints::default()
+            ),
+            "application/atom+xml"
+        );
+        assert_eq!(
+            detect_media_type(
+                br#"<!DOCTYPE html><html><head><meta charset="utf-8"></head></html>"#,
+                &DetectHints::default()
+            ),
+            "text/html"
+        );
+        assert_eq!(
+            detect_media_type(b"just plain ascii text", &DetectHints::default()),
+            "text/plain"
         );
     }
 }
