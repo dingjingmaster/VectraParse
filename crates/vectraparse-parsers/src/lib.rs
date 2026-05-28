@@ -2440,6 +2440,13 @@ fn extract_doc_text_external(input: &[u8]) -> Option<String> {
     }
     let out = candidates
         .into_iter()
+        .flat_map(|s| {
+            let fixed = try_fix_mojibake_latin1_utf8(&s);
+            match fixed {
+                Some(f) if f != s => vec![s, f],
+                _ => vec![s],
+            }
+        })
         .max_by_key(|s| score_human_text(s));
 
     let _ = fs::remove_file(&path);
@@ -2480,6 +2487,23 @@ fn score_human_text(s: &str) -> usize {
         }
     }
     score
+}
+
+fn try_fix_mojibake_latin1_utf8(s: &str) -> Option<String> {
+    let mojibake_hint = s.contains('æ') || s.contains('å') || s.contains('ç') || s.contains('Ã');
+    if !mojibake_hint {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code <= 0xFF {
+            bytes.push(code as u8);
+        } else {
+            return None;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
