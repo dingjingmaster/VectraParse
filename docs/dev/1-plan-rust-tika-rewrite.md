@@ -112,7 +112,7 @@
 | P5-02 | 实现 MBOX parser | mbox 多邮件样本；递归附件测试 | 完成 |
 | P5-03 | 实现 Outlook PST/MSG/TNEF 邮箱能力 | pst/msg/tnef golden；大邮箱资源限制测试 | 完成 |
 | P5-04 | 实现图片 metadata：通用 image、JPEG、TIFF、BPG、PSD、WebP、HEIF、ICNS、EXIF/XMP/IPTC | 图片格式 golden；损坏图片 fuzz smoke | 完成 |
-| P5-05 | 实现音频 metadata：Audio、MP3、MIDI | mp3/id3/midi golden；坏 tag 测试 | 待开始 |
+| P5-05 | 实现音频 metadata：Audio、MP3、MIDI | mp3/id3/midi golden；坏 tag 测试 | 完成 |
 | P5-06 | 实现视频 metadata：MP4、FLV 和通用 video | mp4/flv golden；大文件读取窗口测试 | 待开始 |
 | P5-07 | 实现 captioning 和对象识别接入点 | 模型/服务禁用、超时、失败降级测试 | 待开始 |
 | P6-01 | 实现数据库/表格：DBF、SQLite、Access、JDBC 等价边界 | dbf/sqlite/access golden；连接型能力默认禁用审查 | 待开始 |
@@ -182,6 +182,7 @@
 | 2026-05-28 | 完成 P5-02 MBOX parser | 支持多邮件拆分、聚合附件/嵌套计数与附件上限告警测试 |
 | 2026-05-28 | 完成 P5-03 Outlook 邮箱 parser | 新增 PST/MSG/TNEF 专用解析能力和资源限制告警测试 |
 | 2026-05-28 | 完成 P5-04 图片 metadata parser | 覆盖 JPEG/TIFF/BPG/PSD/WebP/HEIF/ICNS 和 EXIF/XMP/IPTC 标记提取 |
+| 2026-05-28 | 完成 P5-05 音频 metadata parser | 新增 Audio/MP3/MIDI 提取与坏 MP3 tag 告警测试 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
