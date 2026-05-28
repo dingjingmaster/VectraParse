@@ -12,6 +12,8 @@ pub struct OcrConfig {
     pub rec_dict_path: Option<String>,
     pub rec_img_h: usize,
     pub rec_img_w: usize,
+    pub rec_alt_model_path: Option<String>,
+    pub rec_alt_dict_path: Option<String>,
     pub det_img_side: usize,
     pub det_box_thresh: f32,
     pub det_min_box_area: usize,
@@ -27,7 +29,9 @@ pub struct OcrResult {
 pub struct TractOcrEngine {
     det: TypedRunnableModel<TypedModel>,
     rec: TypedRunnableModel<TypedModel>,
+    rec_alt: Option<TypedRunnableModel<TypedModel>>,
     alphabet: Vec<String>,
+    alphabet_alt: Vec<String>,
 }
 
 impl TractOcrEngine {
@@ -40,8 +44,27 @@ impl TractOcrEngine {
             .model_for_path(Path::new(&cfg.rec_model_path))?
             .into_optimized()?
             .into_runnable()?;
+        let rec_alt = cfg
+            .rec_alt_model_path
+            .as_deref()
+            .and_then(|p| {
+                tract_onnx::onnx()
+                    .model_for_path(Path::new(p))
+                    .ok()?
+                    .into_optimized()
+                    .ok()?
+                    .into_runnable()
+                    .ok()
+            });
         let alphabet = load_dict(cfg.rec_dict_path.as_deref());
-        Ok(Self { det, rec, alphabet })
+        let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref());
+        Ok(Self {
+            det,
+            rec,
+            rec_alt,
+            alphabet,
+            alphabet_alt,
+        })
     }
 
     pub fn infer(&self, image_bytes: &[u8], cfg: &OcrConfig) -> TractResult<OcrResult> {
@@ -63,16 +86,34 @@ impl TractOcrEngine {
             }
         }
         lines.sort_by_key(|(y, x, _, _)| (*y / 8, *x));
-        let text = lines
+        let mut text = lines
             .iter()
             .map(|(_, _, t, _)| t.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let confidence = if lines.is_empty() {
+        let mut confidence = if lines.is_empty() {
             0.0
         } else {
             lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
         };
+        if text.trim().is_empty() {
+            let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+            let output = self.rec.run(tvec!(rec_input.into()))?;
+            let logits = output[0].to_array_view::<f32>()?;
+            let (fallback_text, fallback_confidence) = ctc_greedy_decode(&logits, &self.alphabet);
+            text = fallback_text;
+            confidence = fallback_confidence;
+            if text.trim().is_empty()
+                && let Some(rec_alt) = &self.rec_alt
+            {
+                let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+                let output = rec_alt.run(tvec!(rec_input.into()))?;
+                let logits = output[0].to_array_view::<f32>()?;
+                let (alt_text, alt_confidence) = ctc_greedy_decode(&logits, &self.alphabet_alt);
+                text = alt_text;
+                confidence = alt_confidence;
+            }
+        }
         let warning = if self.alphabet.is_empty() {
             Some("ocr-dictionary-missing".to_string())
         } else {
@@ -94,9 +135,11 @@ impl Default for OcrConfig {
             rec_dict_path: None,
             rec_img_h: 48,
             rec_img_w: 320,
+            rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
+            rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.3,
-            det_min_box_area: 32,
+            det_box_thresh: 0.18,
+            det_min_box_area: 20,
         }
     }
 }
@@ -165,10 +208,15 @@ fn preprocess_det_image(
     for y in 0..side {
         for x in 0..side {
             let px = resized.get_pixel(x as u32, y as u32);
+            let bgr = [px[2] as f32, px[1] as f32, px[0] as f32];
+            let norm = [
+                ((bgr[0] / 255.0) - 0.485) / 0.229,
+                ((bgr[1] / 255.0) - 0.456) / 0.224,
+                ((bgr[2] / 255.0) - 0.406) / 0.225,
+            ];
             for c in 0..3 {
-                let v = px[c] as f32 / 255.0;
                 let idx = c * side * side + y * side + x;
-                data[idx] = v;
+                data[idx] = norm[c];
             }
         }
     }
@@ -266,8 +314,9 @@ fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) 
     for y in 0..target_h {
         for x in 0..resized_w {
             let px = resized.get_pixel(x as u32, y as u32);
+            let bgr = [px[2], px[1], px[0]];
             for c in 0..3 {
-                let v = (px[c] as f32 / 255.0 - 0.5) / 0.5;
+                let v = (bgr[c] as f32 / 255.0 - 0.5) / 0.5;
                 let idx = c * target_h * target_w + y * target_w + x;
                 data[idx] = v;
             }
@@ -282,8 +331,11 @@ fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[St
         return (String::new(), 0.0);
     }
     let shape = logits.shape();
-    let steps = shape[1];
-    let classes = shape[2];
+    let (steps, classes, channel_first) = if shape[1] > shape[2] {
+        (shape[2], shape[1], true)
+    } else {
+        (shape[1], shape[2], false)
+    };
     if classes <= 1 {
         return (String::new(), 0.0);
     }
@@ -297,7 +349,11 @@ fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[St
         let mut best_id = 0usize;
         let mut best_val = f32::NEG_INFINITY;
         for c in 0..classes {
-            let v = logits[[0, t, c]];
+            let v = if channel_first {
+                logits[[0, c, t]]
+            } else {
+                logits[[0, t, c]]
+            };
             if v > best_val {
                 best_val = v;
                 best_id = c;
