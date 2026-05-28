@@ -129,7 +129,7 @@
 | P7-06 | 实现深度学习 recognition 和 captioning 模型接入 | 模型路径、批量资源限制、失败降级测试 | 完成 |
 | P7-07 | 实现 OCR/Tesseract 和 external parser XML 配置 | OCR 样本、命令超时、沙箱/路径限制测试 | 完成 |
 | P8-01 | 实现 XMP 映射和 metadata 标准化输出 | XMP golden；多值 metadata round-trip | 完成 |
-| P8-02 | 实现 JSON 序列化、稳定字段、schema version 和兼容策略 | JSON schema 测试；旧字段兼容测试 | 待开始 |
+| P8-02 | 实现 JSON 序列化、稳定字段、schema version 和兼容策略 | JSON schema 测试；旧字段兼容测试 | 完成 |
 | P8-03 | 实现 FFI 包装完整链路：detect/parse/options/result/free/capabilities | C 集成测试；重复 free/空指针/错误路径测试 | 待开始 |
 | P8-04 | 实现发布包：头文件、pkg-config/cmake 文件、license manifest、feature 矩阵 | 本地 install/link smoke；license 审查 | 待开始 |
 | P8-05 | 编写使用文档：Rust API、C ABI、错误码、资源限制、feature、样例 | 文档示例编译；README 审查 | 待开始 |
@@ -199,6 +199,7 @@
 | 2026-05-28 | 完成 P7-06 深度学习视觉 parser | 覆盖模型路径、批量参数和模型缺失/推理失败降级测试 |
 | 2026-05-28 | 完成 P7-07 OCR/external parser | 覆盖 Tesseract XML 配置、超时与沙箱路径限制测试，M6 达成 |
 | 2026-05-28 | 完成 P8-01 XMP 标准化 parser | 增加 XMP key 映射与规范化输出测试 |
+| 2026-05-28 | 完成 P8-02 JSON 兼容 parser | 覆盖 schema version、稳定字段与 legacy 字段兼容策略测试 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
