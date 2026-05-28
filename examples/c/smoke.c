@@ -24,6 +24,16 @@ int main(void) {
   printf("detect: %.*s\n", (int)out.len, (const char *)out.data);
   vectraparse_result_free(&out);
 
+  if (vectraparse_detect_with_hints(handle, sample, sizeof(sample) - 1, &options,
+                                    "report.docx", "application/pdf", NULL,
+                                    &out) != VECTRAPARSE_OK) {
+    fprintf(stderr, "detect_with_hints failed\n");
+    vectraparse_destroy_handle(handle);
+    return 5;
+  }
+  printf("detect_with_hints: %.*s\n", (int)out.len, (const char *)out.data);
+  vectraparse_result_free(&out);
+
   if (vectraparse_parse(handle, sample, sizeof(sample) - 1, &options, &out) !=
       VECTRAPARSE_OK) {
     fprintf(stderr, "parse failed\n");

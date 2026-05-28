@@ -5,15 +5,17 @@ pub mod runtime;
 
 pub const API_VERSION: &str = "0.1.0";
 pub const CAPABILITIES_JSON: &str =
-    "{\"detect\":true,\"parse\":true,\"parse_file\":false,\"enhance\":false}";
+    "{\"detect\":true,\"parse\":true,\"parse_file\":true,\"enhance\":false}";
 
-fn detect_mime(input: &[u8]) -> &'static str {
+fn detect_mime(input: &[u8]) -> String {
     if input.starts_with(b"%PDF-") {
-        "application/pdf"
+        "application/pdf".to_string()
     } else if input.starts_with(b"PK\x03\x04") {
-        "application/zip"
+        "application/zip".to_string()
+    } else if input.is_empty() {
+        "application/x-empty".to_string()
     } else {
-        "application/octet-stream"
+        "application/octet-stream".to_string()
     }
 }
 

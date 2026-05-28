@@ -35,6 +35,19 @@ VectraParseError vectraparse_detect(VectraParseHandle *handle,
                                     size_t input_len,
                                     const VectraParseOptions *options,
                                     VectraParseResult *out);
+VectraParseError vectraparse_detect_with_hints(
+    VectraParseHandle *handle,
+    const uint8_t *input,
+    size_t input_len,
+    const VectraParseOptions *options,
+    const char *resource_name,
+    const char *content_type_hint,
+    const char *force_content_type,
+    VectraParseResult *out);
+VectraParseError vectraparse_detect_file(VectraParseHandle *handle,
+                                         const char *file_path,
+                                         const VectraParseOptions *options,
+                                         VectraParseResult *out);
 
 VectraParseError vectraparse_parse(VectraParseHandle *handle,
                                    const uint8_t *input,

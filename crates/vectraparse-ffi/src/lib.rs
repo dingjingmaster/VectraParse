@@ -1,9 +1,12 @@
 use std::ffi::c_char;
+use std::ffi::CStr;
+use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
 use vectraparse_core::{detect_with_limits_json, parse_with_limits_json, CAPABILITIES_JSON};
+use vectraparse_mime::{DetectHints, detect_media_type};
 
 #[repr(C)]
 pub struct VectraParseHandle {
@@ -29,6 +32,17 @@ pub enum VectraParseError {
     NullPointer = 1,
     InvalidUtf8 = 2,
     Internal = 255,
+}
+
+fn cstr_opt<'a>(ptr: *const c_char) -> Result<Option<&'a str>, VectraParseError> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: caller provides NUL-terminated string pointer when non-null.
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| VectraParseError::InvalidUtf8)?;
+    Ok(Some(s))
 }
 
 fn alloc_json_result(json: String, out: *mut VectraParseResult) -> VectraParseError {
@@ -102,6 +116,90 @@ pub extern "C" fn vectraparse_detect(
         // SAFETY: input pointer and length are provided by caller and validated for non-null above.
         let bytes = unsafe { slice::from_raw_parts(input, input_len) };
         detect_with_limits_json(bytes, limit)
+    }));
+    match run {
+        Ok(Ok(json)) => alloc_json_result(json, out),
+        Ok(Err(_)) => VectraParseError::Internal,
+        Err(_) => VectraParseError::Internal,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vectraparse_detect_with_hints(
+    handle: *mut VectraParseHandle,
+    input: *const u8,
+    input_len: usize,
+    options: *const VectraParseOptions,
+    resource_name: *const c_char,
+    content_type_hint: *const c_char,
+    force_content_type: *const c_char,
+    out: *mut VectraParseResult,
+) -> VectraParseError {
+    if handle.is_null() || input.is_null() {
+        return VectraParseError::NullPointer;
+    }
+    let res_name = match cstr_opt(resource_name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let type_hint = match cstr_opt(content_type_hint) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let forced = match cstr_opt(force_content_type) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let limit = resolve_limit(options);
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: input pointer and length are provided by caller and validated for non-null above.
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        vectraparse_core::runtime::validate_input_size(
+            bytes.len(),
+            &vectraparse_core::runtime::ResourceLimits {
+                max_input_bytes: limit,
+                ..vectraparse_core::runtime::ResourceLimits::default()
+            },
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let mime = detect_media_type(
+            bytes,
+            &DetectHints {
+                resource_name: res_name,
+                content_type_hint: type_hint,
+                force_content_type: forced,
+            },
+        );
+        Ok::<String, String>(format!(
+            "{{\"mime_type\":\"{mime}\",\"metadata\":{{}},\"content\":null,\"embedded\":[],\"warnings\":[],\"error\":null}}"
+        ))
+    }));
+    match run {
+        Ok(Ok(json)) => alloc_json_result(json, out),
+        Ok(Err(_)) => VectraParseError::Internal,
+        Err(_) => VectraParseError::Internal,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vectraparse_detect_file(
+    handle: *mut VectraParseHandle,
+    file_path: *const c_char,
+    options: *const VectraParseOptions,
+    out: *mut VectraParseResult,
+) -> VectraParseError {
+    if handle.is_null() || file_path.is_null() {
+        return VectraParseError::NullPointer;
+    }
+    let path = match cstr_opt(file_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => return VectraParseError::NullPointer,
+        Err(e) => return e,
+    };
+    let limit = resolve_limit(options);
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        detect_with_limits_json(&bytes, limit)
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
