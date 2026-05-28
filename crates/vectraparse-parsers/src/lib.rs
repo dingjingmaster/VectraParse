@@ -507,6 +507,58 @@ impl Parser for PackageParser {
     }
 }
 
+pub struct OoxmlParser;
+impl Parser for OoxmlParser {
+    fn name(&self) -> &'static str {
+        "OoxmlParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/x-tika-ooxml"
+            || media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            || media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            || media_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            || media_type == "application/xml"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "OoxmlParser");
+        let doc_kind = if lower.contains("word/") || lower.contains("word/document.xml") {
+            "docx"
+        } else if lower.contains("xl/") || lower.contains("workbook.xml") {
+            "xlsx"
+        } else if lower.contains("ppt/") || lower.contains("presentation.xml") {
+            "pptx"
+        } else if lower.contains("wordml") {
+            "wordml"
+        } else if lower.contains("spreadsheetml") {
+            "spreadsheetml"
+        } else {
+            "ooxml-unknown"
+        };
+        metadata.insert("ooxml.kind", doc_kind);
+        if lower.contains("_rels/.rels") || lower.contains(".rels") {
+            metadata.insert("ooxml.relationships", "true");
+        }
+        if lower.contains("docprops/core.xml") {
+            metadata.insert("ooxml.core_props", "true");
+        }
+        let embedded_count = lower.matches("embeddings/").count() + lower.matches("oleobject").count();
+        metadata.insert("ooxml.embedded_count", embedded_count.to_string());
+        let mut warnings = Vec::new();
+        if embedded_count > 64 {
+            warnings.push("ooxml-embedded-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -831,7 +883,7 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        LightweightSpecializedParser, PackageParser, SourceCodeParser, StringsParser,
+        LightweightSpecializedParser, OoxmlParser, PackageParser, SourceCodeParser, StringsParser,
         TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -1128,6 +1180,38 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("rar")
+        );
+    }
+
+    #[test]
+    fn ooxml_parser_extracts_kind_relationships_props_and_embeds() {
+        let p = OoxmlParser;
+        let out = p
+            .parse(
+                b"PK\x03\x04...word/document.xml..._rels/.rels...docProps/core.xml...embeddings/oleObject1.bin",
+                "application/x-tika-ooxml",
+            )
+            .expect("ooxml");
+        assert_eq!(
+            out.metadata
+                .values("ooxml.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("docx")
+        );
+        assert_eq!(
+            out.metadata
+                .values("ooxml.relationships")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("ooxml.core_props")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
         );
     }
 }
