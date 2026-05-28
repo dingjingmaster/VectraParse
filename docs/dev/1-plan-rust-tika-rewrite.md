@@ -139,7 +139,7 @@
 | P9-04 | 建立 fuzzing：detector、MIME XML 表、ZIP/OLE、PDF/Office 入口、FFI JSON | fuzz smoke 和定期长跑报告 | 完成 |
 | P9-05 | 建立性能基准：检测吞吐、常见格式解析耗时、峰值内存、并发解析 | bench 基线；性能回归阈值 | 完成 |
 | P9-06 | 建立 ABI/linkage 验证：staticlib/cdylib、C/C++、Go/Python/Java/JNI 可选消费方 | 多语言 smoke；符号和内存释放检查 | 完成 |
-| P9-07 | 建立发布验收：clean checkout、无网络/有缓存构建、feature 组合、包体积、许可证 | release checklist 全通过 | 待开始 |
+| P9-07 | 建立发布验收：clean checkout、无网络/有缓存构建、feature 组合、包体积、许可证 | release checklist 全通过 | 完成 |
 
 ## 6. 里程碑验收
 
@@ -152,7 +152,7 @@
 | M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 完成 |
 | M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 完成 |
 | M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 | 完成 |
-| M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 | 待开始 |
+| M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 | 完成 |
 
 ## 7. 验证计划
 
@@ -209,6 +209,7 @@
 | 2026-05-28 | 完成 P9-04 fuzz smoke 流程 | 新增 detector/parser/ffi smoke 脚本与报告产物 |
 | 2026-05-28 | 完成 P9-05 bench smoke 流程 | 新增吞吐/解析/并发 smoke 基线与回归阈值报告 |
 | 2026-05-28 | 完成 P9-06 ABI/linkage smoke | 覆盖 staticlib/cdylib 构建、C 消费方调用与导出符号检查 |
+| 2026-05-28 | 完成 P9-07 发布验收流程 | 新增 release checklist 脚本并完成全工作区验收，M7 达成 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
