@@ -102,7 +102,7 @@
 | P4-02 | 实现 OOXML：docx/xlsx/pptx、关系文件、core props、嵌入文件、旧 Excel XML/WordML/SpreadsheetML | Office golden；嵌入附件和公式/表格样本测试 | 完成 |
 | P4-03 | 实现 ODF/OpenDocument/OpenOffice parser | odt/ods/odp golden；manifest 和 metadata 测试 | 完成 |
 | P4-04 | 实现 EPUB parser | EPUB spine/metadata/嵌入资源 golden | 完成 |
-| P4-05 | 实现 iWork package parser | pages/numbers/keynote 样本对照 | 待开始 |
+| P4-05 | 实现 iWork package parser | pages/numbers/keynote 样本对照 | 完成 |
 | P4-06 | 实现 PDF parser：文本、metadata、附件、权限、加密、OCR hook、preflight | PDF golden；加密/损坏/大文件/附件测试 | 待开始 |
 | P4-07 | 实现 OLE/CFB 旧 Office：DOC/XLS/PPT、OfficeParser、OldExcel、MSOwnerFile | OLE golden；宏/嵌入对象安全审查 | 待开始 |
 | P4-08 | 实现 Microsoft 专有格式：OneNote、Access/Jackcess、TNEF、EMF、WMF、MSG/PST 联动 | 样本 golden；native/feature 依赖检查 | 待开始 |
@@ -220,6 +220,7 @@
 | 2026-05-28 | 完成 P4-02 OOXML parser 初版 | 在 `vectraparse-parsers` 增加 docx/xlsx/pptx 识别与 relations/coreProps/embedded metadata 提取 |
 | 2026-05-28 | 完成 P4-03 ODF parser 初版 | 在 `vectraparse-parsers` 增加 odt/ods/odp 类型识别及 manifest/meta metadata 提取 |
 | 2026-05-28 | 完成 P4-04 EPUB parser 初版 | 在 `vectraparse-parsers` 增加 spine/metadata/嵌入资源识别与 metadata 输出 |
+| 2026-05-28 | 完成 P4-05 iWork parser 初版 | 在 `vectraparse-parsers` 增加 pages/numbers/keynote 识别与 iwa 计数 metadata 输出 |
 
 ## 10. P0-01 默认确认结果
 
