@@ -17,7 +17,7 @@ golden:
 	bash scripts/golden_compare.sh tests/golden/expected/minimal_pdf.detect.json /tmp/minimal_pdf.actual.json
 
 fuzz-smoke:
-	@echo "fuzz-smoke placeholder: fuzz targets will be added in P9-04"
+	bash scripts/fuzz_smoke.sh docs/dev/1-fuzz-smoke-report.md
 
 bench-smoke:
 	@echo "bench-smoke placeholder: benches will be added in P9-05"
