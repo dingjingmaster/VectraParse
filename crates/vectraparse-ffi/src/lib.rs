@@ -5,8 +5,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
-use vectraparse_core::{detect_with_limits_json, parse_with_limits_json, CAPABILITIES_JSON};
+use vectraparse_core::result::{ParseTiming, StructuredResult};
+use vectraparse_core::{runtime::ResourceLimits, runtime::validate_input_size, CAPABILITIES_JSON};
 use vectraparse_mime::{DetectHints, detect_media_type};
+use vectraparse_parsers::{
+    CompositeParser, DerivedTextParser, FeedParser, HtmlParser, LegacyDocParser, LightweightSpecializedParser,
+    MboxParser, MsSpecialParser, OdfParser, OoxmlParser, OleLegacyParser, PackageParser, Parser, PdfParser,
+    Rfc822MimeParser, RtfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+};
 
 #[repr(C)]
 pub struct VectraParseHandle {
@@ -76,6 +82,76 @@ fn resolve_limit(options: *const VectraParseOptions) -> usize {
     }
 }
 
+fn build_parser_pipeline() -> CompositeParser {
+    CompositeParser::new(vec![
+        Box::new(PackageParser) as Box<dyn Parser>,
+        Box::new(OoxmlParser),
+        Box::new(OdfParser),
+        Box::new(PdfParser),
+        Box::new(OleLegacyParser),
+        Box::new(MsSpecialParser),
+        Box::new(RtfParser),
+        Box::new(LegacyDocParser),
+        Box::new(Rfc822MimeParser),
+        Box::new(MboxParser),
+        Box::new(HtmlParser),
+        Box::new(XmlParser),
+        Box::new(TextAndCsvParser),
+        Box::new(TxtParser),
+        Box::new(SourceCodeParser),
+        Box::new(FeedParser),
+        Box::new(DerivedTextParser),
+        Box::new(LightweightSpecializedParser),
+        Box::new(StringsParser),
+    ])
+}
+
+fn detect_json_runtime(bytes: &[u8], hints: &DetectHints<'_>, limit: usize) -> Result<String, String> {
+    validate_input_size(
+        bytes.len(),
+        &ResourceLimits {
+            max_input_bytes: limit,
+            ..ResourceLimits::default()
+        },
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mime = detect_media_type(bytes, hints);
+    Ok(format!(
+        "{{\"mime_type\":\"{mime}\",\"metadata\":{{}},\"content\":null,\"embedded\":[],\"warnings\":[],\"errors\":[],\"parser_chain\":[],\"timing\":{{\"detect_ms\":0,\"parse_ms\":0}}}}"
+    ))
+}
+
+fn parse_json_runtime(bytes: &[u8], limit: usize) -> Result<String, String> {
+    validate_input_size(
+        bytes.len(),
+        &ResourceLimits {
+            max_input_bytes: limit,
+            ..ResourceLimits::default()
+        },
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mime = detect_media_type(bytes, &DetectHints::default());
+    let pipeline = build_parser_pipeline();
+    let out = pipeline.parse(bytes, &mime);
+    let mut result = StructuredResult {
+        mime_type: mime,
+        timing: ParseTiming {
+            detect_ms: 0,
+            parse_ms: 0,
+        },
+        ..StructuredResult::default()
+    };
+    if let Some(parsed) = out {
+        result.content = parsed.content;
+        result.metadata = parsed.metadata;
+        result.warnings = parsed.warnings;
+        result.parser_chain = parsed.parser_chain;
+    } else {
+        result.warnings.push("no-parser-matched".to_string());
+    }
+    Ok(result.to_json())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vectraparse_create_handle(out: *mut *mut VectraParseHandle) -> VectraParseError {
     if out.is_null() {
@@ -115,7 +191,7 @@ pub extern "C" fn vectraparse_detect(
     let run = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: input pointer and length are provided by caller and validated for non-null above.
         let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-        detect_with_limits_json(bytes, limit)
+        detect_json_runtime(bytes, &DetectHints::default(), limit)
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
@@ -154,25 +230,15 @@ pub extern "C" fn vectraparse_detect_with_hints(
     let run = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: input pointer and length are provided by caller and validated for non-null above.
         let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-        vectraparse_core::runtime::validate_input_size(
-            bytes.len(),
-            &vectraparse_core::runtime::ResourceLimits {
-                max_input_bytes: limit,
-                ..vectraparse_core::runtime::ResourceLimits::default()
-            },
-        )
-        .map_err(|e| format!("{e:?}"))?;
-        let mime = detect_media_type(
+        detect_json_runtime(
             bytes,
             &DetectHints {
                 resource_name: res_name,
                 content_type_hint: type_hint,
                 force_content_type: forced,
             },
-        );
-        Ok::<String, String>(format!(
-            "{{\"mime_type\":\"{mime}\",\"metadata\":{{}},\"content\":null,\"embedded\":[],\"warnings\":[],\"error\":null}}"
-        ))
+            limit,
+        )
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
@@ -199,7 +265,7 @@ pub extern "C" fn vectraparse_detect_file(
     let limit = resolve_limit(options);
     let run = catch_unwind(AssertUnwindSafe(|| {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        detect_with_limits_json(&bytes, limit)
+        detect_json_runtime(&bytes, &DetectHints::default(), limit)
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
@@ -223,7 +289,7 @@ pub extern "C" fn vectraparse_parse(
     let run = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: input pointer and length are provided by caller and validated for non-null above.
         let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-        parse_with_limits_json(bytes, limit)
+        parse_json_runtime(bytes, limit)
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
