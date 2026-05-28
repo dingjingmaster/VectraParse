@@ -107,7 +107,7 @@
 | P4-07 | 实现 OLE/CFB 旧 Office：DOC/XLS/PPT、OfficeParser、OldExcel、MSOwnerFile | OLE golden；宏/嵌入对象安全审查 | 完成 |
 | P4-08 | 实现 Microsoft 专有格式：OneNote、Access/Jackcess、TNEF、EMF、WMF、MSG/PST 联动 | 样本 golden；native/feature 依赖检查 | 完成 |
 | P4-09 | 实现 RTF 和 RTF object data 递归 | RTF golden；嵌入对象测试 | 完成 |
-| P4-10 | 实现 HWP、CHM、WordPerfect、Quattro Pro 等其他文档格式 | 每格式 golden；检测与 parser 映射测试 | 待开始 |
+| P4-10 | 实现 HWP、CHM、WordPerfect、Quattro Pro 等其他文档格式 | 每格式 golden；检测与 parser 映射测试 | 完成 |
 | P5-01 | 实现 RFC822/MIME 邮件 parser、附件递归和 charset 处理 | eml golden；多附件和坏 charset 测试 | 待开始 |
 | P5-02 | 实现 MBOX parser | mbox 多邮件样本；递归附件测试 | 待开始 |
 | P5-03 | 实现 Outlook PST/MSG/TNEF 邮箱能力 | pst/msg/tnef golden；大邮箱资源限制测试 | 待开始 |
@@ -148,7 +148,7 @@
 | M0 基础架构 | workspace、core、FFI、配置、资源限制、测试框架 | `detect`/空 parser 可通过 Rust 和 C ABI 调用，错误路径可释放资源 | 完成 |
 | M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 完成 |
 | M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 完成 |
-| M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 待开始 |
+| M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 完成 |
 | M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 待开始 |
 | M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 待开始 |
 | M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 | 待开始 |
@@ -224,6 +224,9 @@
 | 2026-05-28 | 完成 P4-06 PDF parser 初版 | 在 `vectraparse-parsers` 增加 PDF 版本/附件/权限/加密识别与 OCR/preflight 告警 |
 | 2026-05-28 | 完成 P4-07 OLE/CFB 旧 Office parser 初版 | 在 `vectraparse-parsers` 增加 DOC/XLS/PPT/OldExcel/MSOwnerFile 识别与宏/嵌入安全告警 |
 | 2026-05-28 | 完成 P4-08 Microsoft 专有格式 parser 初版 | 在 `vectraparse-parsers` 增加 OneNote/Access/TNEF/EMF/WMF/MSG/PST 识别与 metadata 输出 |
+| 2026-05-28 | 完成 P4-09 RTF parser 初版 | 在 `vectraparse-parsers` 增加 RTF 控制字剥离与 object data 计数/告警输出 |
+| 2026-05-28 | 完成 P4-10 其他历史文档 parser 初版 | 在 `vectraparse-parsers` 增加 HWP/CHM/WordPerfect/Quattro Pro 识别与 metadata 输出 |
+| 2026-05-28 | 完成里程碑 M3 文档与容器主链路 | P4-01 到 P4-10 全部完成并通过定向测试 |
 | 2026-05-28 | 完成 P4-09 RTF parser 初版 | 在 `vectraparse-parsers` 增加 RTF 控制字剥离与 object data 计数/告警输出 |
 
 ## 10. P0-01 默认确认结果
