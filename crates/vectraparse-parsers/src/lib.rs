@@ -226,6 +226,46 @@ impl Parser for MetadataOnlyParser {
     }
 }
 
+pub struct XmlParser;
+impl Parser for XmlParser {
+    fn name(&self) -> &'static str {
+        "XmlParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/xml" || media_type.ends_with("+xml")
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        if lower.contains("<!doctype") && lower.contains("<!entity") {
+            return Some(ParseOutcome {
+                content: None,
+                metadata: Metadata::default(),
+                warnings: vec!["xxe-blocked".to_string()],
+                parser_chain: Vec::new(),
+            });
+        }
+        let root = extract_xml_root(&content)?;
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "XmlParser");
+        metadata.insert("xml.root", root.clone());
+        if root.eq_ignore_ascii_case("dc") {
+            metadata.insert("xml.profile", "DcXML");
+        }
+        if root.eq_ignore_ascii_case("fictionbook") {
+            metadata.insert("xml.profile", "FictionBook");
+        }
+        // placeholder XPath behavior: keep text after matching tag if present
+        let text = strip_html_tags(&content);
+        Some(ParseOutcome {
+            content: Some(text),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -400,9 +440,39 @@ fn strip_html_tags(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn extract_xml_root(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if i + 1 < bytes.len() && (bytes[i + 1] == b'?' || bytes[i + 1] == b'!') {
+                i += 1;
+            } else {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() {
+                    let c = bytes[j] as char;
+                    if c.is_whitespace() || c == '>' || c == '/' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j > start {
+                    return Some(s[start..j].to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser};
+    use super::{
+        CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser,
+        XmlParser,
+    };
 
     #[test]
     fn mime_to_parser_mapping_and_fallback() {
@@ -411,6 +481,7 @@ mod tests {
             Box::new(HtmlParser),
             Box::new(TxtParser),
             Box::new(TextAndCsvParser),
+            Box::new(XmlParser),
         ]);
         let text = composite
             .parse(b"hello", "text/plain")
@@ -511,5 +582,36 @@ mod tests {
             Some("https://example.com")
         );
         assert!(out.content.as_deref().unwrap_or("").contains("text"));
+    }
+
+    #[test]
+    fn xml_parser_extracts_root_and_blocks_xxe() {
+        let p = XmlParser;
+        let out = p
+            .parse(b"<?xml version='1.0'?><FictionBook><body>x</body></FictionBook>", "application/xml")
+            .expect("xml");
+        assert_eq!(
+            out.metadata
+                .values("xml.root")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("FictionBook")
+        );
+        assert_eq!(
+            out.metadata
+                .values("xml.profile")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("FictionBook")
+        );
+
+        let blocked = p
+            .parse(
+                b"<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><foo>&xxe;</foo>",
+                "application/xml",
+            )
+            .expect("xxe result");
+        assert!(blocked.warnings.iter().any(|w| w == "xxe-blocked"));
+        assert!(blocked.content.is_none());
     }
 }
