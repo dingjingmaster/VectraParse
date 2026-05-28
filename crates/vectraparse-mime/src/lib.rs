@@ -105,6 +105,13 @@ impl MagicMatcher {
                 mask: None,
             },
             MagicRule {
+                mime: "application/x-bplist",
+                priority: 44,
+                offset: 0,
+                pattern: b"bplist00",
+                mask: None,
+            },
+            MagicRule {
                 mime: "application/octet-stream",
                 priority: 1,
                 offset: 0,
@@ -190,7 +197,13 @@ pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
     if magic == "application/x-tika-msoffice" {
         return specialize_ole_container(input).to_string();
     }
+    if magic == "application/x-bplist" {
+        return "application/x-bplist".to_string();
+    }
     if magic == "application/octet-stream" {
+        if let Some(plist) = detect_apple_xml_plist(input) {
+            return plist.to_string();
+        }
         if let Some(refined) = detect_xml_html_or_text(input) {
             return refined;
         }
@@ -342,6 +355,19 @@ fn looks_like_plain_text(input: &[u8]) -> bool {
         return printable * 100 / total >= 90;
     }
     false
+}
+
+fn detect_apple_xml_plist(input: &[u8]) -> Option<&'static str> {
+    let s = std::str::from_utf8(input).ok()?;
+    let t = s.trim_start_matches('\u{feff}').trim_start();
+    if t.starts_with("<?xml")
+        && t.contains("<!DOCTYPE plist")
+        && t.contains("<plist")
+        && t.contains("</plist>")
+    {
+        return Some("application/x-plist");
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -693,6 +719,23 @@ mod tests {
                 &DetectHints::default()
             ),
             "application/vnd.ms-outlook"
+        );
+    }
+
+    #[test]
+    fn detect_bplist_and_xml_plist() {
+        assert_eq!(
+            detect_media_type(b"bplist00....", &DetectHints::default()),
+            "application/x-bplist"
+        );
+        assert_eq!(
+            detect_media_type(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict/></plist>"#,
+                &DetectHints::default()
+            ),
+            "application/x-plist"
         );
     }
 }
