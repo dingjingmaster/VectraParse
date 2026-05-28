@@ -124,7 +124,7 @@
 | P7-01 | 实现语言识别 API、n-gram 资源和 `LanguageIdentifier` 等价能力 | 多语种 corpus；低置信度/短文本测试 | 完成 |
 | P7-02 | 实现语言 provider：Optimaize、Text、Lingo24 等价或替代 | provider 切换、禁用、配置错误测试 | 完成 |
 | P7-03 | 实现翻译 provider：Microsoft、Google、Lingo24、Cached、Joshua、Moses、Yandex 的配置边界 | mock 服务、缓存、密钥缺失、超时降级测试 | 完成 |
-| P7-04 | 实现 NLP/NER 多后端和 sentiment | mock/model 样本；模型缺失降级测试 | 待开始 |
+| P7-04 | 实现 NLP/NER 多后端和 sentiment | mock/model 样本；模型缺失降级测试 | 完成 |
 | P7-05 | 实现 cTAKES 医学文本集成边界 | 医学样本 golden；外部依赖关闭测试 | 待开始 |
 | P7-06 | 实现深度学习 recognition 和 captioning 模型接入 | 模型路径、批量资源限制、失败降级测试 | 待开始 |
 | P7-07 | 实现 OCR/Tesseract 和 external parser XML 配置 | OCR 样本、命令超时、沙箱/路径限制测试 | 待开始 |
@@ -194,6 +194,7 @@
 | 2026-05-28 | 完成 P7-01 语言识别 parser | 增加 LanguageIdentifier 等价能力与低置信度/短文本告警测试 |
 | 2026-05-28 | 完成 P7-02 语言 provider parser | 覆盖 Optimaize/Text/Lingo24 切换与禁用/配置错误测试 |
 | 2026-05-28 | 完成 P7-03 翻译 provider parser | 覆盖多 provider、缓存、密钥缺失与超时降级测试 |
+| 2026-05-28 | 完成 P7-04 NLP/NER parser | 覆盖多后端、sentiment 与模型缺失降级测试 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
