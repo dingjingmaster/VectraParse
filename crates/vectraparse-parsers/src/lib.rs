@@ -1109,6 +1109,53 @@ impl Parser for ImageMetadataParser {
     }
 }
 
+pub struct AudioMetadataParser;
+impl Parser for AudioMetadataParser {
+    fn name(&self) -> &'static str {
+        "AudioMetadataParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(media_type, "audio/mpeg" | "audio/midi" | "audio/basic")
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(input);
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "AudioMetadataParser");
+        let format = if media_type == "audio/midi" || lower.contains("mthd") {
+            "midi"
+        } else if media_type == "audio/mpeg" || lower.contains("id3") || lower.contains("xffxfb") {
+            "mp3"
+        } else {
+            "audio"
+        };
+        metadata.insert("audio.format", format);
+        if let Some(v) = extract_tag_value(&text, "Title:") {
+            metadata.insert("audio.title", v);
+        }
+        if let Some(v) = extract_tag_value(&text, "Artist:") {
+            metadata.insert("audio.artist", v);
+        }
+        if let Some(v) = extract_tag_value(&text, "Album:") {
+            metadata.insert("audio.album", v);
+        }
+        metadata.insert("audio.byte_length", input.len().to_string());
+        let mut warnings = Vec::new();
+        if media_type == "audio/mpeg" && !lower.contains("id3") && !lower.contains("xffxfb") {
+            warnings.push("audio-bad-tag".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1306,6 +1353,13 @@ fn strip_rtf_control_words(s: &str) -> String {
 }
 
 fn extract_header(content: &str, key: &str) -> Option<String> {
+    content
+        .lines()
+        .find(|l| l.starts_with(key))
+        .map(|l| l[key.len()..].trim().to_string())
+}
+
+fn extract_tag_value(content: &str, key: &str) -> Option<String> {
     content
         .lines()
         .find(|l| l.starts_with(key))
@@ -1511,7 +1565,7 @@ mod tests {
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
-        ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
+        AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2311,5 +2365,37 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "image-corrupted-or-unknown"));
+    }
+
+    #[test]
+    fn audio_metadata_parser_extracts_mp3_tags() {
+        let p = AudioMetadataParser;
+        let out = p
+            .parse(
+                b"ID3\nTitle: Song A\nArtist: Artist A\nAlbum: Album A\n",
+                "audio/mpeg",
+            )
+            .expect("audio");
+        assert_eq!(
+            out.metadata
+                .values("audio.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("mp3")
+        );
+        assert_eq!(
+            out.metadata
+                .values("audio.title")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("Song A")
+        );
+    }
+
+    #[test]
+    fn audio_metadata_parser_warns_on_bad_mp3_tag() {
+        let p = AudioMetadataParser;
+        let out = p.parse(b"raw-audio-stream", "audio/mpeg").expect("audio");
+        assert!(out.warnings.iter().any(|w| w == "audio-bad-tag"));
     }
 }
