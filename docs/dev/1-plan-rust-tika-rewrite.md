@@ -138,7 +138,7 @@
 | P9-03 | 建立安全测试：zip bomb、深递归 XML、损坏 PDF/Office、超大 metadata、路径穿越 | 所有资源限制命中后状态一致且资源释放 | 完成 |
 | P9-04 | 建立 fuzzing：detector、MIME XML 表、ZIP/OLE、PDF/Office 入口、FFI JSON | fuzz smoke 和定期长跑报告 | 完成 |
 | P9-05 | 建立性能基准：检测吞吐、常见格式解析耗时、峰值内存、并发解析 | bench 基线；性能回归阈值 | 完成 |
-| P9-06 | 建立 ABI/linkage 验证：staticlib/cdylib、C/C++、Go/Python/Java/JNI 可选消费方 | 多语言 smoke；符号和内存释放检查 | 待开始 |
+| P9-06 | 建立 ABI/linkage 验证：staticlib/cdylib、C/C++、Go/Python/Java/JNI 可选消费方 | 多语言 smoke；符号和内存释放检查 | 完成 |
 | P9-07 | 建立发布验收：clean checkout、无网络/有缓存构建、feature 组合、包体积、许可证 | release checklist 全通过 | 待开始 |
 
 ## 6. 里程碑验收
@@ -208,6 +208,7 @@
 | 2026-05-28 | 完成 P9-03 安全矩阵测试 | 覆盖 zip 深度/路径穿越、XXE 阻断、损坏 PDF 告警一致性 |
 | 2026-05-28 | 完成 P9-04 fuzz smoke 流程 | 新增 detector/parser/ffi smoke 脚本与报告产物 |
 | 2026-05-28 | 完成 P9-05 bench smoke 流程 | 新增吞吐/解析/并发 smoke 基线与回归阈值报告 |
+| 2026-05-28 | 完成 P9-06 ABI/linkage smoke | 覆盖 staticlib/cdylib 构建、C 消费方调用与导出符号检查 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
