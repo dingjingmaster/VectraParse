@@ -97,7 +97,7 @@
 | P3-06 | 实现 strings/Latin1 strings parser | 二进制 strings 样本；输出上限测试 | 完成 |
 | P3-07 | 实现 feed parser：RSS、Atom 等 | feed golden；坏 XML 降级测试 | 完成 |
 | P3-08 | 实现 IPTC ANPA、XLIFF/XLZ、DIF、ENVI header 等文本衍生格式 | 每格式最小 golden；MIME 检测联动测试 | 完成 |
-| P3-09 | 实现 AppleSingle、PList、FictionBook、DcXML 等轻量专用 parser | SPI 类名映射快照；格式样本测试 | 待开始 |
+| P3-09 | 实现 AppleSingle、PList、FictionBook、DcXML 等轻量专用 parser | SPI 类名映射快照；格式样本测试 | 完成 |
 | P4-01 | 实现压缩/包 parser：Package、Compressor、RAR，以及 zip/tar/gzip/bzip2/xz/zstd/7z 策略 | 解压 golden；解压比例/深度/数量限制测试 | 待开始 |
 | P4-02 | 实现 OOXML：docx/xlsx/pptx、关系文件、core props、嵌入文件、旧 Excel XML/WordML/SpreadsheetML | Office golden；嵌入附件和公式/表格样本测试 | 待开始 |
 | P4-03 | 实现 ODF/OpenDocument/OpenOffice parser | odt/ods/odp golden；manifest 和 metadata 测试 | 待开始 |
@@ -147,7 +147,7 @@
 |--------|----------|----------|------|
 | M0 基础架构 | workspace、core、FFI、配置、资源限制、测试框架 | `detect`/空 parser 可通过 Rust 和 C ABI 调用，错误路径可释放资源 | 完成 |
 | M1 检测闭环 | MIME 数据库、detector、encoding、容器 specialization | Tika 检测 golden 通过，ZIP/OLE/BPList 不被粗略误判 | 完成 |
-| M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 待开始 |
+| M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 完成 |
 | M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 待开始 |
 | M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 待开始 |
 | M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 待开始 |
@@ -214,6 +214,8 @@
 | 2026-05-28 | 完成 P3-06 strings parser 初版 | 在 `vectraparse-parsers` 增加 ASCII+Latin1 strings 提取与输出上限控制 |
 | 2026-05-28 | 完成 P3-07 feed parser 初版 | 在 `vectraparse-parsers` 增加 RSS/Atom 解析、link metadata 与坏 XML 降级告警 |
 | 2026-05-28 | 完成 P3-08 文本衍生格式 parser 初版 | 在 `vectraparse-parsers` 增加 IPTC/XLIFF/DIF/ENVI 最小识别与 derived.format metadata 输出 |
+| 2026-05-28 | 完成 P3-09 轻量专用 parser 初版 | 在 `vectraparse-parsers` 增加 AppleSingle/PList/FictionBook/DcXML profile 识别与测试 |
+| 2026-05-28 | 完成里程碑 M2 基础提取 | P3-01 到 P3-09 全部完成并通过定向测试 |
 
 ## 10. P0-01 默认确认结果
 
