@@ -98,6 +98,13 @@ impl MagicMatcher {
                 mask: None,
             },
             MagicRule {
+                mime: "application/x-tika-msoffice",
+                priority: 45,
+                offset: 0,
+                pattern: b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",
+                mask: None,
+            },
+            MagicRule {
                 mime: "application/octet-stream",
                 priority: 1,
                 offset: 0,
@@ -180,6 +187,9 @@ pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
     if magic == "application/zip" {
         return specialize_zip_container(input).to_string();
     }
+    if magic == "application/x-tika-msoffice" {
+        return specialize_ole_container(input).to_string();
+    }
     if magic == "application/octet-stream" {
         if let Some(refined) = detect_xml_html_or_text(input) {
             return refined;
@@ -234,6 +244,29 @@ fn specialize_zip_container(input: &[u8]) -> &'static str {
         return "application/java-archive";
     }
     "application/zip"
+}
+
+fn specialize_ole_container(input: &[u8]) -> &'static str {
+    let probe = String::from_utf8_lossy(&input[..input.len().min(512 * 1024)]);
+    if probe.contains("WordDocument") {
+        return "application/msword";
+    }
+    if probe.contains("Workbook") || probe.contains("Book") {
+        return "application/vnd.ms-excel";
+    }
+    if probe.contains("PowerPoint Document") {
+        return "application/vnd.ms-powerpoint";
+    }
+    if probe.contains("__properties_version1.0") || probe.contains("__substg1.0_") {
+        return "application/vnd.ms-outlook";
+    }
+    if probe.contains("MSysObjects") || probe.contains("Standard Jet DB") {
+        return "application/x-msaccess";
+    }
+    if probe.contains("~$") || probe.contains("OwnerFile") {
+        return "application/x-tika-msoffice";
+    }
+    "application/x-tika-msoffice"
 }
 
 fn detect_xml_html_or_text(input: &[u8]) -> Option<String> {
@@ -635,6 +668,31 @@ mod tests {
         assert_eq!(
             detect_media_type(b"PK\x03\x04...random...", &DetectHints::default()),
             "application/zip"
+        );
+    }
+
+    #[test]
+    fn detect_ole_specialization_chain() {
+        assert_eq!(
+            detect_media_type(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1....WordDocument....",
+                &DetectHints::default()
+            ),
+            "application/msword"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1....Workbook....",
+                &DetectHints::default()
+            ),
+            "application/vnd.ms-excel"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1....__substg1.0_....",
+                &DetectHints::default()
+            ),
+            "application/vnd.ms-outlook"
         );
     }
 }
