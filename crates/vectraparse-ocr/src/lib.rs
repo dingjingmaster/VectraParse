@@ -12,6 +12,9 @@ pub struct OcrConfig {
     pub rec_dict_path: Option<String>,
     pub rec_img_h: usize,
     pub rec_img_w: usize,
+    pub det_img_side: usize,
+    pub det_box_thresh: f32,
+    pub det_min_box_area: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -22,22 +25,23 @@ pub struct OcrResult {
 }
 
 pub struct TractOcrEngine {
+    det: TypedRunnableModel<TypedModel>,
     rec: TypedRunnableModel<TypedModel>,
     alphabet: Vec<String>,
 }
 
 impl TractOcrEngine {
     pub fn load(cfg: &OcrConfig) -> TractResult<Self> {
-        // Keep loading det model to validate model presence for future integration.
-        let _ = tract_onnx::onnx()
+        let det = tract_onnx::onnx()
             .model_for_path(Path::new(&cfg.det_model_path))?
-            .into_optimized()?;
+            .into_optimized()?
+            .into_runnable()?;
         let rec = tract_onnx::onnx()
             .model_for_path(Path::new(&cfg.rec_model_path))?
             .into_optimized()?
             .into_runnable()?;
         let alphabet = load_dict(cfg.rec_dict_path.as_deref());
-        Ok(Self { rec, alphabet })
+        Ok(Self { det, rec, alphabet })
     }
 
     pub fn infer(&self, image_bytes: &[u8], cfg: &OcrConfig) -> TractResult<OcrResult> {
@@ -46,10 +50,29 @@ impl TractOcrEngine {
     }
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> TractResult<OcrResult> {
-        let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-        let output = self.rec.run(tvec!(rec_input.into()))?;
-        let logits = output[0].to_array_view::<f32>()?;
-        let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
+        let boxes = self.detect_text_boxes(img, cfg)?;
+        let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
+        for b in boxes {
+            let crop = crop_box(img, b);
+            let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
+            let output = self.rec.run(tvec!(rec_input.into()))?;
+            let logits = output[0].to_array_view::<f32>()?;
+            let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
+            if !text.trim().is_empty() {
+                lines.push((b.1, b.0, text, confidence));
+            }
+        }
+        lines.sort_by_key(|(y, x, _, _)| (*y / 8, *x));
+        let text = lines
+            .iter()
+            .map(|(_, _, t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let confidence = if lines.is_empty() {
+            0.0
+        } else {
+            lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
+        };
         let warning = if self.alphabet.is_empty() {
             Some("ocr-dictionary-missing".to_string())
         } else {
@@ -71,7 +94,36 @@ impl Default for OcrConfig {
             rec_dict_path: Some("data/ppocr_keys_v1.txt".to_string()),
             rec_img_h: 48,
             rec_img_w: 320,
+            det_img_side: 960,
+            det_box_thresh: 0.3,
+            det_min_box_area: 32,
         }
+    }
+}
+
+type BoxRect = (u32, u32, u32, u32);
+
+impl TractOcrEngine {
+    fn detect_text_boxes(&self, img: &DynamicImage, cfg: &OcrConfig) -> TractResult<Vec<BoxRect>> {
+        let (det_input, sx, sy, w, h) = preprocess_det_image(img, cfg.det_img_side)?;
+        let output = self.det.run(tvec!(det_input.into()))?;
+        let map = output[0].to_array_view::<f32>()?;
+        let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
+        for b in &mut boxes {
+            b.0 = ((b.0 as f32) * sx).round() as u32;
+            b.1 = ((b.1 as f32) * sy).round() as u32;
+            b.2 = ((b.2 as f32) * sx).round() as u32;
+            b.3 = ((b.3 as f32) * sy).round() as u32;
+            b.0 = b.0.min(w.saturating_sub(1));
+            b.1 = b.1.min(h.saturating_sub(1));
+            b.2 = b.2.min(w);
+            b.3 = b.3.min(h);
+        }
+        boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
+        if boxes.is_empty() {
+            boxes.push((0, 0, w, h));
+        }
+        Ok(boxes)
     }
 }
 
@@ -88,6 +140,101 @@ fn load_dict(path: Option<&str>) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn preprocess_det_image(
+    image: &DynamicImage,
+    side: usize,
+) -> TractResult<(Tensor, f32, f32, u32, u32)> {
+    let rgb = image.to_rgb8();
+    let (src_w, src_h) = rgb.dimensions();
+    let resized = image::imageops::resize(&rgb, side as u32, side as u32, FilterType::Triangle);
+    let mut data = vec![0f32; 1 * 3 * side * side];
+    for y in 0..side {
+        for x in 0..side {
+            let px = resized.get_pixel(x as u32, y as u32);
+            for c in 0..3 {
+                let v = px[c] as f32 / 255.0;
+                let idx = c * side * side + y * side + x;
+                data[idx] = v;
+            }
+        }
+    }
+    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, side, side), data)?;
+    let sx = src_w as f32 / side as f32;
+    let sy = src_h as f32 / side as f32;
+    Ok((arr.into_tensor(), sx, sy, src_w, src_h))
+}
+
+fn extract_boxes_from_map(
+    map: &tract_ndarray::ArrayViewD<'_, f32>,
+    thresh: f32,
+    min_area: usize,
+) -> Vec<BoxRect> {
+    if map.ndim() != 4 {
+        return Vec::new();
+    }
+    let h = map.shape()[2];
+    let w = map.shape()[3];
+    let mut mask = vec![false; h * w];
+    for y in 0..h {
+        for x in 0..w {
+            let v = map[[0, 0, y, x]];
+            mask[y * w + x] = v >= thresh;
+        }
+    }
+    let mut visited = vec![false; h * w];
+    let mut boxes = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if visited[idx] || !mask[idx] {
+                continue;
+            }
+            let mut queue = vec![(x, y)];
+            visited[idx] = true;
+            let mut min_x = x;
+            let mut min_y = y;
+            let mut max_x = x;
+            let mut max_y = y;
+            let mut area = 0usize;
+            while let Some((cx, cy)) = queue.pop() {
+                area += 1;
+                min_x = min_x.min(cx);
+                min_y = min_y.min(cy);
+                max_x = max_x.max(cx);
+                max_y = max_y.max(cy);
+                let neigh = [
+                    (cx.wrapping_sub(1), cy),
+                    (cx + 1, cy),
+                    (cx, cy.wrapping_sub(1)),
+                    (cx, cy + 1),
+                ];
+                for (nx, ny) in neigh {
+                    if nx >= w || ny >= h {
+                        continue;
+                    }
+                    let nidx = ny * w + nx;
+                    if visited[nidx] || !mask[nidx] {
+                        continue;
+                    }
+                    visited[nidx] = true;
+                    queue.push((nx, ny));
+                }
+            }
+            if area >= min_area {
+                boxes.push((min_x as u32, min_y as u32, (max_x + 1) as u32, (max_y + 1) as u32));
+            }
+        }
+    }
+    boxes
+}
+
+fn crop_box(img: &DynamicImage, b: BoxRect) -> DynamicImage {
+    let (x0, y0, x1, y1) = b;
+    let w = x1.saturating_sub(x0).max(1);
+    let h = y1.saturating_sub(y0).max(1);
+    img.crop_imm(x0, y0, w, h)
 }
 
 fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) -> TractResult<Tensor> {
