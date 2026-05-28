@@ -1394,6 +1394,56 @@ impl Parser for GeoEngineeringParser {
     }
 }
 
+pub struct SpecialistFormatParser;
+impl Parser for SpecialistFormatParser {
+    fn name(&self) -> &'static str {
+        "SpecialistFormatParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/x-isatab"
+                | "application/x-grobid-tei"
+                | "application/x-pooled-timeseries"
+                | "application/x-pot"
+                | "application/x-prt"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "SpecialistFormatParser");
+        let kind = if media_type == "application/x-isatab" || lower.contains("investigation.txt") {
+            "isa-tab"
+        } else if media_type == "application/x-grobid-tei" || lower.contains("<tei") {
+            "grobid-journal"
+        } else if media_type == "application/x-pooled-timeseries" || lower.contains("timeseries") {
+            "pooled-timeseries"
+        } else if media_type == "application/x-pot" || lower.contains("msgid") {
+            "pot"
+        } else {
+            "prt"
+        };
+        metadata.insert("special.kind", kind);
+        let mut warnings = Vec::new();
+        if kind == "grobid-journal" && lower.contains("service:disabled") {
+            warnings.push("special-external-service-disabled".to_string());
+        }
+        if kind == "grobid-journal" && lower.contains("service:timeout") {
+            warnings.push("special-external-service-timeout".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&String::from_utf8_lossy(input))),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1805,7 +1855,7 @@ mod tests {
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
-        GeoEngineeringParser, ScienceDataParser,
+        GeoEngineeringParser, ScienceDataParser, SpecialistFormatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2766,5 +2816,34 @@ mod tests {
                 .map(String::as_str),
             Some("geo")
         );
+    }
+
+    #[test]
+    fn specialist_format_parser_detects_kind_and_service_degrade() {
+        let p = SpecialistFormatParser;
+        let isa = p
+            .parse(b"investigation.txt study.txt assay.txt", "application/x-isatab")
+            .expect("isa");
+        assert_eq!(
+            isa.metadata
+                .values("special.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("isa-tab")
+        );
+        let grobid = p
+            .parse(
+                b"<TEI>service:disabled service:timeout</TEI>",
+                "application/x-grobid-tei",
+            )
+            .expect("grobid");
+        assert!(grobid
+            .warnings
+            .iter()
+            .any(|w| w == "special-external-service-disabled"));
+        assert!(grobid
+            .warnings
+            .iter()
+            .any(|w| w == "special-external-service-timeout"));
     }
 }
