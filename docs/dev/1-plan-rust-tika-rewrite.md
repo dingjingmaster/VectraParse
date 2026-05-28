@@ -210,6 +210,7 @@
 | 2026-05-28 | 完成 P9-05 bench smoke 流程 | 新增吞吐/解析/并发 smoke 基线与回归阈值报告 |
 | 2026-05-28 | 完成 P9-06 ABI/linkage smoke | 覆盖 staticlib/cdylib 构建、C 消费方调用与导出符号检查 |
 | 2026-05-28 | 完成 P9-07 发布验收流程 | 新增 release checklist 脚本并完成全工作区验收，M7 达成 |
+| 2026-05-28 | 引入 tract OCR 后端骨架 | 新增 `vectraparse-ocr` crate，接入 `tract-onnx` 并完成工作区编译验证，作为后续 PP-OCR det/rec 推理集成基础 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
