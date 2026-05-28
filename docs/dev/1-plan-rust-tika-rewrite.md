@@ -93,7 +93,7 @@
 | P3-02 | 实现 CSV/TSV/分隔文本 parser，覆盖 `TextAndCSVParser` | CSV 方言、转义、坏行、metadata 测试 | 完成 |
 | P3-03 | 实现 HTML parser，提取正文、title、meta、链接和 charset | HTML golden；恶意/深层 DOM 资源限制测试 | 完成 |
 | P3-04 | 实现 XML parser、DcXML、FictionBook、通用 XML metadata 和 XPath | XML root golden；XXE 禁止测试 | 完成 |
-| P3-05 | 实现 source code parser 和语言识别/metadata | 多语言源码样本；纯文本兜底差异测试 | 待开始 |
+| P3-05 | 实现 source code parser 和语言识别/metadata | 多语言源码样本；纯文本兜底差异测试 | 完成 |
 | P3-06 | 实现 strings/Latin1 strings parser | 二进制 strings 样本；输出上限测试 | 待开始 |
 | P3-07 | 实现 feed parser：RSS、Atom 等 | feed golden；坏 XML 降级测试 | 待开始 |
 | P3-08 | 实现 IPTC ANPA、XLIFF/XLZ、DIF、ENVI header 等文本衍生格式 | 每格式最小 golden；MIME 检测联动测试 | 待开始 |
@@ -210,6 +210,7 @@
 | 2026-05-28 | 完成 P3-02 CSV/TSV parser 初版 | 在 `vectraparse-parsers` 增加方言检测、转义处理、坏行检测和结构化 metadata 输出 |
 | 2026-05-28 | 完成 P3-03 HTML parser 初版 | 在 `vectraparse-parsers` 增加正文/title/meta/link/charset 提取与深层输入告警测试 |
 | 2026-05-28 | 完成 P3-04 XML parser 初版 | 在 `vectraparse-parsers` 增加 XML root/profile 提取与 XXE 阻断测试 |
+| 2026-05-28 | 完成 P3-05 source code parser 初版 | 在 `vectraparse-parsers` 增加源码语言识别与 source metadata 输出 |
 
 ## 10. P0-01 默认确认结果
 
