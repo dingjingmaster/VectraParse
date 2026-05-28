@@ -325,6 +325,66 @@ impl Parser for StringsParser {
     }
 }
 
+pub struct FeedParser;
+impl Parser for FeedParser {
+    fn name(&self) -> &'static str {
+        "FeedParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/rss+xml"
+            || media_type == "application/atom+xml"
+            || media_type == "application/xml"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "FeedParser");
+        let mut warnings = Vec::new();
+        let feed_type = if lower.contains("<rss") {
+            "rss"
+        } else if lower.contains("<feed") {
+            "atom"
+        } else {
+            "unknown"
+        };
+        metadata.insert("feed.type", feed_type);
+        if feed_type == "unknown" {
+            warnings.push("feed-fallback-plain-xml".to_string());
+            return Some(ParseOutcome {
+                content: Some(strip_html_tags(&content)),
+                metadata,
+                warnings,
+                parser_chain: Vec::new(),
+            });
+        }
+        if !lower.contains("</rss>") && !lower.contains("</feed>") {
+            warnings.push("feed-malformed-xml".to_string());
+            return Some(ParseOutcome {
+                content: Some(strip_html_tags(&content)),
+                metadata,
+                warnings,
+                parser_chain: Vec::new(),
+            });
+        }
+        let title = extract_between(&content, "<title>", "</title>").unwrap_or_default();
+        if !title.is_empty() {
+            metadata.insert("feed.title", title);
+        }
+        let links = extract_feed_links(&content);
+        for l in &links {
+            metadata.insert("feed.link", l.clone());
+        }
+        metadata.insert("feed.link_count", links.len().to_string());
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -540,6 +600,27 @@ fn detect_source_language(content: &str) -> &'static str {
     }
 }
 
+fn extract_feed_links(content: &str) -> Vec<String> {
+    let mut out = extract_html_links(content);
+    let mut i = 0usize;
+    while let Some(pos) = content[i..].find("<link") {
+        let start = i + pos;
+        let rest = &content[start..];
+        let end = match rest.find('>') {
+            Some(v) => v,
+            None => break,
+        };
+        let tag = &rest[..end];
+        if let Some(href) = extract_attr(tag, "href") {
+            out.push(href);
+        }
+        i = start + end + 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn extract_ascii_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
@@ -590,7 +671,7 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser,
-        SourceCodeParser, StringsParser, XmlParser,
+        FeedParser, SourceCodeParser, StringsParser, XmlParser,
     };
 
     #[test]
@@ -763,5 +844,40 @@ mod tests {
                 .map(String::as_str),
             Some("ascii+latin1")
         );
+    }
+
+    #[test]
+    fn feed_parser_supports_rss_atom_and_malformed_fallback() {
+        let p = FeedParser;
+        let rss = p
+            .parse(
+                br#"<?xml version="1.0"?><rss><channel><title>T</title><link>https://a</link></channel></rss>"#,
+                "application/rss+xml",
+            )
+            .expect("rss");
+        assert_eq!(
+            rss.metadata
+                .values("feed.type")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("rss")
+        );
+        let atom = p
+            .parse(
+                br#"<?xml version="1.0"?><feed><title>A</title><link href="https://b"/></feed>"#,
+                "application/atom+xml",
+            )
+            .expect("atom");
+        assert_eq!(
+            atom.metadata
+                .values("feed.type")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("atom")
+        );
+        let bad = p
+            .parse(br#"<?xml version="1.0"?><feed><title>bad"#, "application/xml")
+            .expect("bad");
+        assert!(bad.warnings.iter().any(|w| w == "feed-malformed-xml"));
     }
 }
