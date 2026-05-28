@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MimeStats {
     pub mime_type_count: usize,
@@ -27,9 +29,124 @@ pub fn source_path() -> &'static str {
     generated::TIKA_MIME_XML_PATH
 }
 
+#[derive(Debug, Default)]
+pub struct MediaTypeRegistry {
+    aliases: HashMap<&'static str, &'static str>,
+    superclasses: HashMap<&'static str, Vec<&'static str>>,
+    known: HashSet<&'static str>,
+}
+
+impl MediaTypeRegistry {
+    pub fn from_generated() -> Self {
+        let mut aliases = HashMap::new();
+        for (alias, canonical) in generated::ALIAS_PAIRS {
+            aliases.insert(*alias, *canonical);
+        }
+        let mut superclasses = HashMap::new();
+        for (child, parent) in generated::SUBCLASS_PAIRS {
+            superclasses
+                .entry(*child)
+                .or_insert_with(Vec::new)
+                .push(*parent);
+        }
+        let known = generated::KNOWN_MIME_TYPES.iter().copied().collect();
+        Self {
+            aliases,
+            superclasses,
+            known,
+        }
+    }
+
+    pub fn normalize(&self, raw: &str) -> Option<String> {
+        let mut current = normalize_media_type(raw)?;
+        let mut guard = 0usize;
+        while let Some(canonical) = self.aliases.get(current.as_str()) {
+            if *canonical == current {
+                break;
+            }
+            current = (*canonical).to_string();
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        Some(current)
+    }
+
+    pub fn supertypes(&self, raw: &str) -> Vec<String> {
+        let Some(normalized) = self.normalize(raw) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![normalized];
+        let mut seen = HashSet::new();
+        while let Some(mt) = stack.pop() {
+            if !seen.insert(mt.clone()) {
+                continue;
+            }
+            if let Some(next) = self.superclasses.get(mt.as_str()) {
+                for parent in next {
+                    out.push((*parent).to_string());
+                    stack.push((*parent).to_string());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn direct_supertype(&self, raw: &str) -> Option<String> {
+        let normalized = self.normalize(raw)?;
+        self.superclasses
+            .get(normalized.as_str())
+            .and_then(|v| v.first().copied())
+            .map(ToString::to_string)
+    }
+
+    pub fn is_specialization_of(&self, raw: &str, maybe_parent: &str) -> bool {
+        let Some(child) = self.normalize(raw) else {
+            return false;
+        };
+        let Some(parent) = self.normalize(maybe_parent) else {
+            return false;
+        };
+        if child == parent {
+            return true;
+        }
+        self.supertypes(&child).iter().any(|p| p == &parent)
+    }
+
+    pub fn specialize(&self, parent: &str, candidate: &str) -> Option<String> {
+        let normalized_candidate = self.normalize(candidate)?;
+        if self.is_specialization_of(&normalized_candidate, parent) {
+            return Some(normalized_candidate);
+        }
+        None
+    }
+
+    pub fn knows(&self, raw: &str) -> bool {
+        self.normalize(raw)
+            .is_some_and(|normalized| self.known.contains(normalized.as_str()))
+    }
+}
+
+fn normalize_media_type(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let no_params = trimmed.split(';').next()?.trim();
+    let (ty, sub) = no_params.split_once('/')?;
+    let ty = ty.trim().to_ascii_lowercase();
+    let sub = sub.trim().to_ascii_lowercase();
+    if ty.is_empty() || sub.is_empty() {
+        return None;
+    }
+    Some(format!("{ty}/{sub}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{generated_stats, source_path};
+    use super::{MediaTypeRegistry, generated_stats, source_path};
 
     #[test]
     fn generated_counts_match_expected_tika_snapshot() {
@@ -45,5 +162,44 @@ mod tests {
     #[test]
     fn source_path_is_stable() {
         assert!(source_path().ends_with("tika-mimetypes.xml"));
+    }
+
+    #[test]
+    fn registry_normalize_alias_and_params() {
+        let reg = MediaTypeRegistry::from_generated();
+        assert_eq!(
+            reg.normalize(" Application/X-Javascript ; charset=utf-8 ")
+                .as_deref(),
+            Some("application/javascript")
+        );
+    }
+
+    #[test]
+    fn registry_supertype_and_specialize_work() {
+        let reg = MediaTypeRegistry::from_generated();
+        assert_eq!(
+            reg.direct_supertype("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                .as_deref(),
+            Some("application/x-tika-ooxml")
+        );
+        assert!(
+            reg.supertypes("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                .iter()
+                .any(|v| v == "application/zip")
+        );
+        assert!(
+            reg.is_specialization_of(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/zip"
+            )
+        );
+        assert_eq!(
+            reg.specialize(
+                "application/zip",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            .as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
     }
 }
