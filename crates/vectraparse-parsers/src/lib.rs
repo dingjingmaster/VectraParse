@@ -1491,6 +1491,56 @@ impl Parser for CryptoSecurityParser {
     }
 }
 
+pub struct BinaryFontParser;
+impl Parser for BinaryFontParser {
+    fn name(&self) -> &'static str {
+        "BinaryFontParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/java-vm"
+                | "application/x-executable"
+                | "application/x-font-afm"
+                | "font/ttf"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "BinaryFontParser");
+        let kind = if media_type == "application/java-vm" || input.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) {
+            "java-class"
+        } else if media_type == "application/x-executable"
+            || input.starts_with(b"\x7FELF")
+            || input.starts_with(b"MZ")
+        {
+            "executable"
+        } else if media_type == "application/x-font-afm" || lower.contains("startfontmetrics") {
+            "afm"
+        } else {
+            "truetype"
+        };
+        metadata.insert("binary.kind", kind);
+        let mut warnings = Vec::new();
+        if kind == "executable" {
+            warnings.push("binary-security-scan-limited".to_string());
+        }
+        if kind == "java-class" && input.len() > 10 * 1024 * 1024 {
+            warnings.push("binary-class-size-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1902,7 +1952,8 @@ mod tests {
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
-        CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser, SpecialistFormatParser,
+        BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
+        SpecialistFormatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2921,5 +2972,36 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "crypto-password-invalid"));
+    }
+
+    #[test]
+    fn binary_font_parser_detects_class_exec_and_fonts() {
+        let p = BinaryFontParser;
+        let class = p
+            .parse(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00], "application/java-vm")
+            .expect("class");
+        assert_eq!(
+            class
+                .metadata
+                .values("binary.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("java-class")
+        );
+        let exe = p.parse(b"MZ....", "application/x-executable").expect("exe");
+        assert!(exe
+            .warnings
+            .iter()
+            .any(|w| w == "binary-security-scan-limited"));
+        let afm = p
+            .parse(b"StartFontMetrics 4.1", "application/x-font-afm")
+            .expect("afm");
+        assert_eq!(
+            afm.metadata
+                .values("binary.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("afm")
+        );
     }
 }
