@@ -96,7 +96,7 @@
 | P3-05 | 实现 source code parser 和语言识别/metadata | 多语言源码样本；纯文本兜底差异测试 | 完成 |
 | P3-06 | 实现 strings/Latin1 strings parser | 二进制 strings 样本；输出上限测试 | 完成 |
 | P3-07 | 实现 feed parser：RSS、Atom 等 | feed golden；坏 XML 降级测试 | 完成 |
-| P3-08 | 实现 IPTC ANPA、XLIFF/XLZ、DIF、ENVI header 等文本衍生格式 | 每格式最小 golden；MIME 检测联动测试 | 待开始 |
+| P3-08 | 实现 IPTC ANPA、XLIFF/XLZ、DIF、ENVI header 等文本衍生格式 | 每格式最小 golden；MIME 检测联动测试 | 完成 |
 | P3-09 | 实现 AppleSingle、PList、FictionBook、DcXML 等轻量专用 parser | SPI 类名映射快照；格式样本测试 | 待开始 |
 | P4-01 | 实现压缩/包 parser：Package、Compressor、RAR，以及 zip/tar/gzip/bzip2/xz/zstd/7z 策略 | 解压 golden；解压比例/深度/数量限制测试 | 待开始 |
 | P4-02 | 实现 OOXML：docx/xlsx/pptx、关系文件、core props、嵌入文件、旧 Excel XML/WordML/SpreadsheetML | Office golden；嵌入附件和公式/表格样本测试 | 待开始 |
@@ -213,6 +213,7 @@
 | 2026-05-28 | 完成 P3-05 source code parser 初版 | 在 `vectraparse-parsers` 增加源码语言识别与 source metadata 输出 |
 | 2026-05-28 | 完成 P3-06 strings parser 初版 | 在 `vectraparse-parsers` 增加 ASCII+Latin1 strings 提取与输出上限控制 |
 | 2026-05-28 | 完成 P3-07 feed parser 初版 | 在 `vectraparse-parsers` 增加 RSS/Atom 解析、link metadata 与坏 XML 降级告警 |
+| 2026-05-28 | 完成 P3-08 文本衍生格式 parser 初版 | 在 `vectraparse-parsers` 增加 IPTC/XLIFF/DIF/ENVI 最小识别与 derived.format metadata 输出 |
 
 ## 10. P0-01 默认确认结果
 
