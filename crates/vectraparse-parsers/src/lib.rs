@@ -5,6 +5,7 @@ pub mod security;
 
 use vectraparse_core::metadata::Metadata;
 use vectraparse_mime::detect_encoding;
+use zip::ZipArchive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParseOutcome {
@@ -523,8 +524,33 @@ impl Parser for OoxmlParser {
             || media_type == "application/xml"
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
-        let content = String::from_utf8(input.to_vec()).ok()?;
-        let lower = content.to_ascii_lowercase();
+        let mut lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut extracted_content = String::new();
+        if let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(input)) {
+            let mut names = Vec::new();
+            for i in 0..archive.len() {
+                if let Ok(file) = archive.by_index(i) {
+                    names.push(file.name().to_string());
+                }
+            }
+            lower = names.join("\n").to_ascii_lowercase();
+            if let Ok(mut doc) = archive.by_name("word/document.xml") {
+                use std::io::Read;
+                let mut xml = String::new();
+                let _ = doc.read_to_string(&mut xml);
+                extracted_content = strip_html_tags(&xml);
+            } else if let Ok(mut ss) = archive.by_name("xl/sharedStrings.xml") {
+                use std::io::Read;
+                let mut xml = String::new();
+                let _ = ss.read_to_string(&mut xml);
+                extracted_content = strip_html_tags(&xml);
+            } else if let Ok(mut slide) = archive.by_name("ppt/slides/slide1.xml") {
+                use std::io::Read;
+                let mut xml = String::new();
+                let _ = slide.read_to_string(&mut xml);
+                extracted_content = strip_html_tags(&xml);
+            }
+        }
         let mut metadata = Metadata::default();
         metadata.insert("parser", "OoxmlParser");
         let doc_kind = if lower.contains("word/") || lower.contains("word/document.xml") {
@@ -554,7 +580,7 @@ impl Parser for OoxmlParser {
             warnings.push("ooxml-embedded-limit".to_string());
         }
         Some(ParseOutcome {
-            content: Some(strip_html_tags(&content)),
+            content: Some(extracted_content),
             metadata,
             warnings,
             parser_chain: Vec::new(),
@@ -1061,6 +1087,7 @@ impl Parser for ImageMetadataParser {
                 | "image/webp"
                 | "image/heif"
                 | "image/icns"
+                | "image/png"
         )
     }
     fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {

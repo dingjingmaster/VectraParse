@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 vectraparse-core.workspace = true
 vectraparse-mime.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

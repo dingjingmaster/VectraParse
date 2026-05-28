@@ -158,6 +158,13 @@ impl MagicMatcher {
                 mask: None,
             },
             MagicRule {
+                mime: "image/png",
+                priority: 43,
+                offset: 0,
+                pattern: b"\x89PNG\r\n\x1A\n",
+                mask: None,
+            },
+            MagicRule {
                 mime: "application/octet-stream",
                 priority: 1,
                 offset: 0,
