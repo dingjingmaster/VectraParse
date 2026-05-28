@@ -635,6 +635,40 @@ impl Parser for EpubParser {
     }
 }
 
+pub struct IworkParser;
+impl Parser for IworkParser {
+    fn name(&self) -> &'static str {
+        "IworkParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/x-iwork-package"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "IworkParser");
+        let kind = if lower.contains("index/document.iwa") || lower.contains("pages") {
+            "pages"
+        } else if lower.contains("index/tables/") || lower.contains("numbers") {
+            "numbers"
+        } else if lower.contains("keynote") || lower.contains("index/metadata.iwa") {
+            "keynote"
+        } else {
+            "iwork-unknown"
+        };
+        metadata.insert("iwork.kind", kind);
+        let iwa_count = lower.matches(".iwa").count();
+        metadata.insert("iwork.iwa_count", iwa_count.to_string());
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -959,7 +993,7 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        EpubParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
+        EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -1352,6 +1386,53 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn iwork_parser_detects_pages_numbers_keynote() {
+        let p = IworkParser;
+        let pages = p
+            .parse(
+                b"PK\x03\x04...Index/Document.iwa...Pages",
+                "application/x-iwork-package",
+            )
+            .expect("pages");
+        assert_eq!(
+            pages
+                .metadata
+                .values("iwork.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("pages")
+        );
+        let numbers = p
+            .parse(
+                b"PK\x03\x04...Index/Tables/Table.iwa...Numbers",
+                "application/x-iwork-package",
+            )
+            .expect("numbers");
+        assert_eq!(
+            numbers
+                .metadata
+                .values("iwork.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("numbers")
+        );
+        let keynote = p
+            .parse(
+                b"PK\x03\x04...Index/Metadata.iwa...Keynote",
+                "application/x-iwork-package",
+            )
+            .expect("keynote");
+        assert_eq!(
+            keynote
+                .metadata
+                .values("iwork.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("keynote")
         );
     }
 }
