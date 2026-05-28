@@ -791,7 +791,18 @@ impl Parser for OleLegacyParser {
         if lower.contains("ole10native") || lower.contains("embedded object") {
             warnings.push("ole-embedded-object".to_string());
         }
-        let text = extract_ascii_strings(input, 4, 8 * 1024).join("\n");
+        let utf16_lines = extract_utf16le_strings(input, 4, 16 * 1024);
+        let ascii_lines = extract_ascii_strings(input, 4, 16 * 1024);
+        let mut merged = Vec::new();
+        for line in utf16_lines.into_iter().chain(ascii_lines.into_iter()) {
+            if is_human_text_line(&line) {
+                merged.push(line);
+            }
+            if merged.len() >= 300 {
+                break;
+            }
+        }
+        let text = merged.join("\n");
         Some(ParseOutcome {
             content: if text.is_empty() { Some(String::new()) } else { Some(text) },
             metadata,
@@ -2334,6 +2345,57 @@ fn extract_ascii_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<
         out.push(String::from_utf8_lossy(&buf).to_string());
     }
     out
+}
+
+fn extract_utf16le_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = Vec::<u16>::new();
+    let mut consumed = 0usize;
+    for chunk in input.chunks_exact(2) {
+        let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let ch = char::from_u32(u as u32).unwrap_or('\0');
+        let printable = ch.is_ascii_graphic()
+            || ch.is_ascii_whitespace()
+            || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+            || ('\u{3040}'..='\u{30FF}').contains(&ch)
+            || ('\u{AC00}'..='\u{D7AF}').contains(&ch);
+        if printable {
+            buf.push(u);
+            continue;
+        }
+        if buf.len() >= min_len {
+            if let Ok(s) = String::from_utf16(&buf) {
+                consumed += s.len();
+                out.push(s);
+            }
+        }
+        buf.clear();
+        if consumed >= max_chars {
+            break;
+        }
+    }
+    if buf.len() >= min_len && consumed < max_chars {
+        if let Ok(s) = String::from_utf16(&buf) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn is_human_text_line(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() < 3 {
+        return false;
+    }
+    if t.contains("WMFC") || t.contains("IHDR") || t.contains("IDAT") || t.contains("pHYs") {
+        return false;
+    }
+    let total = t.chars().count();
+    let good = t
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ('\u{4E00}'..='\u{9FFF}').contains(c))
+        .count();
+    good * 100 / total >= 70
 }
 
 fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
