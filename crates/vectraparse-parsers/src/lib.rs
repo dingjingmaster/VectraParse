@@ -1660,6 +1660,54 @@ impl Parser for TranslationProviderParser {
     }
 }
 
+pub struct NlpNerParser;
+impl Parser for NlpNerParser {
+    fn name(&self) -> &'static str {
+        "NlpNerParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/nlp-ner"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "NlpNerParser");
+        let backend = if lower.contains("backend=opennlp") {
+            "opennlp"
+        } else if lower.contains("backend=spacy") {
+            "spacy"
+        } else {
+            "simple"
+        };
+        metadata.insert("nlp.backend", backend);
+        let sentiment = if lower.contains("sentiment=positive") {
+            "positive"
+        } else if lower.contains("sentiment=negative") {
+            "negative"
+        } else {
+            "neutral"
+        };
+        metadata.insert("nlp.sentiment", sentiment);
+        if lower.contains("person:") {
+            metadata.insert("nlp.ner.person", "detected");
+        }
+        if lower.contains("org:") {
+            metadata.insert("nlp.ner.org", "detected");
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("model=missing") {
+            warnings.push("nlp-model-missing-degraded".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2093,7 +2141,7 @@ mod tests {
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
-        TranslationProviderParser,
+        TranslationProviderParser, NlpNerParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3219,5 +3267,37 @@ mod tests {
         );
         assert!(out.warnings.iter().any(|w| w == "translation-key-missing"));
         assert!(out.warnings.iter().any(|w| w == "translation-timeout"));
+    }
+
+    #[test]
+    fn nlp_ner_parser_handles_backend_sentiment_and_missing_model_degrade() {
+        let p = NlpNerParser;
+        let out = p
+            .parse(
+                b"backend=spacy sentiment=positive person:alice org:acme",
+                "application/nlp-ner",
+            )
+            .expect("nlp");
+        assert_eq!(
+            out.metadata
+                .values("nlp.backend")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("spacy")
+        );
+        assert_eq!(
+            out.metadata
+                .values("nlp.sentiment")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("positive")
+        );
+        let degraded = p
+            .parse(b"backend=opennlp model=missing", "application/nlp-ner")
+            .expect("degraded");
+        assert!(degraded
+            .warnings
+            .iter()
+            .any(|w| w == "nlp-model-missing-degraded"));
     }
 }
