@@ -2415,27 +2415,71 @@ fn extract_doc_text_external(input: &[u8]) -> Option<String> {
     let path = std::env::temp_dir().join(format!("vectraparse-doc-{nanos}.doc"));
     fs::write(&path, input).ok()?;
 
-    let antiword = Command::new("antiword").arg(&path).output().ok();
-    let out = antiword
-        .as_ref()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            let catdoc = Command::new("catdoc")
-                .args(["-d", "utf-8"])
-                .arg(&path)
-                .output()
-                .ok()?;
-            if !catdoc.status.success() {
-                return None;
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(out) = Command::new("antiword").arg(&path).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_string();
+            if !s.trim().is_empty() {
+                candidates.push(s);
             }
-            let s = String::from_utf8_lossy(&catdoc.stdout).to_string();
-            if s.trim().is_empty() { None } else { Some(s) }
-        });
+        }
+    }
+    for src_cs in ["utf-8", "gb18030", "gbk", "cp936", "big5", "cp1252"] {
+        if let Ok(out) = Command::new("catdoc")
+            .args(["-d", "utf-8", "-s", src_cs])
+            .arg(&path)
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).to_string();
+                if !s.trim().is_empty() {
+                    candidates.push(s);
+                }
+            }
+        }
+    }
+    let out = candidates
+        .into_iter()
+        .max_by_key(|s| score_human_text(s));
 
     let _ = fs::remove_file(&path);
     out
+}
+
+fn score_human_text(s: &str) -> usize {
+    let mut score = 0usize;
+    for line in s.lines() {
+        let t = line.trim();
+        if t.len() < 2 {
+            continue;
+        }
+        if t.contains("Root Entry")
+            || t.contains("SummaryInformation")
+            || t.contains("DocumentSummaryInformation")
+            || t.contains("WordDocument")
+            || t.contains("WMFC")
+            || t.contains("IDAT")
+            || t.contains("IHDR")
+        {
+            score = score.saturating_sub(5);
+            continue;
+        }
+        let total = t.chars().count().max(1);
+        let good = t
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ('\u{4E00}'..='\u{9FFF}').contains(c))
+            .count();
+        if good * 100 / total >= 70 {
+            score += good;
+        }
+        if t.contains('的') || t.contains('是') || t.contains('了') {
+            score += 10;
+        }
+        if t.contains("æ") || t.contains("å") || t.contains("ç") {
+            score = score.saturating_sub(2);
+        }
+    }
+    score
 }
 
 fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
