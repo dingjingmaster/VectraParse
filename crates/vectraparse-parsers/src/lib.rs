@@ -1156,6 +1156,45 @@ impl Parser for AudioMetadataParser {
     }
 }
 
+pub struct VideoMetadataParser;
+impl Parser for VideoMetadataParser {
+    fn name(&self) -> &'static str {
+        "VideoMetadataParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(media_type, "video/mp4" | "video/x-flv" | "video/*")
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "VideoMetadataParser");
+        let format = if media_type == "video/mp4" || lower.contains("ftyp") || lower.contains("moov")
+        {
+            "mp4"
+        } else if media_type == "video/x-flv" || input.starts_with(b"FLV") {
+            "flv"
+        } else {
+            "video"
+        };
+        metadata.insert("video.format", format);
+        metadata.insert("video.byte_length", input.len().to_string());
+        let mut warnings = Vec::new();
+        if input.len() > 16 * 1024 * 1024 {
+            warnings.push("video-read-window-applied".to_string());
+            metadata.insert("video.read_window_bytes", (4 * 1024 * 1024).to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1566,6 +1605,7 @@ mod tests {
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
+        VideoMetadataParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2397,5 +2437,37 @@ mod tests {
         let p = AudioMetadataParser;
         let out = p.parse(b"raw-audio-stream", "audio/mpeg").expect("audio");
         assert!(out.warnings.iter().any(|w| w == "audio-bad-tag"));
+    }
+
+    #[test]
+    fn video_metadata_parser_detects_mp4_and_flv() {
+        let p = VideoMetadataParser;
+        let mp4 = p.parse(b"...ftyp...moov...", "video/mp4").expect("mp4");
+        assert_eq!(
+            mp4.metadata
+                .values("video.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("mp4")
+        );
+        let flv = p.parse(b"FLV\x01\x05", "video/x-flv").expect("flv");
+        assert_eq!(
+            flv.metadata
+                .values("video.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("flv")
+        );
+    }
+
+    #[test]
+    fn video_metadata_parser_applies_read_window_warning_on_large_inputs() {
+        let p = VideoMetadataParser;
+        let huge = vec![b'a'; 17 * 1024 * 1024];
+        let out = p.parse(&huge, "video/mp4").expect("video");
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w == "video-read-window-applied"));
     }
 }
