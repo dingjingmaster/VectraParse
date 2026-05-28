@@ -39,6 +39,125 @@ static char *extract_json_string_field(const uint8_t *json, size_t len,
   return out;
 }
 
+static void append_utf8(char **buf, size_t *len, size_t *cap, unsigned cp) {
+  if (cp > 0x10FFFF) {
+    cp = 0xFFFD;
+  }
+  char tmp[4];
+  size_t n = 0;
+  if (cp < 0x80) {
+    tmp[n++] = (char)cp;
+  } else if (cp < 0x800) {
+    tmp[n++] = (char)(0xC0 | (cp >> 6));
+    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    tmp[n++] = (char)(0xE0 | (cp >> 12));
+    tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+  } else {
+    tmp[n++] = (char)(0xF0 | (cp >> 18));
+    tmp[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    tmp[n++] = (char)(0x80 | (cp & 0x3F));
+  }
+  if (*len + n + 1 > *cap) {
+    size_t new_cap = (*cap == 0) ? 64 : (*cap * 2);
+    while (new_cap < *len + n + 1) {
+      new_cap *= 2;
+    }
+    char *new_buf = (char *)realloc(*buf, new_cap);
+    if (new_buf == NULL) {
+      return;
+    }
+    *buf = new_buf;
+    *cap = new_cap;
+  }
+  memcpy(*buf + *len, tmp, n);
+  *len += n;
+  (*buf)[*len] = '\0';
+}
+
+static int hex4_to_u32(const char *s, unsigned *out) {
+  unsigned v = 0;
+  for (int i = 0; i < 4; i++) {
+    char c = s[i];
+    v <<= 4;
+    if (c >= '0' && c <= '9') {
+      v |= (unsigned)(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      v |= (unsigned)(c - 'a' + 10);
+    } else if (c >= 'A' && c <= 'F') {
+      v |= (unsigned)(c - 'A' + 10);
+    } else {
+      return -1;
+    }
+  }
+  *out = v;
+  return 0;
+}
+
+static char *json_unescape_utf8(const char *in) {
+  if (in == NULL) {
+    return NULL;
+  }
+  char *out = NULL;
+  size_t len = 0, cap = 0;
+  for (const char *p = in; *p != '\0'; p++) {
+    if (*p != '\\') {
+      append_utf8(&out, &len, &cap, (unsigned char)*p);
+      continue;
+    }
+    p++;
+    if (*p == '\0') {
+      break;
+    }
+    switch (*p) {
+    case 'n':
+      append_utf8(&out, &len, &cap, '\n');
+      break;
+    case 't':
+      append_utf8(&out, &len, &cap, '\t');
+      break;
+    case 'r':
+      append_utf8(&out, &len, &cap, '\r');
+      break;
+    case '"':
+      append_utf8(&out, &len, &cap, '"');
+      break;
+    case '\\':
+      append_utf8(&out, &len, &cap, '\\');
+      break;
+    case '/':
+      append_utf8(&out, &len, &cap, '/');
+      break;
+    case 'u': {
+      if (p[1] == '\0' || p[2] == '\0' || p[3] == '\0' || p[4] == '\0') {
+        append_utf8(&out, &len, &cap, 0xFFFD);
+        break;
+      }
+      unsigned cp = 0;
+      if (hex4_to_u32(p + 1, &cp) != 0) {
+        append_utf8(&out, &len, &cap, 0xFFFD);
+        break;
+      }
+      append_utf8(&out, &len, &cap, cp);
+      p += 4;
+      break;
+    }
+    default:
+      append_utf8(&out, &len, &cap, (unsigned char)*p);
+      break;
+    }
+  }
+  if (out == NULL) {
+    out = (char *)malloc(1);
+    if (out != NULL) {
+      out[0] = '\0';
+    }
+  }
+  return out;
+}
+
 static int read_file_bytes(const char *path, uint8_t **data, size_t *len) {
   FILE *fp = fopen(path, "rb");
   if (fp == NULL) {
@@ -118,12 +237,14 @@ int main(int argc, char **argv) {
   }
 
   char *mime = extract_json_string_field(detect_out.data, detect_out.len, "mime_type");
-  char *content = extract_json_string_field(parse_out.data, parse_out.len, "content");
+  char *content_json = extract_json_string_field(parse_out.data, parse_out.len, "content");
+  char *content = json_unescape_utf8(content_json);
 
   printf("File Type: %s\n\n\n", mime != NULL ? mime : "(unknown)");
   printf("Content:\n%s\n", content != NULL ? content : "");
 
   free(mime);
+  free(content_json);
   free(content);
   free(bytes);
   vectraparse_result_free(&detect_out);
