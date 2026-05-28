@@ -791,8 +791,9 @@ impl Parser for OleLegacyParser {
         if lower.contains("ole10native") || lower.contains("embedded object") {
             warnings.push("ole-embedded-object".to_string());
         }
+        let text = extract_ascii_strings(input, 4, 8 * 1024).join("\n");
         Some(ParseOutcome {
-            content: Some(strip_html_tags(&content)),
+            content: if text.is_empty() { Some(String::new()) } else { Some(text) },
             metadata,
             warnings,
             parser_chain: Vec::new(),
