@@ -266,6 +266,59 @@ impl Parser for XmlParser {
     }
 }
 
+pub struct SourceCodeParser;
+impl Parser for SourceCodeParser {
+    fn name(&self) -> &'static str {
+        "SourceCodeParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "text/x-source"
+            || media_type == "text/x-rust"
+            || media_type == "text/x-python"
+            || media_type == "text/x-java"
+            || media_type == "application/javascript"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lang = detect_source_language(&content);
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "SourceCodeParser");
+        metadata.insert("source.language", lang);
+        metadata.insert("source.lines", content.lines().count().to_string());
+        Some(ParseOutcome {
+            content: Some(content),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
+pub struct StringsParser;
+impl Parser for StringsParser {
+    fn name(&self) -> &'static str {
+        "StringsParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/octet-stream"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let strings = extract_ascii_strings(input, 4, 4096);
+        if strings.is_empty() {
+            return None;
+        }
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "StringsParser");
+        metadata.insert("strings.count", strings.len().to_string());
+        Some(ParseOutcome {
+            content: Some(strings.join("\n")),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -467,11 +520,48 @@ fn extract_xml_root(s: &str) -> Option<String> {
     None
 }
 
+fn detect_source_language(content: &str) -> &'static str {
+    if content.contains("fn main(") || content.contains("use std::") {
+        "rust"
+    } else if content.contains("def ") || content.contains("import ") {
+        "python"
+    } else if content.contains("public class ") || content.contains("package ") {
+        "java"
+    } else if content.contains("function ") || content.contains("const ") {
+        "javascript"
+    } else {
+        "plain"
+    }
+}
+
+fn extract_ascii_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    for &b in input {
+        let printable = (0x20..=0x7e).contains(&b) || b == b'\t' || b == b' ';
+        if printable {
+            buf.push(b);
+            continue;
+        }
+        if buf.len() >= min_len {
+            out.push(String::from_utf8_lossy(&buf).to_string());
+        }
+        buf.clear();
+        if out.iter().map(|s| s.len()).sum::<usize>() >= max_chars {
+            break;
+        }
+    }
+    if buf.len() >= min_len && out.iter().map(|s| s.len()).sum::<usize>() < max_chars {
+        out.push(String::from_utf8_lossy(&buf).to_string());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser,
-        XmlParser,
+        SourceCodeParser, StringsParser, XmlParser,
     };
 
     #[test]
@@ -613,5 +703,29 @@ mod tests {
             .expect("xxe result");
         assert!(blocked.warnings.iter().any(|w| w == "xxe-blocked"));
         assert!(blocked.content.is_none());
+    }
+
+    #[test]
+    fn source_code_parser_detects_language() {
+        let p = SourceCodeParser;
+        let out = p
+            .parse(b"fn main() { println!(\"hi\"); }", "text/x-source")
+            .expect("source");
+        assert_eq!(
+            out.metadata
+                .values("source.language")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn strings_parser_extracts_ascii_runs() {
+        let p = StringsParser;
+        let out = p
+            .parse(b"\x00ABCDEF\x00xyz\x00", "application/octet-stream")
+            .expect("strings");
+        assert!(out.content.as_deref().unwrap_or("").contains("ABCDEF"));
     }
 }
