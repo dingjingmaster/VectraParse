@@ -1611,6 +1611,55 @@ impl Parser for LanguageProviderParser {
     }
 }
 
+pub struct TranslationProviderParser;
+impl Parser for TranslationProviderParser {
+    fn name(&self) -> &'static str {
+        "TranslationProviderParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/translation-provider"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "TranslationProviderParser");
+        let provider = if lower.contains("provider=microsoft") {
+            "microsoft"
+        } else if lower.contains("provider=google") {
+            "google"
+        } else if lower.contains("provider=lingo24") {
+            "lingo24"
+        } else if lower.contains("provider=joshua") {
+            "joshua"
+        } else if lower.contains("provider=moses") {
+            "moses"
+        } else if lower.contains("provider=yandex") {
+            "yandex"
+        } else {
+            "cached"
+        };
+        metadata.insert("translation.provider", provider);
+        metadata.insert(
+            "translation.cache",
+            if lower.contains("cache=on") { "enabled" } else { "disabled" },
+        );
+        let mut warnings = Vec::new();
+        if lower.contains("api_key=missing") {
+            warnings.push("translation-key-missing".to_string());
+        }
+        if lower.contains("timeout=true") {
+            warnings.push("translation-timeout".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2044,6 +2093,7 @@ mod tests {
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
+        TranslationProviderParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3142,5 +3192,32 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "lang-provider-config-invalid"));
+    }
+
+    #[test]
+    fn translation_provider_parser_handles_provider_cache_key_and_timeout() {
+        let p = TranslationProviderParser;
+        let out = p
+            .parse(
+                b"provider=google cache=on api_key=missing timeout=true",
+                "application/translation-provider",
+            )
+            .expect("translation");
+        assert_eq!(
+            out.metadata
+                .values("translation.provider")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("google")
+        );
+        assert_eq!(
+            out.metadata
+                .values("translation.cache")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("enabled")
+        );
+        assert!(out.warnings.iter().any(|w| w == "translation-key-missing"));
+        assert!(out.warnings.iter().any(|w| w == "translation-timeout"));
     }
 }
