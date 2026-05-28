@@ -105,7 +105,7 @@
 | P4-05 | 实现 iWork package parser | pages/numbers/keynote 样本对照 | 完成 |
 | P4-06 | 实现 PDF parser：文本、metadata、附件、权限、加密、OCR hook、preflight | PDF golden；加密/损坏/大文件/附件测试 | 完成 |
 | P4-07 | 实现 OLE/CFB 旧 Office：DOC/XLS/PPT、OfficeParser、OldExcel、MSOwnerFile | OLE golden；宏/嵌入对象安全审查 | 完成 |
-| P4-08 | 实现 Microsoft 专有格式：OneNote、Access/Jackcess、TNEF、EMF、WMF、MSG/PST 联动 | 样本 golden；native/feature 依赖检查 | 待开始 |
+| P4-08 | 实现 Microsoft 专有格式：OneNote、Access/Jackcess、TNEF、EMF、WMF、MSG/PST 联动 | 样本 golden；native/feature 依赖检查 | 完成 |
 | P4-09 | 实现 RTF 和 RTF object data 递归 | RTF golden；嵌入对象测试 | 待开始 |
 | P4-10 | 实现 HWP、CHM、WordPerfect、Quattro Pro 等其他文档格式 | 每格式 golden；检测与 parser 映射测试 | 待开始 |
 | P5-01 | 实现 RFC822/MIME 邮件 parser、附件递归和 charset 处理 | eml golden；多附件和坏 charset 测试 | 待开始 |
@@ -223,6 +223,7 @@
 | 2026-05-28 | 完成 P4-05 iWork parser 初版 | 在 `vectraparse-parsers` 增加 pages/numbers/keynote 识别与 iwa 计数 metadata 输出 |
 | 2026-05-28 | 完成 P4-06 PDF parser 初版 | 在 `vectraparse-parsers` 增加 PDF 版本/附件/权限/加密识别与 OCR/preflight 告警 |
 | 2026-05-28 | 完成 P4-07 OLE/CFB 旧 Office parser 初版 | 在 `vectraparse-parsers` 增加 DOC/XLS/PPT/OldExcel/MSOwnerFile 识别与宏/嵌入安全告警 |
+| 2026-05-28 | 完成 P4-08 Microsoft 专有格式 parser 初版 | 在 `vectraparse-parsers` 增加 OneNote/Access/TNEF/EMF/WMF/MSG/PST 识别与 metadata 输出 |
 
 ## 10. P0-01 默认确认结果
 
