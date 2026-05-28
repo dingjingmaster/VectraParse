@@ -498,6 +498,9 @@ impl Parser for PackageParser {
         if input.windows(6).filter(|w| *w == b"[[DIR:").count() > 16 {
             warnings.push("package-depth-limit".to_string());
         }
+        if input.windows(3).any(|w| w == b"../") || input.windows(3).any(|w| w == b"..\\") {
+            warnings.push("package-path-traversal-blocked".to_string());
+        }
         Some(ParseOutcome {
             content: None,
             metadata,
@@ -3668,5 +3671,34 @@ mod tests {
             "extraction golden mismatches:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    #[test]
+    fn security_matrix_limits_and_malformed_inputs_match() {
+        let pkg = PackageParser
+            .parse(
+                b"PK\x03\x04[[DIR:a]][[DIR:b]][[DIR:c]][[DIR:d]][[DIR:e]][[DIR:f]][[DIR:g]][[DIR:h]][[DIR:i]][[DIR:j]][[DIR:k]][[DIR:l]][[DIR:m]][[DIR:n]][[DIR:o]][[DIR:p]][[DIR:q]]../etc/passwd",
+                "application/zip",
+            )
+            .expect("pkg");
+        assert!(pkg.warnings.iter().any(|w| w == "package-depth-limit"));
+        assert!(pkg
+            .warnings
+            .iter()
+            .any(|w| w == "package-path-traversal-blocked"));
+
+        let xxe = XmlParser
+            .parse(
+                b"<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><foo>&xxe;</foo>",
+                "application/xml",
+            )
+            .expect("xxe");
+        assert!(xxe.warnings.iter().any(|w| w == "xxe-blocked"));
+
+        let bad_pdf = PdfParser.parse(b"not-a-pdf", "application/pdf").expect("pdf");
+        assert!(bad_pdf
+            .warnings
+            .iter()
+            .any(|w| w == "pdf-invalid-header"));
     }
 }
