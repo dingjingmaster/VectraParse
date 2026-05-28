@@ -722,6 +722,55 @@ impl Parser for PdfParser {
     }
 }
 
+pub struct OleLegacyParser;
+impl Parser for OleLegacyParser {
+    fn name(&self) -> &'static str {
+        "OleLegacyParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/x-tika-msoffice"
+            || media_type == "application/msword"
+            || media_type == "application/vnd.ms-excel"
+            || media_type == "application/vnd.ms-powerpoint"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        if !input.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
+            return None;
+        }
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "OleLegacyParser");
+        let kind = if lower.contains("worddocument") {
+            "doc"
+        } else if lower.contains("workbook") || lower.contains("book") {
+            "xls"
+        } else if lower.contains("powerpoint document") {
+            "ppt"
+        } else if lower.contains("biff") || lower.contains("oldexcel") {
+            "oldexcel"
+        } else if lower.contains("ownerfile") || lower.contains("~$") {
+            "msoffice-ownerfile"
+        } else {
+            "ole-unknown"
+        };
+        metadata.insert("ole.kind", kind);
+        let mut warnings = Vec::new();
+        if lower.contains("vba") || lower.contains("macros") {
+            warnings.push("ole-macro-present".to_string());
+        }
+        if lower.contains("ole10native") || lower.contains("embedded object") {
+            warnings.push("ole-embedded-object".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1047,7 +1096,8 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        PdfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+        OleLegacyParser, PdfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
+        XmlParser,
     };
 
     #[test]
@@ -1521,5 +1571,53 @@ mod tests {
         );
         assert!(out.warnings.iter().any(|w| w == "pdf-ocr-hook-suggested"));
         assert!(out.warnings.iter().any(|w| w == "pdf-preflight-warning"));
+    }
+
+    #[test]
+    fn ole_legacy_parser_detects_doc_xls_ppt_and_security_warnings() {
+        let p = OleLegacyParser;
+        let doc = p
+            .parse(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1...WordDocument...VBA...OLE10Native",
+                "application/x-tika-msoffice",
+            )
+            .expect("doc");
+        assert_eq!(
+            doc.metadata
+                .values("ole.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("doc")
+        );
+        assert!(doc.warnings.iter().any(|w| w == "ole-macro-present"));
+        assert!(doc.warnings.iter().any(|w| w == "ole-embedded-object"));
+
+        let xls = p
+            .parse(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1...Workbook...",
+                "application/vnd.ms-excel",
+            )
+            .expect("xls");
+        assert_eq!(
+            xls.metadata
+                .values("ole.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("xls")
+        );
+
+        let ppt = p
+            .parse(
+                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1...PowerPoint Document...",
+                "application/vnd.ms-powerpoint",
+            )
+            .expect("ppt");
+        assert_eq!(
+            ppt.metadata
+                .values("ole.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("ppt")
+        );
     }
 }
