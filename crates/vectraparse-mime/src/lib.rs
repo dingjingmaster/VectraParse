@@ -29,6 +29,125 @@ pub fn source_path() -> &'static str {
     generated::TIKA_MIME_XML_PATH
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagicRule {
+    pub mime: &'static str,
+    pub priority: i32,
+    pub offset: usize,
+    pub pattern: &'static [u8],
+    pub mask: Option<&'static [u8]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagicMatch {
+    pub mime: String,
+    pub priority: i32,
+}
+
+#[derive(Debug, Default)]
+pub struct MagicMatcher {
+    rules: Vec<MagicRule>,
+}
+
+impl MagicMatcher {
+    pub fn from_rules(mut rules: Vec<MagicRule>) -> Self {
+        rules.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.offset.cmp(&b.offset))
+                .then(a.mime.cmp(b.mime))
+        });
+        Self { rules }
+    }
+
+    pub fn default_rules() -> Self {
+        Self::from_rules(vec![
+            MagicRule {
+                mime: "application/pdf",
+                priority: 80,
+                offset: 0,
+                pattern: b"%PDF-",
+                mask: None,
+            },
+            MagicRule {
+                mime: "application/zip",
+                priority: 50,
+                offset: 0,
+                pattern: b"PK\x03\x04",
+                mask: None,
+            },
+            MagicRule {
+                mime: "application/zip",
+                priority: 50,
+                offset: 0,
+                pattern: b"PK\x05\x06",
+                mask: None,
+            },
+            MagicRule {
+                mime: "application/zip",
+                priority: 50,
+                offset: 0,
+                pattern: b"PK\x07\x08",
+                mask: None,
+            },
+            MagicRule {
+                mime: "application/octet-stream",
+                priority: 1,
+                offset: 0,
+                pattern: b"\x00\x00\x00\x00",
+                mask: Some(b"\x00\x00\x00\x00"),
+            },
+        ])
+    }
+
+    pub fn detect(&self, input: &[u8], read_window: usize) -> MagicMatch {
+        if input.is_empty() {
+            return MagicMatch {
+                mime: "application/x-empty".to_string(),
+                priority: i32::MAX,
+            };
+        }
+        let window = input.len().min(read_window);
+        let sliced = &input[..window];
+        for rule in &self.rules {
+            if magic_matches_rule(sliced, rule) {
+                return MagicMatch {
+                    mime: rule.mime.to_string(),
+                    priority: rule.priority,
+                };
+            }
+        }
+        MagicMatch {
+            mime: "application/octet-stream".to_string(),
+            priority: i32::MIN,
+        }
+    }
+}
+
+fn magic_matches_rule(input: &[u8], rule: &MagicRule) -> bool {
+    let end = match rule.offset.checked_add(rule.pattern.len()) {
+        Some(v) => v,
+        None => return false,
+    };
+    if end > input.len() {
+        return false;
+    }
+    let actual = &input[rule.offset..end];
+    match rule.mask {
+        None => actual == rule.pattern,
+        Some(mask) => {
+            if mask.len() != rule.pattern.len() {
+                return false;
+            }
+            actual
+                .iter()
+                .zip(rule.pattern.iter())
+                .zip(mask.iter())
+                .all(|((a, expected), m)| (a & m) == (expected & m))
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MediaTypeRegistry {
     aliases: HashMap<&'static str, &'static str>,
@@ -146,7 +265,7 @@ fn normalize_media_type(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaTypeRegistry, generated_stats, source_path};
+    use super::{MagicMatcher, MagicRule, MediaTypeRegistry, generated_stats, source_path};
 
     #[test]
     fn generated_counts_match_expected_tika_snapshot() {
@@ -200,6 +319,51 @@ mod tests {
             )
             .as_deref(),
             Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+    }
+
+    #[test]
+    fn magic_matcher_detects_empty_file() {
+        let matcher = MagicMatcher::default_rules();
+        let matched = matcher.detect(&[], 32);
+        assert_eq!(matched.mime, "application/x-empty");
+    }
+
+    #[test]
+    fn magic_matcher_applies_priority_and_offset() {
+        let matcher = MagicMatcher::from_rules(vec![
+            MagicRule {
+                mime: "application/test-low",
+                priority: 10,
+                offset: 1,
+                pattern: b"ABC",
+                mask: None,
+            },
+            MagicRule {
+                mime: "application/test-high",
+                priority: 100,
+                offset: 1,
+                pattern: b"ABC",
+                mask: None,
+            },
+        ]);
+        let matched = matcher.detect(b"XABCY", 8);
+        assert_eq!(matched.mime, "application/test-high");
+    }
+
+    #[test]
+    fn magic_matcher_supports_mask_and_short_input() {
+        let matcher = MagicMatcher::from_rules(vec![MagicRule {
+            mime: "application/masked",
+            priority: 5,
+            offset: 0,
+            pattern: b"\xF0\x0A",
+            mask: Some(b"\xF0\x0F"),
+        }]);
+        assert_eq!(matcher.detect(b"\xFA\x0A", 2).mime, "application/masked");
+        assert_eq!(
+            matcher.detect(b"\xFA", 2).mime,
+            "application/octet-stream"
         );
     }
 }
