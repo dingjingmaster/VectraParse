@@ -1574,6 +1574,43 @@ impl Parser for LanguageIdParser {
     }
 }
 
+pub struct LanguageProviderParser;
+impl Parser for LanguageProviderParser {
+    fn name(&self) -> &'static str {
+        "LanguageProviderParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/lang-provider"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "LanguageProviderParser");
+        let provider = if lower.contains("provider=optimaize") {
+            "optimaize"
+        } else if lower.contains("provider=lingo24") {
+            "lingo24"
+        } else {
+            "text"
+        };
+        metadata.insert("lang.provider", provider);
+        let mut warnings = Vec::new();
+        if lower.contains("enabled=false") {
+            warnings.push("lang-provider-disabled".to_string());
+        }
+        if lower.contains("config=invalid") {
+            warnings.push("lang-provider-config-invalid".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2006,7 +2043,7 @@ mod tests {
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
-        LanguageIdParser, SpecialistFormatParser,
+        LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3076,5 +3113,34 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "lang-low-confidence"));
+    }
+
+    #[test]
+    fn language_provider_parser_handles_switch_disable_and_bad_config() {
+        let p = LanguageProviderParser;
+        let opt = p
+            .parse(b"provider=optimaize enabled=true", "application/lang-provider")
+            .expect("opt");
+        assert_eq!(
+            opt.metadata
+                .values("lang.provider")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("optimaize")
+        );
+        let bad = p
+            .parse(
+                b"provider=lingo24 enabled=false config=invalid",
+                "application/lang-provider",
+            )
+            .expect("bad");
+        assert!(bad
+            .warnings
+            .iter()
+            .any(|w| w == "lang-provider-disabled"));
+        assert!(bad
+            .warnings
+            .iter()
+            .any(|w| w == "lang-provider-config-invalid"));
     }
 }
