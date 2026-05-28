@@ -385,6 +385,43 @@ impl Parser for FeedParser {
     }
 }
 
+pub struct DerivedTextParser;
+impl Parser for DerivedTextParser {
+    fn name(&self) -> &'static str {
+        "DerivedTextParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/x-xliff+xml"
+            || media_type == "text/x-dif"
+            || media_type == "text/x-envi-header"
+            || media_type == "application/x-iptc-anpa"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "DerivedTextParser");
+        let format = if lower.contains("<xliff") {
+            "xliff"
+        } else if lower.contains("table") && lower.contains("vectors") {
+            "dif"
+        } else if lower.contains("envi") && lower.contains("samples") {
+            "envi-header"
+        } else if lower.contains("anpa") || lower.contains("iptc") {
+            "iptc-anpa"
+        } else {
+            "derived-text-unknown"
+        };
+        metadata.insert("derived.format", format);
+        Some(ParseOutcome {
+            content: Some(content),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -670,8 +707,8 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser,
-        FeedParser, SourceCodeParser, StringsParser, XmlParser,
+        CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
+        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -879,5 +916,37 @@ mod tests {
             .parse(br#"<?xml version="1.0"?><feed><title>bad"#, "application/xml")
             .expect("bad");
         assert!(bad.warnings.iter().any(|w| w == "feed-malformed-xml"));
+    }
+
+    #[test]
+    fn derived_text_parser_detects_min_formats() {
+        let p = DerivedTextParser;
+        let xliff = p.parse(b"<xliff version=\"1.2\"></xliff>", "application/x-xliff+xml").expect("x");
+        assert_eq!(
+            xliff
+                .metadata
+                .values("derived.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("xliff")
+        );
+        let dif = p.parse(b"TABLE\n0,1\nVECTORS", "text/x-dif").expect("d");
+        assert_eq!(
+            dif.metadata
+                .values("derived.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("dif")
+        );
+        let envi = p
+            .parse(b"ENVI\nsamples = 128", "text/x-envi-header")
+            .expect("e");
+        assert_eq!(
+            envi.metadata
+                .values("derived.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("envi-header")
+        );
     }
 }
