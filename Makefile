@@ -1,4 +1,10 @@
-.PHONY: check test abi-smoke golden fuzz-smoke bench-smoke pipeline
+.PHONY: debug release file-content check test abi-smoke golden fuzz-smoke bench-smoke pipeline
+
+release:
+	cargo build --release
+
+debug:
+	cargo build 
 
 check:
 	cargo check --workspace

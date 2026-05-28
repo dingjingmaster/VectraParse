@@ -4,7 +4,7 @@
 > - 文件编号：2
 > - 文档类型：plan
 > - 文件路径：docs/dev/2-plan-ole-doc-ppt-xls-extraction.md
-> - 文档版本：v1.0.0
+> - 文档版本：v1.1.0
 > - 最后更新：2026-05-28
 > - 关联调研：`docs/dev/2-research-ole-doc-ppt-xls-extraction.md`
 > - 目标约束：不引入新的系统命令/二进制依赖（`soffice`/`catdoc`/`antiword` 等）。
@@ -45,8 +45,8 @@
 - [x] 新建 `crates/vectraparse-mso-binary`（纯 Rust）。
 - [ ] 定义模块：
   - [x] `text`（编码与清洗）
-  - [ ] `ole`（CFB 读取）
-  - [ ] `doc`（WW8）
+  - [x] `ole`（CFB 读取已支持目录解析、常规流读取与 mini stream 链读取）
+  - [ ] `doc`（WW8，进行中：准备切换 FIB/CLX 结构化提取）
   - [ ] `xls`（BIFF）
   - [ ] `ppt`（PPT Binary）
 - [ ] 定义统一输出结构（建议）：
@@ -64,21 +64,31 @@
 
 ## 3.2 M1 - DOC MVP（优先）
 
-- [ ] OLE 层：读取 `WordDocument`、`0Table`/`1Table` 流。
+- [x] OLE 层：读取 `WordDocument`、`0Table`/`1Table` 流（已支持常规流 + mini stream）。
 - [ ] FIB 解析：
-  - [ ] 校验版本与关键 flag；
-  - [ ] 读取 `fcClx/lcbClx`。
+  - [x] 校验版本与关键 flag；
+  - [x] 读取 `fcClx/lcbClx`。
 - [ ] CLX / Piece Table：
-  - [ ] 解析 `Pcdt`；
-  - [ ] 遍历 piece 并按字符区间拼接。
+  - [x] 解析 `Pcdt`；
+  - [x] 遍历 piece 并按字符区间拼接。
 - [ ] 编码处理：
-  - [ ] Unicode piece（UTF-16LE）；
-  - [ ] ANSI piece（按 codepage 解码，默认 cp1252，含可配置回退）。
+  - [x] Unicode piece（UTF-16LE）；
+  - [x] ANSI piece（按 codepage 解码，默认 cp1252，含可配置回退）。
 - [ ] 文本清洗：
-  - [ ] 去除控制字符噪声；
-  - [ ] 规范换行。
+  - [x] 去除控制字符噪声；
+  - [x] 规范换行。
 - [x] 在 `vectraparse-parsers` 替换 `.doc` 旧字符串扫描路径（已切换到 `vectraparse-mso-binary`）。
-- [ ] 增加样例测试（中英混合 doc）。
+- [x] 增加样例测试（中英混合 doc）。
+
+当前进度备注（2026-05-28）：
+- 已完成：`.doc` 入口已从旧整文件字符串扫描迁移到新 crate，且优先按目标流读取后提取文本。
+- 已完成：新增 FIB 基础校验（`wIdent/nFib/fWhichTblStm`）与 `fcClx/lcbClx` 定位，优先按 FIB 指定 table 流解析，失败时回退 CLX 扫描。
+- 已完成：ANSI piece 新增按 `chsTables/chs/lid` 选择编码解码，默认 `windows-1252`，并支持 `VECTRAPARSE_DOC_ANSI_FALLBACK` 回退配置。
+- 已完成：清洗阶段新增 Word 控制字符映射与换行归一化（段落/单元格控制符转边界，连续空行折叠）。
+- 已完成：补充中英混合样例单测（ANSI + Unicode piece 混合正文）。
+- 已完成：修复 DBCS ANSI piece 长度处理（按编码推断单/双字节宽度读取），补充 GBK ANSI 中文回归单测。
+- 已完成：`.doc` 回退链路新增尾部噪声截断（内部锚点/连续乱码行触发），降低正文后乱码尾巴泄漏。
+- 未完成：WW8 CLX Piece Table 的完整兼容性与样例覆盖仍需继续完善。
 
 验收：
 - `test.doc` 输出真实段落文本；
@@ -88,18 +98,28 @@
 
 ## 3.3 M2 - XLS MVP
 
-- [ ] OLE 层：读取 `Workbook`（回退 `Book`）。
-- [ ] BIFF record 基础框架：
-  - [ ] BOF/EOF；
-  - [ ] BOUNDSHEET；
-  - [ ] SST + CONTINUE；
-  - [ ] LABELSST/LABEL/NUMBER/RK/FORMULA(缓存值)。
-- [ ] sheet 输出组织：
-  - [ ] 按 sheet 名分块；
-  - [ ] 按行列顺序拼接文本。
-- [ ] 数值格式基础转换（避免科学计数法误读）。
+- [x] OLE 层：读取 `Workbook`（回退 `Book`，已接入流选择，覆盖常规流 + mini stream）。
+- [x] BIFF record 基础框架：
+  - [x] BOF/EOF；
+  - [x] BOUNDSHEET；
+  - [x] SST + CONTINUE；
+  - [x] LABELSST/LABEL/NUMBER/RK/FORMULA(缓存值)。
+- [x] sheet 输出组织：
+  - [x] 按 sheet 名分块；
+  - [x] 按行列顺序拼接文本。
+- [x] 数值格式基础转换（避免科学计数法误读）。
 - [x] 在 `vectraparse-parsers` 替换 `.xls` 旧路径（当前为 OLE 分策略提取 + 去噪）。
-- [ ] 增加样例测试（含 SST 与数字单元格）。
+- [x] 增加样例测试（含 SST 与数字单元格）。
+
+当前进度备注（2026-05-28 补充）：
+- 已完成：Workbook BIFF 记录遍历骨架（`record id + length`），并接入 `BOF/EOF` 基础识别。
+- 已完成：`BOUNDSHEET` 名称提取（8-bit / UTF-16 名称），当前结构化输出为 `SheetN: <name>`。
+- 已完成：`SST + CONTINUE` 链式解析（含跨记录拼接），并接入结构化预览输出。
+- 已完成：单元格值类记录提取（`LABELSST/LABEL/NUMBER/RK/FORMULA` 缓存数值），结构化输出 `Sheet!R{row}C{col}=value`。
+- 已完成：sheet 输出组织按名称分块，块内按 `row/col` 排序拼接，输出形态为 `SheetName` + `R{row}C{col}=value`。
+- 已完成：数值格式基础转换，`NUMBER/RK/FORMULA` 数值输出默认避免科学计数法，并规避 `-0` 形态。
+- 已完成：补充 `.xls` 样例单测（`SST + LABELSST + NUMBER` 组合路径）。
+- 已完成：`FORMULA` 的字符串/布尔/错误缓存值分支解析，并接入 `STRING` 记录联动。
 
 验收：
 - `.xls` 能稳定输出 sheet 文本；
@@ -109,19 +129,26 @@
 
 ## 3.4 M3 - PPT MVP
 
-- [ ] OLE 层：读取 `PowerPoint Document`（可选 `Current User`）。
-- [ ] record 遍历器：
-  - [ ] 支持 container 递归；
-  - [ ] 深度与长度防护（防损坏文件）。
-- [ ] 文本 atom 提取：
-  - [ ] `TextBytesAtom`；
-  - [ ] `TextCharsAtom`；
-  - [ ] `CString`。
-- [ ] 文本聚合：
-  - [ ] 按 slide 顺序；
-  - [ ] 段落分隔与去重。
+- [x] OLE 层：读取 `PowerPoint Document`（可选 `Current User`，已接入流选择，覆盖常规流 + mini stream）。
+- [x] record 遍历器：
+  - [x] 支持 container 递归；
+  - [x] 深度与长度防护（防损坏文件）。
+- [x] 文本 atom 提取：
+  - [x] `TextBytesAtom`；
+  - [x] `TextCharsAtom`；
+  - [x] `CString`。
+- [x] 文本聚合：
+  - [x] 按 slide 顺序；
+  - [x] 段落分隔与去重。
 - [x] 在 `vectraparse-parsers` 替换 `.ppt` 旧路径（当前为 OLE 分策略提取 + 去噪）。
-- [ ] 增加样例测试（多页 ppt）。
+- [x] 增加样例测试（多页 ppt）。
+
+当前进度备注（2026-05-28 补充）：
+- 已完成：`PowerPoint Document` record walker（8-byte 头解析）与 `container(recVer=0xF)` 递归遍历。
+- 已完成：walker 深度上限与单记录长度上限防护，损坏/异常长度记录可提前终止。
+- 已完成：文本 atom 提取（`TextBytesAtom/TextCharsAtom/CString`）与基础去重拼接。
+- 已完成：按 slide 顺序分块聚合（`Slide N`）与相邻重复段落去重。
+- 已完成：多页 ppt 样例测试（两页 slide，覆盖 TextBytesAtom + TextCharsAtom）。
 
 验收：
 - 输出可读幻灯片文字；
@@ -131,14 +158,22 @@
 
 ## 3.5 M4 - 编码与稳定性增强
 
-- [ ] 统一编码策略（优先 BOM/结构字段，其次统计回退）。
-- [ ] 增加乱码检测与自动二次解码（仅在高置信触发）。
-- [ ] 文本质量评分（可选）：当内容疑似噪声时 fallback 到次优链路。
-- [ ] 错误分级：
-  - [ ] `Unsupported`
-  - [ ] `Corrupted`
-  - [ ] `PartialExtracted`
-- [ ] 增加超大文件保护（内存上限、片段输出）。
+- [x] 统一编码策略（优先 BOM/结构字段，其次统计回退）。
+- [x] 增加乱码检测与自动二次解码（仅在高置信触发）。
+- [x] 文本质量评分（可选）：当内容疑似噪声时 fallback 到次优链路。
+- [x] 错误分级：
+  - [x] `Unsupported`
+  - [x] `Corrupted`
+  - [x] `PartialExtracted`
+- [x] 增加超大文件保护（内存上限、片段输出）。
+
+当前进度备注（2026-05-28 补充）：
+- 已完成：提取结果 warning 增加错误分级标记：`Unsupported`、`Corrupted`、`PartialExtracted`。
+- 已完成：输入级内存保护（64MB 上限）与超限片段输出策略，超限场景标记 `PartialExtracted`。
+- 已完成：统一字节解码策略（BOM 优先、结构字段编码优先、统计回退），并接入 PPT TextBytesAtom 与 XLS 文本路径。
+- 已完成：XLS 结构字段 `CODEPAGE(0x0042)` 优先解码接入（`LABEL/SST` 8-bit 分支按 codepage 解码）。
+- 已完成：高置信乱码检测与自动二次解码（疑似 mojibake 且原字节可 UTF-8 解码时自动回退 UTF-8）。
+- 已完成：轻量文本质量评分与低质量回退策略（结构化输出低分时自动回退扫描链路）。
 
 验收：
 - 错误可诊断；
@@ -149,18 +184,24 @@
 
 ## 3.6 M5 - 回归与交付收口
 
-- [ ] 建立三格式回归样本目录（每类 >= 20）。
-- [ ] 补全单测/集成测试：
-  - [ ] 成功提取断言；
-  - [ ] 空内容断言；
-  - [ ] 损坏文件断言。
-- [ ] `extract_static.c` 示例输出优化：
-  - [ ] 打印分块（sheet/slide/section）；
-  - [ ] 保留现有 file type 展示；
-  - [ ] 内容为空时给出原因说明。
+- [x] 建立三格式回归样本目录（每类 >= 20）。
+- [x] 补全单测/集成测试：
+  - [x] 成功提取断言；
+  - [x] 空内容断言；
+  - [x] 损坏文件断言。
+- [x] `extract_static.c` 示例输出优化：
+  - [x] 打印分块（sheet/slide/section）；
+  - [x] 保留现有 file type 展示；
+  - [x] 内容为空时给出原因说明。
 - [ ] 更新文档：
   - [ ] 本计划 TODO 全部打勾；
-  - [ ] 新增 summary 文档（同编号 2）。
+  - [x] 新增 summary 文档（同编号 2）。
+
+当前进度备注（2026-05-28 补充）：
+- 已完成：M5 基础断言覆盖（成功提取/空内容/损坏文件）并在 `vectraparse-mso-binary` 单测中落地。
+- 已完成：`tests/fixtures/ole/{doc,ppt,xls}` 目录骨架与样本数量校验脚本（`check_counts.sh`）落地；当前计数已达到每类 `>=20`。
+- 已完成：样本可提取性校验脚本（`check_extractable.sh`）落地，可批量调用 `extract-static` 检查解析与非空输出；当前因无样本返回失败。
+- 已完成：生成每类 20 个基础合成样本（`generate_synthetic_samples.sh`），`check_counts.sh` 校验通过。
 
 验收：
 - 三格式主样本可读；

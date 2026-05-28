@@ -206,6 +206,42 @@ static int read_file_bytes(const char *path, uint8_t **data, size_t *len) {
   return 0;
 }
 
+static int is_section_header(const char *line) {
+  return (strncmp(line, "Sheet ", 6) == 0 || strncmp(line, "Slide ", 6) == 0);
+}
+
+static void print_content_blocks(const char *content) {
+  if (content == NULL || content[0] == '\0') {
+    printf("Content:\n(empty)\n");
+    return;
+  }
+  char *buf = strdup(content);
+  if (buf == NULL) {
+    printf("Content:\n%s\n", content);
+    return;
+  }
+  printf("Content Blocks:\n");
+  char *line = strtok(buf, "\n");
+  int block_idx = 0;
+  int in_block = 0;
+  while (line != NULL) {
+    if (is_section_header(line)) {
+      block_idx++;
+      in_block = 1;
+      printf("\n[%d] %s\n", block_idx, line);
+    } else if (line[0] != '\0') {
+      if (!in_block) {
+        block_idx++;
+        in_block = 1;
+        printf("\n[%d] Section\n", block_idx);
+      }
+      printf("  %s\n", line);
+    }
+    line = strtok(NULL, "\n");
+  }
+  free(buf);
+}
+
 
 int main(int argc, char **argv) {
   if (argc != 2) {
@@ -255,8 +291,12 @@ int main(int argc, char **argv) {
   char *content_json = extract_json_string_field(parse_out.data, parse_out.len, "content");
   char *content = json_unescape_utf8(content_json);
 
-  printf("File Type: %s\n\n\n", mime != NULL ? mime : "(unknown)");
-  printf("Content:\n%s\n", content != NULL ? content : "");
+  printf("File Type: %s\n\n", mime != NULL ? mime : "(unknown)");
+  if (content == NULL || content[0] == '\0') {
+    printf("Content:\n(empty)\nReason: parser returned empty content or file has no extractable text.\n");
+  } else {
+    print_content_blocks(content);
+  }
 
   free(mime);
   free(content_json);

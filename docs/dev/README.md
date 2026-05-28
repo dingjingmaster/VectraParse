@@ -19,3 +19,4 @@
 | 1 | 2026-05-27 | L4 | plan | [1-plan-rust-tika-rewrite.md](1-plan-rust-tika-rewrite.md) | 已完成 | 将 Tika Rust 重写范围整合为完整执行计划，列出基础架构、检测、解析、增强、FFI、验证和发布 todo。 |
 | 2 | 2026-05-28 | L3 | research | [2-research-ole-doc-ppt-xls-extraction.md](2-research-ole-doc-ppt-xls-extraction.md) | 已完成 | 基于 LibreOffice 源码路径调研 OLE 二进制 Office（`.doc/.ppt/.xls`）可行提取方案，结论为可通过纯 Rust 重写解析链路达成且不引入新的系统二进制依赖。 |
 | 2 | 2026-05-28 | L3 | plan | [2-plan-ole-doc-ppt-xls-extraction.md](2-plan-ole-doc-ppt-xls-extraction.md) | 进行中 | 基于调研拆解 `.doc/.ppt/.xls` 纯 Rust 实施 TODO，按里程碑定义验收标准、测试命令与提交节奏。 |
+| 2 | 2026-05-28 | L3 | summary | [2-summary-ole-doc-ppt-xls-extraction.md](2-summary-ole-doc-ppt-xls-extraction.md) | 进行中 | 阶段性总结 DOC/XLS/PPT 结构化提取、编码与稳定性增强进展，记录当前验证范围与剩余收口事项。 |
