@@ -109,7 +109,7 @@
 | P4-09 | 实现 RTF 和 RTF object data 递归 | RTF golden；嵌入对象测试 | 完成 |
 | P4-10 | 实现 HWP、CHM、WordPerfect、Quattro Pro 等其他文档格式 | 每格式 golden；检测与 parser 映射测试 | 完成 |
 | P5-01 | 实现 RFC822/MIME 邮件 parser、附件递归和 charset 处理 | eml golden；多附件和坏 charset 测试 | 完成 |
-| P5-02 | 实现 MBOX parser | mbox 多邮件样本；递归附件测试 | 待开始 |
+| P5-02 | 实现 MBOX parser | mbox 多邮件样本；递归附件测试 | 完成 |
 | P5-03 | 实现 Outlook PST/MSG/TNEF 邮箱能力 | pst/msg/tnef golden；大邮箱资源限制测试 | 待开始 |
 | P5-04 | 实现图片 metadata：通用 image、JPEG、TIFF、BPG、PSD、WebP、HEIF、ICNS、EXIF/XMP/IPTC | 图片格式 golden；损坏图片 fuzz smoke | 待开始 |
 | P5-05 | 实现音频 metadata：Audio、MP3、MIDI | mp3/id3/midi golden；坏 tag 测试 | 待开始 |
@@ -179,6 +179,7 @@
 | 2026-05-27 | 完成 P0-01 约束确认 | 按默认策略固定第一阶段执行边界，避免后续任务阻塞 |
 | 2026-05-27 | 完成 P0-02 workspace 骨架 | 建立多 crate 工作区和依赖边界，进入可编译状态 |
 | 2026-05-28 | 完成 P5-01 RFC822/MIME 邮件 parser | 实现邮件头/charset/附件与嵌套统计，并补充坏 charset 告警测试 |
+| 2026-05-28 | 完成 P5-02 MBOX parser | 支持多邮件拆分、聚合附件/嵌套计数与附件上限告警测试 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
