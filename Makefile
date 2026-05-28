@@ -20,6 +20,6 @@ fuzz-smoke:
 	bash scripts/fuzz_smoke.sh docs/dev/1-fuzz-smoke-report.md
 
 bench-smoke:
-	@echo "bench-smoke placeholder: benches will be added in P9-05"
+	bash scripts/bench_smoke.sh docs/dev/1-bench-smoke-report.md
 
 pipeline: check test abi-smoke golden fuzz-smoke bench-smoke
