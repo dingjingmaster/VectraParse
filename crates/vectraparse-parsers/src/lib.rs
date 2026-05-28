@@ -460,6 +460,53 @@ impl Parser for LightweightSpecializedParser {
     }
 }
 
+pub struct PackageParser;
+impl Parser for PackageParser {
+    fn name(&self) -> &'static str {
+        "PackageParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/zip"
+                | "application/x-tar"
+                | "application/gzip"
+                | "application/x-bzip2"
+                | "application/x-xz"
+                | "application/zstd"
+                | "application/x-7z-compressed"
+                | "application/vnd.rar"
+                | "application/x-rar-compressed"
+        )
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let pkg = detect_package_kind(input)?;
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "PackageParser");
+        metadata.insert("package.kind", pkg.to_string());
+        metadata.insert("package.input_bytes", input.len().to_string());
+        let (entry_count, inflated_bytes) = estimate_archive_stats(input);
+        metadata.insert("package.entry_count", entry_count.to_string());
+        metadata.insert("package.estimated_inflated_bytes", inflated_bytes.to_string());
+        let mut warnings = Vec::new();
+        if inflated_bytes > input.len().saturating_mul(200) {
+            warnings.push("package-expansion-ratio-limit".to_string());
+        }
+        if entry_count > 1000 {
+            warnings.push("package-entry-limit".to_string());
+        }
+        if input.windows(6).filter(|w| *w == b"[[DIR:").count() > 16 {
+            warnings.push("package-depth-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -675,6 +722,44 @@ fn detect_source_language(content: &str) -> &'static str {
     }
 }
 
+fn detect_package_kind(input: &[u8]) -> Option<&'static str> {
+    if input.starts_with(b"PK\x03\x04") || input.starts_with(b"PK\x05\x06") {
+        return Some("zip");
+    }
+    if input.starts_with(b"\x1F\x8B") {
+        return Some("gzip");
+    }
+    if input.starts_with(b"BZh") {
+        return Some("bzip2");
+    }
+    if input.starts_with(b"\xFD7zXZ\x00") {
+        return Some("xz");
+    }
+    if input.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some("zstd");
+    }
+    if input.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        return Some("7z");
+    }
+    if input.starts_with(b"Rar!\x1A\x07\x00") || input.starts_with(b"Rar!\x1A\x07\x01\x00") {
+        return Some("rar");
+    }
+    if input.len() > 262 && &input[257..262] == b"ustar" {
+        return Some("tar");
+    }
+    None
+}
+
+fn estimate_archive_stats(input: &[u8]) -> (usize, usize) {
+    let entry_markers = input
+        .windows(8)
+        .filter(|w| *w == b"[[FILE:]]" || *w == b"[[DIR:]]")
+        .count();
+    let entry_count = entry_markers.max(1);
+    let inflated = input.len().saturating_mul(8).saturating_add(entry_count * 64);
+    (entry_count, inflated)
+}
+
 fn extract_feed_links(content: &str) -> Vec<String> {
     let mut out = extract_html_links(content);
     let mut i = 0usize;
@@ -746,8 +831,8 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        LightweightSpecializedParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
-        XmlParser,
+        LightweightSpecializedParser, PackageParser, SourceCodeParser, StringsParser,
+        TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1020,6 +1105,29 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("DcXML")
+        );
+    }
+
+    #[test]
+    fn package_parser_detects_kinds_and_limits() {
+        let p = PackageParser;
+        let zip = p.parse(b"PK\x03\x04....", "application/zip").expect("zip");
+        assert_eq!(
+            zip.metadata
+                .values("package.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("zip")
+        );
+        let rar = p
+            .parse(b"Rar!\x1A\x07\x00....", "application/vnd.rar")
+            .expect("rar");
+        assert_eq!(
+            rar.metadata
+                .values("package.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("rar")
         );
     }
 }
