@@ -1348,6 +1348,52 @@ impl Parser for ScienceDataParser {
     }
 }
 
+pub struct GeoEngineeringParser;
+impl Parser for GeoEngineeringParser {
+    fn name(&self) -> &'static str {
+        "GeoEngineeringParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/x-gdal"
+                | "application/acad"
+                | "application/x-geodata"
+                | "application/x-geographic-info"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "GeoEngineeringParser");
+        let kind = if media_type == "application/x-gdal" || lower.contains("gdal") {
+            "gdal"
+        } else if media_type == "application/acad" || lower.contains("autocad") || lower.contains("dwg")
+        {
+            "dwg"
+        } else if lower.contains("epsg:") || lower.contains("geometry") || lower.contains("geojson") {
+            "geo"
+        } else {
+            "geographic-information"
+        };
+        metadata.insert("geo.kind", kind);
+        metadata.insert("geo.native_feature", "optional");
+        let mut warnings = Vec::new();
+        if kind == "gdal" || kind == "dwg" {
+            warnings.push("geo-native-dependency-optional".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1759,7 +1805,7 @@ mod tests {
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
-        ScienceDataParser,
+        GeoEngineeringParser, ScienceDataParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2692,5 +2738,33 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "science-native-dependency-optional"));
+    }
+
+    #[test]
+    fn geo_engineering_parser_detects_gdal_dwg_and_geo() {
+        let p = GeoEngineeringParser;
+        let gdal = p.parse(b"GDAL dataset", "application/x-gdal").expect("gdal");
+        assert_eq!(
+            gdal.metadata
+                .values("geo.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("gdal")
+        );
+        let dwg = p.parse(b"AutoCAD DWG", "application/acad").expect("dwg");
+        assert!(dwg
+            .warnings
+            .iter()
+            .any(|w| w == "geo-native-dependency-optional"));
+        let geo = p
+            .parse(b"{\"type\":\"Feature\",\"crs\":\"EPSG:4326\"}", "application/x-geodata")
+            .expect("geo");
+        assert_eq!(
+            geo.metadata
+                .values("geo.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("geo")
+        );
     }
 }
