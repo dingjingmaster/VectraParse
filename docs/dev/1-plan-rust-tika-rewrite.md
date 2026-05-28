@@ -89,7 +89,7 @@
 | P2-05 | 实现递归嵌入文档处理：深度、数量、路径、父子 metadata、异常隔离 | 嵌入 Office/zip/mail 样本；递归限制测试 | 完成 |
 | P2-06 | 实现 `ContainerExtractor`、`ParserContainerExtractor`、`Embedder`、`ExternalEmbedder` 等等价边界 | API 单测；禁用 embedder 时行为测试 | 完成 |
 | P2-07 | 实现 digest/hash parser、fork 隔离等价策略、NetworkParser 边界和可关闭策略 | hash 输出测试；隔离/禁用策略审查 | 完成 |
-| P3-01 | 实现 TXT parser 和编码归一化 | TXT 多编码 golden；空文件和二进制误判测试 | 待开始 |
+| P3-01 | 实现 TXT parser 和编码归一化 | TXT 多编码 golden；空文件和二进制误判测试 | 完成 |
 | P3-02 | 实现 CSV/TSV/分隔文本 parser，覆盖 `TextAndCSVParser` | CSV 方言、转义、坏行、metadata 测试 | 待开始 |
 | P3-03 | 实现 HTML parser，提取正文、title、meta、链接和 charset | HTML golden；恶意/深层 DOM 资源限制测试 | 待开始 |
 | P3-04 | 实现 XML parser、DcXML、FictionBook、通用 XML metadata 和 XPath | XML root golden；XXE 禁止测试 | 待开始 |
@@ -206,6 +206,7 @@
 | 2026-05-28 | 完成 P2-05 递归嵌入处理初版 | 在 `vectraparse-parsers` 增加嵌入递归、路径追踪、深度/数量限制和异常隔离告警 |
 | 2026-05-28 | 完成 P2-06 容器提取边界初版 | 在 `vectraparse-parsers` 增加 ContainerExtractor/Embedder 边界与禁用 embedder 行为测试 |
 | 2026-05-28 | 完成 P2-07 安全与摘要 parser 初版 | 在 `vectraparse-parsers` 增加 digest/hash parser、network parser 禁用策略与隔离配置测试 |
+| 2026-05-28 | 完成 P3-01 TXT parser 初版 | 在 `vectraparse-parsers` 增加编码归一化解码、空文件处理和二进制误判规避测试 |
 
 ## 10. P0-01 默认确认结果
 
