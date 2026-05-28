@@ -938,6 +938,57 @@ impl Parser for Rfc822MimeParser {
     }
 }
 
+pub struct MboxParser;
+impl Parser for MboxParser {
+    fn name(&self) -> &'static str {
+        "MboxParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/mbox" || media_type == "application/x-mbox"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8_lossy(input);
+        let messages = split_mbox_messages(&content);
+        if messages.is_empty() {
+            return None;
+        }
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "MboxParser");
+        metadata.insert("mail.message_count", messages.len().to_string());
+        let mut total_attachments = 0usize;
+        let mut total_nested = 0usize;
+        let mut bodies = Vec::new();
+        for msg in &messages {
+            let lower = msg.to_ascii_lowercase();
+            if let Some(from) = extract_header(msg, "From:") {
+                metadata.insert("mail.from", from);
+            }
+            if let Some(subject) = extract_header(msg, "Subject:") {
+                metadata.insert("mail.subject", subject);
+            }
+            total_attachments += lower.matches("content-disposition: attachment").count()
+                + lower.matches("filename=").count();
+            total_nested += lower.matches("message/rfc822").count();
+            let body = extract_mail_body(msg);
+            if !body.trim().is_empty() {
+                bodies.push(body.trim().to_string());
+            }
+        }
+        metadata.insert("mail.attachment_count", total_attachments.to_string());
+        metadata.insert("mail.nested_count", total_nested.to_string());
+        let mut warnings = Vec::new();
+        if total_attachments > 256 {
+            warnings.push("mail-attachment-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(bodies.join("\n\n")),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1171,6 +1222,23 @@ fn extract_mail_body(content: &str) -> String {
     content.to_string()
 }
 
+fn split_mbox_messages(content: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut current = String::new();
+    for line in content.lines() {
+        if line.starts_with("From ") && !current.trim().is_empty() {
+            messages.push(current.trim().to_string());
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        messages.push(current.trim().to_string());
+    }
+    messages
+}
+
 fn extract_xml_root(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -1322,7 +1390,7 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        LegacyDocParser, MsSpecialParser, OleLegacyParser, PdfParser, Rfc822MimeParser, RtfParser,
+        LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, PdfParser, Rfc822MimeParser, RtfParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -1994,5 +2062,43 @@ mod tests {
             )
             .expect("mail");
         assert!(out.warnings.iter().any(|w| w == "mail-invalid-charset"));
+    }
+
+    #[test]
+    fn mbox_parser_extracts_multiple_messages() {
+        let p = MboxParser;
+        let out = p
+            .parse(
+                b"From sender1@example.com Sat Jan 01 00:00:00 2022\nFrom: sender1@example.com\nSubject: one\n\nbody one\nFrom sender2@example.com Sat Jan 01 00:00:01 2022\nFrom: sender2@example.com\nSubject: two\nContent-Type: message/rfc822\n\nbody two",
+                "application/mbox",
+            )
+            .expect("mbox");
+        assert_eq!(
+            out.metadata
+                .values("mail.message_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            out.metadata
+                .values("mail.nested_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(out.content.as_deref().unwrap_or("").contains("body one"));
+        assert!(out.content.as_deref().unwrap_or("").contains("body two"));
+    }
+
+    #[test]
+    fn mbox_parser_warns_when_attachment_limit_exceeded() {
+        let p = MboxParser;
+        let mut mail = String::from("From sender@example.com\nFrom: sender@example.com\n\n");
+        for _ in 0..257 {
+            mail.push_str("Content-Disposition: attachment; filename=a.bin\n");
+        }
+        let out = p.parse(mail.as_bytes(), "application/x-mbox").expect("mbox");
+        assert!(out.warnings.iter().any(|w| w == "mail-attachment-limit"));
     }
 }
