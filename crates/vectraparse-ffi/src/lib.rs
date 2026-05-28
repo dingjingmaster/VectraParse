@@ -10,8 +10,9 @@ use vectraparse_core::{runtime::ResourceLimits, runtime::validate_input_size, CA
 use vectraparse_mime::{DetectHints, detect_media_type};
 use vectraparse_parsers::{
     CompositeParser, DerivedTextParser, FeedParser, HtmlParser, LegacyDocParser, LightweightSpecializedParser,
-    MboxParser, MsSpecialParser, OdfParser, OoxmlParser, OleLegacyParser, PackageParser, Parser, PdfParser,
-    Rfc822MimeParser, RtfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+    ImageMetadataParser, MboxParser, MsSpecialParser, OdfParser, OoxmlParser, OleLegacyParser, PackageParser,
+    Parser, PdfParser, Rfc822MimeParser, RtfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
+    XmlParser,
 };
 
 #[repr(C)]
@@ -94,6 +95,7 @@ fn build_parser_pipeline() -> CompositeParser {
         Box::new(LegacyDocParser),
         Box::new(Rfc822MimeParser),
         Box::new(MboxParser),
+        Box::new(ImageMetadataParser),
         Box::new(HtmlParser),
         Box::new(XmlParser),
         Box::new(TextAndCsvParser),

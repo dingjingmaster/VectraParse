@@ -3,8 +3,11 @@ pub mod embedded;
 pub mod extractor;
 pub mod security;
 
+use std::sync::OnceLock;
+
 use vectraparse_core::metadata::Metadata;
 use vectraparse_mime::detect_encoding;
+use vectraparse_ocr::{OcrConfig, TractOcrEngine};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1142,6 +1145,34 @@ impl Parser for ImageMetadataParser {
         if format == "unknown" {
             warnings.push("image-corrupted-or-unknown".to_string());
         }
+        if let Some(engine) = ocr_engine() {
+            let cfg = OcrConfig::default();
+            match engine.infer(input, &cfg) {
+                Ok(ocr) => {
+                    metadata.insert("image.ocr.enabled", "true");
+                    metadata.insert("image.ocr.confidence", format!("{:.4}", ocr.confidence));
+                    if let Some(w) = ocr.warning {
+                        warnings.push(w);
+                    }
+                    let content = if ocr.text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(ocr.text)
+                    };
+                    return Some(ParseOutcome {
+                        content,
+                        metadata,
+                        warnings,
+                        parser_chain: Vec::new(),
+                    });
+                }
+                Err(_) => {
+                    warnings.push("image-ocr-failed".to_string());
+                }
+            }
+        } else {
+            warnings.push("image-ocr-model-unavailable".to_string());
+        }
         Some(ParseOutcome {
             content: None,
             metadata,
@@ -1149,6 +1180,13 @@ impl Parser for ImageMetadataParser {
             parser_chain: Vec::new(),
         })
     }
+}
+
+fn ocr_engine() -> Option<&'static TractOcrEngine> {
+    static OCR_ENGINE: OnceLock<Option<TractOcrEngine>> = OnceLock::new();
+    OCR_ENGINE
+        .get_or_init(|| TractOcrEngine::load(&OcrConfig::default()).ok())
+        .as_ref()
 }
 
 pub struct AudioMetadataParser;
