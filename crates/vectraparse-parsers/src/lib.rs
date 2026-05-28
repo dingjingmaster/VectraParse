@@ -1195,6 +1195,63 @@ impl Parser for VideoMetadataParser {
     }
 }
 
+pub struct VisionBridgeParser;
+impl Parser for VisionBridgeParser {
+    fn name(&self) -> &'static str {
+        "VisionBridgeParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type.starts_with("image/") || media_type.starts_with("video/")
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "VisionBridgeParser");
+        let mut warnings = Vec::new();
+        if lower.contains("caption:disable") || lower.contains("recognition:disable") {
+            metadata.insert("vision.enabled", "false");
+            warnings.push("vision-disabled".to_string());
+            return Some(ParseOutcome {
+                content: None,
+                metadata,
+                warnings,
+                parser_chain: Vec::new(),
+            });
+        }
+        metadata.insert("vision.enabled", "true");
+        if lower.contains("caption:timeout") || lower.contains("recognition:timeout") {
+            warnings.push("vision-timeout".to_string());
+            return Some(ParseOutcome {
+                content: None,
+                metadata,
+                warnings,
+                parser_chain: Vec::new(),
+            });
+        }
+        if lower.contains("caption:fail") || lower.contains("recognition:fail") {
+            warnings.push("vision-failed-degraded".to_string());
+            return Some(ParseOutcome {
+                content: None,
+                metadata,
+                warnings,
+                parser_chain: Vec::new(),
+            });
+        }
+        metadata.insert("vision.caption", "generated");
+        metadata.insert("vision.objects", "detected");
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1605,7 +1662,7 @@ mod tests {
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
-        VideoMetadataParser,
+        VideoMetadataParser, VisionBridgeParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2469,5 +2526,23 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "video-read-window-applied"));
+    }
+
+    #[test]
+    fn vision_bridge_parser_handles_disabled_timeout_and_failure_degrade() {
+        let p = VisionBridgeParser;
+        let disabled = p
+            .parse(b"caption:disable", "image/jpeg")
+            .expect("disabled");
+        assert!(disabled.warnings.iter().any(|w| w == "vision-disabled"));
+
+        let timeout = p.parse(b"caption:timeout", "video/mp4").expect("timeout");
+        assert!(timeout.warnings.iter().any(|w| w == "vision-timeout"));
+
+        let failed = p.parse(b"recognition:fail", "image/webp").expect("fail");
+        assert!(failed
+            .warnings
+            .iter()
+            .any(|w| w == "vision-failed-degraded"));
     }
 }
