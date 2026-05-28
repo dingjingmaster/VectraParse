@@ -559,6 +559,47 @@ impl Parser for OoxmlParser {
     }
 }
 
+pub struct OdfParser;
+impl Parser for OdfParser {
+    fn name(&self) -> &'static str {
+        "OdfParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/vnd.oasis.opendocument"
+            || media_type == "application/vnd.oasis.opendocument.text"
+            || media_type == "application/vnd.oasis.opendocument.spreadsheet"
+            || media_type == "application/vnd.oasis.opendocument.presentation"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "OdfParser");
+        let kind = if lower.contains("mimetypeapplication/vnd.oasis.opendocument.text") {
+            "odt"
+        } else if lower.contains("mimetypeapplication/vnd.oasis.opendocument.spreadsheet") {
+            "ods"
+        } else if lower.contains("mimetypeapplication/vnd.oasis.opendocument.presentation") {
+            "odp"
+        } else {
+            "odf"
+        };
+        metadata.insert("odf.kind", kind);
+        if lower.contains("meta.xml") {
+            metadata.insert("odf.meta", "true");
+        }
+        if lower.contains("manifest.xml") {
+            metadata.insert("odf.manifest", "true");
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -883,7 +924,7 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        LightweightSpecializedParser, OoxmlParser, PackageParser, SourceCodeParser, StringsParser,
+        LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser, SourceCodeParser, StringsParser,
         TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -1209,6 +1250,38 @@ mod tests {
         assert_eq!(
             out.metadata
                 .values("ooxml.core_props")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn odf_parser_extracts_kind_manifest_and_meta() {
+        let p = OdfParser;
+        let out = p
+            .parse(
+                b"PK\x03\x04...mimetypeapplication/vnd.oasis.opendocument.text...META-INF/manifest.xml...meta.xml",
+                "application/vnd.oasis.opendocument",
+            )
+            .expect("odf");
+        assert_eq!(
+            out.metadata
+                .values("odf.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("odt")
+        );
+        assert_eq!(
+            out.metadata
+                .values("odf.manifest")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("odf.meta")
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("true")
