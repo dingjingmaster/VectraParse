@@ -91,7 +91,7 @@ impl Default for OcrConfig {
         Self {
             det_model_path: "data/ch_PP-OCRv4_det.onnx".to_string(),
             rec_model_path: "data/ch_PP-OCRv4_rec.onnx".to_string(),
-            rec_dict_path: Some("data/ppocr_keys_v1.txt".to_string()),
+            rec_dict_path: None,
             rec_img_h: 48,
             rec_img_w: 320,
             det_img_side: 960,
@@ -128,10 +128,22 @@ impl TractOcrEngine {
 }
 
 fn load_dict(path: Option<&str>) -> Vec<String> {
-    let Some(path) = path else {
-        return Vec::new();
+    let candidates: Vec<&str> = match path {
+        Some(p) => vec![p],
+        None => vec![
+            "data/chinese/dict.txt",
+            "data/english/dict.txt",
+            "data/ppocr_keys_v1.txt",
+        ],
     };
-    let Ok(content) = fs::read_to_string(path) else {
+    let mut content_opt = None;
+    for p in candidates {
+        if let Ok(content) = fs::read_to_string(p) {
+            content_opt = Some(content);
+            break;
+        }
+    }
+    let Some(content) = content_opt else {
         return Vec::new();
     };
     content
