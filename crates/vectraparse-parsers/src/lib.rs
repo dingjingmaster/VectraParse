@@ -2766,6 +2766,44 @@ mod tests {
     }
 
     #[test]
+    fn ooxml_parser_extracts_text_from_real_docx_zip_payload() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            zip.start_file("word/document.xml", SimpleFileOptions::default())
+                .expect("start file");
+            zip.write_all(
+                br#"<w:document><w:body><w:p><w:t>Hello DOCX Text</w:t></w:p></w:body></w:document>"#,
+            )
+            .expect("write xml");
+            zip.finish().expect("finish zip");
+        }
+        let payload = cursor.into_inner();
+        let p = OoxmlParser;
+        let out = p
+            .parse(
+                &payload,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            .expect("ooxml");
+        assert_eq!(
+            out.metadata
+                .values("ooxml.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("docx")
+        );
+        assert!(out
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("Hello DOCX Text"));
+    }
+
+    #[test]
     fn odf_parser_extracts_kind_manifest_and_meta() {
         let p = OdfParser;
         let out = p
