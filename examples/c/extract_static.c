@@ -2,8 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include "vectraparse.h"
 
@@ -194,103 +192,6 @@ static int read_file_bytes(const char *path, uint8_t **data, size_t *len) {
   return 0;
 }
 
-static int read_text_file(const char *path, char **out) {
-  FILE *fp = fopen(path, "rb");
-  if (fp == NULL) {
-    return -1;
-  }
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    fclose(fp);
-    return -1;
-  }
-  long sz = ftell(fp);
-  if (sz < 0) {
-    fclose(fp);
-    return -1;
-  }
-  if (fseek(fp, 0, SEEK_SET) != 0) {
-    fclose(fp);
-    return -1;
-  }
-  char *buf = (char *)malloc((size_t)sz + 1);
-  if (buf == NULL) {
-    fclose(fp);
-    return -1;
-  }
-  size_t got = fread(buf, 1, (size_t)sz, fp);
-  fclose(fp);
-  buf[got] = '\0';
-  *out = buf;
-  return 0;
-}
-
-static char *basename_noext(const char *path) {
-  const char *name = strrchr(path, '/');
-  name = (name == NULL) ? path : name + 1;
-  const char *dot = strrchr(name, '.');
-  size_t n = (dot && dot > name) ? (size_t)(dot - name) : strlen(name);
-  char *out = (char *)malloc(n + 1);
-  if (out == NULL) {
-    return NULL;
-  }
-  memcpy(out, name, n);
-  out[n] = '\0';
-  return out;
-}
-
-static int try_soffice_extract_txt(const char *doc_path, char **content_out) {
-  char tmpdir[] = "/tmp/vectraparse-soffice-XXXXXX";
-  if (mkdtemp(tmpdir) == NULL) {
-    return -1;
-  }
-
-  const char *bin = NULL;
-  if (access("/usr/bin/soffice", X_OK) == 0) {
-    bin = "soffice";
-  } else if (access("/usr/bin/libreoffice", X_OK) == 0) {
-    bin = "libreoffice";
-  } else {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", tmpdir);
-    system(cmd);
-    return -1;
-  }
-
-  char cmd[2048];
-  snprintf(cmd, sizeof(cmd),
-           "%s --headless --convert-to txt:Text --outdir %s '%s' >/dev/null 2>&1",
-           bin, tmpdir, doc_path);
-  int rc = system(cmd);
-  if (rc != 0) {
-    char clean[512];
-    snprintf(clean, sizeof(clean), "rm -rf %s", tmpdir);
-    system(clean);
-    return -1;
-  }
-
-  char *stem = basename_noext(doc_path);
-  if (stem == NULL) {
-    char clean[512];
-    snprintf(clean, sizeof(clean), "rm -rf %s", tmpdir);
-    system(clean);
-    return -1;
-  }
-  char txt_path[2048];
-  snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", tmpdir, stem);
-  free(stem);
-
-  char *txt = NULL;
-  int ok = read_text_file(txt_path, &txt);
-  char clean[512];
-  snprintf(clean, sizeof(clean), "rm -rf %s", tmpdir);
-  system(clean);
-  if (ok != 0 || txt == NULL || txt[0] == '\0') {
-    free(txt);
-    return -1;
-  }
-  *content_out = txt;
-  return 0;
-}
 
 int main(int argc, char **argv) {
   if (argc != 2) {
@@ -339,14 +240,6 @@ int main(int argc, char **argv) {
   char *mime = extract_json_string_field(detect_out.data, detect_out.len, "mime_type");
   char *content_json = extract_json_string_field(parse_out.data, parse_out.len, "content");
   char *content = json_unescape_utf8(content_json);
-
-  if (mime != NULL && strcmp(mime, "application/x-tika-msoffice") == 0) {
-    char *doc_text = NULL;
-    if (try_soffice_extract_txt(path, &doc_text) == 0 && doc_text != NULL) {
-      free(content);
-      content = doc_text;
-    }
-  }
 
   printf("File Type: %s\n\n\n", mime != NULL ? mime : "(unknown)");
   printf("Content:\n%s\n", content != NULL ? content : "");

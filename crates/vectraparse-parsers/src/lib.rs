@@ -791,20 +791,18 @@ impl Parser for OleLegacyParser {
         if lower.contains("ole10native") || lower.contains("embedded object") {
             warnings.push("ole-embedded-object".to_string());
         }
-        let text = extract_doc_text_external(input).unwrap_or_else(|| {
-            let utf16_lines = extract_utf16le_strings(input, 4, 16 * 1024);
-            let ascii_lines = extract_ascii_strings(input, 4, 16 * 1024);
-            let mut merged = Vec::new();
-            for line in utf16_lines.into_iter().chain(ascii_lines.into_iter()) {
-                if is_human_text_line(&line) {
-                    merged.push(line);
-                }
-                if merged.len() >= 300 {
-                    break;
-                }
+        let utf16_lines = extract_utf16le_strings(input, 4, 16 * 1024);
+        let ascii_lines = extract_ascii_strings(input, 4, 16 * 1024);
+        let mut merged = Vec::new();
+        for line in utf16_lines.into_iter().chain(ascii_lines.into_iter()) {
+            if is_human_text_line(&line) {
+                merged.push(line);
             }
-            merged.join("\n")
-        });
+            if merged.len() >= 300 {
+                break;
+            }
+        }
+        let text = merged.join("\n");
         Some(ParseOutcome {
             content: if text.is_empty() { Some(String::new()) } else { Some(text) },
             metadata,
@@ -2400,162 +2398,6 @@ fn is_human_text_line(s: &str) -> bool {
     good * 100 / total >= 70
 }
 
-fn extract_doc_text_external(input: &[u8]) -> Option<String> {
-    use std::fs;
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    if !input.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
-        return None;
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("vectraparse-doc-{nanos}.doc"));
-    fs::write(&path, input).ok()?;
-
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(out) = Command::new("antiword").arg(&path).output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).to_string();
-            if !s.trim().is_empty() {
-                candidates.push(s);
-            }
-        }
-    }
-    for src_cs in ["utf-8", "gb18030", "gbk", "cp936", "big5", "cp1252"] {
-        if let Ok(out) = Command::new("catdoc")
-            .args(["-d", "utf-8", "-s", src_cs])
-            .arg(&path)
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).to_string();
-                if !s.trim().is_empty() {
-                    candidates.push(s);
-                }
-            }
-        }
-    }
-    if let Some(txt) = extract_with_soffice_txt(&path) {
-        if !txt.trim().is_empty() {
-            candidates.push(txt);
-        }
-    }
-    let out = candidates
-        .into_iter()
-        .flat_map(|s| {
-            let fixed = try_fix_mojibake_latin1_utf8(&s);
-            match fixed {
-                Some(f) if f != s => vec![s, f],
-                _ => vec![s],
-            }
-        })
-        .max_by_key(|s| score_human_text(s));
-
-    let _ = fs::remove_file(&path);
-    out
-}
-
-fn extract_with_soffice_txt(path: &std::path::Path) -> Option<String> {
-    use std::fs;
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let outdir = std::env::temp_dir().join(format!("vectraparse-soffice-{ts}"));
-    fs::create_dir_all(&outdir).ok()?;
-    let bin = if Command::new("soffice").arg("--version").output().is_ok() {
-        "soffice"
-    } else if Command::new("libreoffice")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        "libreoffice"
-    } else {
-        let _ = fs::remove_dir_all(&outdir);
-        return None;
-    };
-    let status = Command::new(bin)
-        .args([
-            "--headless",
-            "--convert-to",
-            "txt:Text",
-            "--outdir",
-            outdir.to_string_lossy().as_ref(),
-        ])
-        .arg(path)
-        .status()
-        .ok()?;
-    if !status.success() {
-        let _ = fs::remove_dir_all(&outdir);
-        return None;
-    }
-    let stem = path.file_stem()?.to_string_lossy();
-    let txt_path = outdir.join(format!("{stem}.txt"));
-    let content = fs::read_to_string(&txt_path).ok();
-    let _ = fs::remove_file(txt_path);
-    let _ = fs::remove_dir_all(&outdir);
-    content
-}
-
-fn score_human_text(s: &str) -> usize {
-    let mut score = 0usize;
-    for line in s.lines() {
-        let t = line.trim();
-        if t.len() < 2 {
-            continue;
-        }
-        if t.contains("Root Entry")
-            || t.contains("SummaryInformation")
-            || t.contains("DocumentSummaryInformation")
-            || t.contains("WordDocument")
-            || t.contains("WMFC")
-            || t.contains("IDAT")
-            || t.contains("IHDR")
-        {
-            score = score.saturating_sub(5);
-            continue;
-        }
-        let total = t.chars().count().max(1);
-        let good = t
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ('\u{4E00}'..='\u{9FFF}').contains(c))
-            .count();
-        if good * 100 / total >= 70 {
-            score += good;
-        }
-        if t.contains('的') || t.contains('是') || t.contains('了') {
-            score += 10;
-        }
-        if t.contains("æ") || t.contains("å") || t.contains("ç") {
-            score = score.saturating_sub(2);
-        }
-    }
-    score
-}
-
-fn try_fix_mojibake_latin1_utf8(s: &str) -> Option<String> {
-    let mojibake_hint = s.contains('æ') || s.contains('å') || s.contains('ç') || s.contains('Ã');
-    if !mojibake_hint {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(s.len());
-    for ch in s.chars() {
-        let code = ch as u32;
-        if code <= 0xFF {
-            bytes.push(code as u8);
-        } else {
-            return None;
-        }
-    }
-    String::from_utf8(bytes).ok()
-}
 
 fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
     let mut out = Vec::new();
