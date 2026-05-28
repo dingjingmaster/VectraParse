@@ -279,6 +279,54 @@ pub fn detect_media_type_with_config(
     magic
 }
 
+pub fn detect_encoding(input: &[u8]) -> &'static str {
+    if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return "utf-8";
+    }
+    if input.starts_with(&[0xFF, 0xFE]) {
+        return "utf-16le";
+    }
+    if input.starts_with(&[0xFE, 0xFF]) {
+        return "utf-16be";
+    }
+    if let Some(enc) = detect_html_meta_charset(input) {
+        return enc;
+    }
+    if std::str::from_utf8(input).is_ok() {
+        return "utf-8";
+    }
+    "binary"
+}
+
+fn detect_html_meta_charset(input: &[u8]) -> Option<&'static str> {
+    let s = String::from_utf8_lossy(&input[..input.len().min(8192)]).to_ascii_lowercase();
+    if let Some(pos) = s.find("charset=") {
+        let mut rest = &s[pos + "charset=".len()..];
+        rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\'')) {
+            rest = stripped;
+        }
+        let mut end = rest.len();
+        for (i, ch) in rest.char_indices() {
+            if ch == '"' || ch == '\'' || ch == '>' || ch.is_whitespace() || ch == ';' {
+                end = i;
+                break;
+            }
+        }
+        let raw = rest[..end].trim_matches('"').trim_matches('\'');
+        return match raw {
+            "utf-8" => Some("utf-8"),
+            "utf8" => Some("utf-8"),
+            "utf-16" | "utf-16le" => Some("utf-16le"),
+            "utf-16be" => Some("utf-16be"),
+            "gbk" | "gb2312" => Some("gbk"),
+            "iso-8859-1" | "latin1" => Some("iso-8859-1"),
+            _ => Some("unknown"),
+        };
+    }
+    None
+}
+
 fn looks_like_model_hint(input: &[u8]) -> bool {
     let probe = String::from_utf8_lossy(&input[..input.len().min(4096)]).to_ascii_lowercase();
     probe.contains("neural-model:") || probe.contains("ml-prediction:")
@@ -562,7 +610,7 @@ fn normalize_media_type(raw: &str) -> Option<String> {
 mod tests {
     use super::{
         DetectHints, DetectorConfig, MagicMatcher, MagicRule, MediaTypeRegistry, detect_media_type,
-        detector_provider_names, generated_stats, source_path,
+        detect_encoding, detector_provider_names, generated_stats, source_path,
     };
 
     #[test]
@@ -856,5 +904,16 @@ mod tests {
             super::detect_media_type_with_config(input, &hints, &enabled),
             "application/x-model-predicted"
         );
+    }
+
+    #[test]
+    fn encoding_detector_handles_bom_and_html_charset() {
+        assert_eq!(detect_encoding(b"\xEF\xBB\xBFhello"), "utf-8");
+        assert_eq!(detect_encoding(b"\xFF\xFEh\0i\0"), "utf-16le");
+        assert_eq!(
+            detect_encoding(br#"<meta charset="ISO-8859-1"><p>x</p>"#),
+            "iso-8859-1"
+        );
+        assert_eq!(detect_encoding(b"plain text"), "utf-8");
     }
 }
