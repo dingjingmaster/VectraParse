@@ -1252,6 +1252,54 @@ impl Parser for VisionBridgeParser {
     }
 }
 
+pub struct DatabaseTabularParser;
+impl Parser for DatabaseTabularParser {
+    fn name(&self) -> &'static str {
+        "DatabaseTabularParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/x-dbf"
+                | "application/vnd.sqlite3"
+                | "application/x-msaccess"
+                | "application/x-jdbc"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "DatabaseTabularParser");
+        let kind = if media_type == "application/x-dbf" || lower.contains("dbf") {
+            "dbf"
+        } else if media_type == "application/vnd.sqlite3" || lower.contains("sqlite format 3") {
+            "sqlite"
+        } else if media_type == "application/x-msaccess"
+            || lower.contains("standard jet db")
+            || lower.contains("msysobjects")
+        {
+            "access"
+        } else {
+            "jdbc"
+        };
+        metadata.insert("db.kind", kind);
+        metadata.insert("db.connection.enabled", "false");
+        let mut warnings = vec!["db-connection-disabled-by-default".to_string()];
+        if kind == "jdbc" && (lower.contains("jdbc:") || lower.contains("driverclass")) {
+            warnings.push("db-jdbc-config-detected".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1662,7 +1710,7 @@ mod tests {
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
-        VideoMetadataParser, VisionBridgeParser,
+        DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2544,5 +2592,35 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "vision-failed-degraded"));
+    }
+
+    #[test]
+    fn database_tabular_parser_detects_kinds_and_connection_policy() {
+        let p = DatabaseTabularParser;
+        let sqlite = p
+            .parse(b"SQLite format 3\0....", "application/vnd.sqlite3")
+            .expect("sqlite");
+        assert_eq!(
+            sqlite
+                .metadata
+                .values("db.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("sqlite")
+        );
+        let jdbc = p
+            .parse(
+                b"jdbc:mysql://localhost:3306/demo DriverClass=com.mysql.Driver",
+                "application/x-jdbc",
+            )
+            .expect("jdbc");
+        assert!(jdbc
+            .warnings
+            .iter()
+            .any(|w| w == "db-connection-disabled-by-default"));
+        assert!(jdbc
+            .warnings
+            .iter()
+            .any(|w| w == "db-jdbc-config-detected"));
     }
 }
