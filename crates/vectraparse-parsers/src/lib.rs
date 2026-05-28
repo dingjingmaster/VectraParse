@@ -1043,6 +1043,72 @@ impl Parser for OutlookMailboxParser {
     }
 }
 
+pub struct ImageMetadataParser;
+impl Parser for ImageMetadataParser {
+    fn name(&self) -> &'static str {
+        "ImageMetadataParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "image/jpeg"
+                | "image/tiff"
+                | "image/bpg"
+                | "image/vnd.adobe.photoshop"
+                | "image/webp"
+                | "image/heif"
+                | "image/icns"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(input);
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "ImageMetadataParser");
+        metadata.insert("image.mime", media_type);
+        let format = if input.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            "jpeg"
+        } else if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
+            "tiff"
+        } else if input.starts_with(b"BPG\xFB") {
+            "bpg"
+        } else if input.starts_with(b"8BPS") {
+            "psd"
+        } else if input.len() > 12 && &input[0..4] == b"RIFF" && &input[8..12] == b"WEBP" {
+            "webp"
+        } else if lower.contains("ftypheic") || lower.contains("ftypmif1") {
+            "heif"
+        } else if input.starts_with(b"icns") {
+            "icns"
+        } else {
+            "unknown"
+        };
+        metadata.insert("image.format", format);
+        if lower.contains("exif") {
+            metadata.insert("image.has_exif", "true");
+        }
+        if lower.contains("<x:xmpmeta") || lower.contains("http://ns.adobe.com/xap/1.0/") {
+            metadata.insert("image.has_xmp", "true");
+        }
+        if lower.contains("iptc") || lower.contains("photoshop 3.0") {
+            metadata.insert("image.has_iptc", "true");
+        }
+        let mut warnings = Vec::new();
+        if format == "unknown" {
+            warnings.push("image-corrupted-or-unknown".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1445,7 +1511,7 @@ mod tests {
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
-        PdfParser, Rfc822MimeParser, RtfParser,
+        ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2196,5 +2262,54 @@ mod tests {
                 .map(String::as_str),
             Some("tnef")
         );
+    }
+
+    #[test]
+    fn image_metadata_parser_extracts_format_and_embedded_metadata_flags() {
+        let p = ImageMetadataParser;
+        let out = p
+            .parse(
+                b"\xFF\xD8\xFF....EXIF....<x:xmpmeta>..IPTC..",
+                "image/jpeg",
+            )
+            .expect("jpeg");
+        assert_eq!(
+            out.metadata
+                .values("image.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("jpeg")
+        );
+        assert_eq!(
+            out.metadata
+                .values("image.has_exif")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("image.has_xmp")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("image.has_iptc")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn image_metadata_parser_warns_on_unknown_signature() {
+        let p = ImageMetadataParser;
+        let out = p.parse(b"not-an-image", "image/webp").expect("image");
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w == "image-corrupted-or-unknown"));
     }
 }
