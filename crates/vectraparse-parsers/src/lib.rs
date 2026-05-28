@@ -1300,6 +1300,54 @@ impl Parser for DatabaseTabularParser {
     }
 }
 
+pub struct ScienceDataParser;
+impl Parser for ScienceDataParser {
+    fn name(&self) -> &'static str {
+        "ScienceDataParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        matches!(
+            media_type,
+            "application/x-netcdf"
+                | "application/x-hdf"
+                | "application/x-grib"
+                | "application/x-matlab-data"
+                | "application/x-sas-data"
+        )
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "ScienceDataParser");
+        let kind = if media_type == "application/x-netcdf" || lower.contains("netcdf") {
+            "netcdf"
+        } else if media_type == "application/x-hdf" || lower.contains("hdf") {
+            "hdf"
+        } else if media_type == "application/x-grib" || lower.contains("grib") {
+            "grib"
+        } else if media_type == "application/x-matlab-data" || lower.contains("matlab") {
+            "mat"
+        } else {
+            "sas"
+        };
+        metadata.insert("science.kind", kind);
+        metadata.insert("science.native_feature", "optional");
+        let mut warnings = Vec::new();
+        if kind == "hdf" || kind == "grib" {
+            warnings.push("science-native-dependency-optional".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1711,6 +1759,7 @@ mod tests {
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
+        ScienceDataParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2622,5 +2671,26 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "db-jdbc-config-detected"));
+    }
+
+    #[test]
+    fn science_data_parser_detects_kinds_and_native_feature_flags() {
+        let p = ScienceDataParser;
+        let netcdf = p
+            .parse(b"CDF...netcdf...", "application/x-netcdf")
+            .expect("netcdf");
+        assert_eq!(
+            netcdf
+                .metadata
+                .values("science.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("netcdf")
+        );
+        let hdf = p.parse(b"HDF5...", "application/x-hdf").expect("hdf");
+        assert!(hdf
+            .warnings
+            .iter()
+            .any(|w| w == "science-native-dependency-optional"));
     }
 }
