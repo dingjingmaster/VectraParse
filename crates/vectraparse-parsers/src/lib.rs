@@ -1541,6 +1541,39 @@ impl Parser for BinaryFontParser {
     }
 }
 
+pub struct LanguageIdParser;
+impl Parser for LanguageIdParser {
+    fn name(&self) -> &'static str {
+        "LanguageIdParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type.starts_with("text/") || media_type == "application/lang-detect"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(input);
+        let trimmed = text.trim();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "LanguageIdParser");
+        metadata.insert("lang.ngram.profile", "builtin-v1");
+        let (lang, confidence) = detect_language_simple(trimmed);
+        metadata.insert("lang.code", lang);
+        metadata.insert("lang.confidence", format!("{confidence:.2}"));
+        let mut warnings = Vec::new();
+        if trimmed.chars().count() < 16 || confidence < 0.6 {
+            warnings.push("lang-low-confidence".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1751,6 +1784,26 @@ fn extract_tag_value(content: &str, key: &str) -> Option<String> {
         .map(|l| l[key.len()..].trim().to_string())
 }
 
+fn detect_language_simple(text: &str) -> (&'static str, f32) {
+    if text.is_empty() {
+        return ("und", 0.0);
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains(" the ") || lower.contains(" and ") {
+        return ("en", 0.86);
+    }
+    if lower.contains(" el ") || lower.contains(" la ") || lower.contains(" de ") {
+        return ("es", 0.78);
+    }
+    if lower.contains(" le ") || lower.contains(" les ") || lower.contains(" des ") {
+        return ("fr", 0.76);
+    }
+    if text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) {
+        return ("zh", 0.82);
+    }
+    ("und", 0.45)
+}
+
 fn extract_mail_charset(lower: &str) -> Option<String> {
     let idx = lower.find("charset=")?;
     let mut rest = &lower[idx + "charset=".len()..];
@@ -1953,7 +2006,7 @@ mod tests {
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
-        SpecialistFormatParser,
+        LanguageIdParser, SpecialistFormatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3003,5 +3056,25 @@ mod tests {
                 .map(String::as_str),
             Some("afm")
         );
+    }
+
+    #[test]
+    fn language_id_parser_detects_language_and_low_confidence_paths() {
+        let p = LanguageIdParser;
+        let en = p
+            .parse(b"This is the document and this is the second line.", "text/plain")
+            .expect("en");
+        assert_eq!(
+            en.metadata
+                .values("lang.code")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("en")
+        );
+        let short = p.parse(b"hi", "text/plain").expect("short");
+        assert!(short
+            .warnings
+            .iter()
+            .any(|w| w == "lang-low-confidence"));
     }
 }
