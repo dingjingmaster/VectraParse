@@ -2438,6 +2438,11 @@ fn extract_doc_text_external(input: &[u8]) -> Option<String> {
             }
         }
     }
+    if let Some(txt) = extract_with_soffice_txt(&path) {
+        if !txt.trim().is_empty() {
+            candidates.push(txt);
+        }
+    }
     let out = candidates
         .into_iter()
         .flat_map(|s| {
@@ -2451,6 +2456,52 @@ fn extract_doc_text_external(input: &[u8]) -> Option<String> {
 
     let _ = fs::remove_file(&path);
     out
+}
+
+fn extract_with_soffice_txt(path: &std::path::Path) -> Option<String> {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let outdir = std::env::temp_dir().join(format!("vectraparse-soffice-{ts}"));
+    fs::create_dir_all(&outdir).ok()?;
+    let bin = if Command::new("soffice").arg("--version").output().is_ok() {
+        "soffice"
+    } else if Command::new("libreoffice")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        "libreoffice"
+    } else {
+        let _ = fs::remove_dir_all(&outdir);
+        return None;
+    };
+    let status = Command::new(bin)
+        .args([
+            "--headless",
+            "--convert-to",
+            "txt:Text",
+            "--outdir",
+            outdir.to_string_lossy().as_ref(),
+        ])
+        .arg(path)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&outdir);
+        return None;
+    }
+    let stem = path.file_stem()?.to_string_lossy();
+    let txt_path = outdir.join(format!("{stem}.txt"));
+    let content = fs::read_to_string(&txt_path).ok();
+    let _ = fs::remove_file(txt_path);
+    let _ = fs::remove_dir_all(&outdir);
+    content
 }
 
 fn score_human_text(s: &str) -> usize {
