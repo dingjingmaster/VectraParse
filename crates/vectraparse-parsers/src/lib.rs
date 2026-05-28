@@ -1856,6 +1856,40 @@ impl Parser for XmpNormalizeParser {
     }
 }
 
+pub struct JsonSchemaCompatParser;
+impl Parser for JsonSchemaCompatParser {
+    fn name(&self) -> &'static str {
+        "JsonSchemaCompatParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/json-metadata"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "JsonSchemaCompatParser");
+        let schema = extract_json_field(&text, "schema_version")
+            .or_else(|| extract_json_field(&text, "version"))
+            .unwrap_or_else(|| "1".to_string());
+        metadata.insert("json.schema_version", schema);
+        metadata.insert("json.stable_fields", "content,metadata,warnings,errors");
+        if let Some(old) = extract_json_field(&text, "legacy_field") {
+            metadata.insert("json.compat.legacy_field", old);
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("\"legacy_field\"") {
+            warnings.push("json-legacy-compat-applied".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2086,6 +2120,21 @@ fn detect_language_simple(text: &str) -> (&'static str, f32) {
     ("und", 0.45)
 }
 
+fn extract_json_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let idx = text.find(&needle)?;
+    let rest = &text[idx + needle.len()..];
+    let colon = rest.find(':')?;
+    let v = rest[colon + 1..].trim_start();
+    if let Some(stripped) = v.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        Some(stripped[..end].to_string())
+    } else {
+        let end = v.find([',', '}', '\n']).unwrap_or(v.len());
+        Some(v[..end].trim().to_string())
+    }
+}
+
 fn extract_mail_charset(lower: &str) -> Option<String> {
     let idx = lower.find("charset=")?;
     let mut rest = &lower[idx + "charset=".len()..];
@@ -2290,7 +2339,7 @@ mod tests {
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
         TranslationProviderParser, NlpNerParser, CtakesParser, DlVisionModelParser,
-        OcrExternalParser, XmpNormalizeParser,
+        OcrExternalParser, XmpNormalizeParser, JsonSchemaCompatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3547,5 +3596,27 @@ mod tests {
                 .map(String::as_str),
             Some("Vectra")
         );
+    }
+
+    #[test]
+    fn json_schema_compat_parser_handles_schema_and_legacy_field() {
+        let p = JsonSchemaCompatParser;
+        let out = p
+            .parse(
+                br#"{"schema_version":"2","legacy_field":"old_value"}"#,
+                "application/json-metadata",
+            )
+            .expect("json");
+        assert_eq!(
+            out.metadata
+                .values("json.schema_version")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w == "json-legacy-compat-applied"));
     }
 }
