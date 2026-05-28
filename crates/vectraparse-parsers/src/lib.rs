@@ -893,6 +893,51 @@ impl Parser for LegacyDocParser {
     }
 }
 
+pub struct Rfc822MimeParser;
+impl Parser for Rfc822MimeParser {
+    fn name(&self) -> &'static str {
+        "Rfc822MimeParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "message/rfc822" || media_type == "multipart/mixed"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "Rfc822MimeParser");
+        if let Some(from) = extract_header(&content, "From:") {
+            metadata.insert("mail.from", from);
+        }
+        if let Some(to) = extract_header(&content, "To:") {
+            metadata.insert("mail.to", to);
+        }
+        if let Some(subject) = extract_header(&content, "Subject:") {
+            metadata.insert("mail.subject", subject);
+        }
+        let charset = extract_mail_charset(&lower).unwrap_or_else(|| "utf-8".to_string());
+        metadata.insert("mail.charset", charset.clone());
+        let attachment_count = lower.matches("content-disposition: attachment").count()
+            + lower.matches("filename=").count();
+        metadata.insert("mail.attachment_count", attachment_count.to_string());
+        let nested_count = lower.matches("message/rfc822").count().saturating_sub(1);
+        metadata.insert("mail.nested_count", nested_count.to_string());
+        let mut warnings = Vec::new();
+        if charset == "unknown" {
+            warnings.push("mail-invalid-charset".to_string());
+        }
+        if attachment_count > 64 {
+            warnings.push("mail-attachment-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(extract_mail_body(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1089,6 +1134,43 @@ fn strip_rtf_control_words(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn extract_header(content: &str, key: &str) -> Option<String> {
+    content
+        .lines()
+        .find(|l| l.starts_with(key))
+        .map(|l| l[key.len()..].trim().to_string())
+}
+
+fn extract_mail_charset(lower: &str) -> Option<String> {
+    let idx = lower.find("charset=")?;
+    let mut rest = &lower[idx + "charset=".len()..];
+    rest = rest.trim_start();
+    if let Some(s) = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\'')) {
+        rest = s;
+    }
+    let end = rest
+        .find(|c: char| c == '"' || c == '\'' || c == ';' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let cs = rest[..end].trim();
+    if cs.is_empty() {
+        None
+    } else if matches!(cs, "utf-8" | "utf8" | "iso-8859-1" | "gbk" | "us-ascii") {
+        Some(cs.to_string())
+    } else {
+        Some("unknown".to_string())
+    }
+}
+
+fn extract_mail_body(content: &str) -> String {
+    if let Some((_, body)) = content.split_once("\r\n\r\n") {
+        return body.to_string();
+    }
+    if let Some((_, body)) = content.split_once("\n\n") {
+        return body.to_string();
+    }
+    content.to_string()
+}
+
 fn extract_xml_root(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -1240,8 +1322,8 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        LegacyDocParser, MsSpecialParser, OleLegacyParser, PdfParser, RtfParser, SourceCodeParser,
-        StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+        LegacyDocParser, MsSpecialParser, OleLegacyParser, PdfParser, Rfc822MimeParser, RtfParser,
+        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1873,5 +1955,44 @@ mod tests {
                 .map(String::as_str),
             Some("quattro-pro")
         );
+    }
+
+    #[test]
+    fn rfc822_mime_parser_extracts_headers_charset_and_attachments() {
+        let p = Rfc822MimeParser;
+        let out = p
+            .parse(
+                b"From: a@example.com\nTo: b@example.com\nSubject: hello\nContent-Type: multipart/mixed; charset=\"utf-8\"\n\nbody\nContent-Disposition: attachment; filename=x.txt",
+                "message/rfc822",
+            )
+            .expect("mail");
+        assert_eq!(
+            out.metadata.values("mail.from").and_then(|v| v.first()).map(String::as_str),
+            Some("a@example.com")
+        );
+        assert_eq!(
+            out.metadata.values("mail.charset").and_then(|v| v.first()).map(String::as_str),
+            Some("utf-8")
+        );
+        assert_eq!(
+            out.metadata
+                .values("mail.attachment_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(out.content.as_deref().unwrap_or("").contains("body"));
+    }
+
+    #[test]
+    fn rfc822_parser_warns_on_bad_charset() {
+        let p = Rfc822MimeParser;
+        let out = p
+            .parse(
+                b"Content-Type: text/plain; charset=not-a-real-charset\n\nx",
+                "message/rfc822",
+            )
+            .expect("mail");
+        assert!(out.warnings.iter().any(|w| w == "mail-invalid-charset"));
     }
 }
