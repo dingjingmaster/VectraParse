@@ -174,12 +174,33 @@ impl Parser for HtmlParser {
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
         let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let title = extract_between(&content, "<title>", "</title>");
+        let charset = extract_html_charset(&lower);
+        let links = extract_html_links(&content);
+        let body = strip_html_tags(&content);
         let mut metadata = Metadata::default();
         metadata.insert("parser", "HtmlParser");
+        if let Some(t) = title {
+            metadata.insert("html.title", t);
+        }
+        if let Some(cs) = charset {
+            metadata.insert("html.charset", cs);
+        }
+        for (k, v) in extract_meta_pairs(&content) {
+            metadata.insert(format!("html.meta.{k}"), v);
+        }
+        for link in &links {
+            metadata.insert("html.link", link.clone());
+        }
+        let mut warnings = Vec::new();
+        if content.len() > 512 * 1024 || content.matches('<').count() > 10_000 {
+            warnings.push("html-depth-limit-applied".to_string());
+        }
         Some(ParseOutcome {
-            content: Some(content),
+            content: Some(body),
             metadata,
-            warnings: Vec::new(),
+            warnings,
             parser_chain: Vec::new(),
         })
     }
@@ -280,6 +301,105 @@ fn split_csv_like(line: &str, delimiter: char) -> Vec<String> {
     out
 }
 
+fn extract_between(s: &str, start: &str, end: &str) -> Option<String> {
+    let i = s.to_ascii_lowercase().find(&start.to_ascii_lowercase())?;
+    let j0 = i + start.len();
+    let rest = &s[j0..];
+    let j = rest.to_ascii_lowercase().find(&end.to_ascii_lowercase())?;
+    Some(rest[..j].trim().to_string())
+}
+
+fn extract_html_charset(lower: &str) -> Option<String> {
+    let idx = lower.find("charset=")?;
+    let mut rest = &lower[idx + "charset=".len()..];
+    rest = rest.trim_start();
+    if let Some(stripped) = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\'')) {
+        rest = stripped;
+    }
+    let end = rest
+        .find(|c: char| c == '"' || c == '\'' || c == '>' || c.is_whitespace() || c == ';')
+        .unwrap_or(rest.len());
+    let v = rest[..end].trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+fn extract_html_links(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(pos) = s[i..].find("href=") {
+        let start = i + pos + "href=".len();
+        let bytes = s.as_bytes();
+        if start >= s.len() {
+            break;
+        }
+        let quote = bytes[start] as char;
+        if quote != '"' && quote != '\'' {
+            i = start;
+            continue;
+        }
+        let rest = &s[start + 1..];
+        if let Some(end) = rest.find(quote) {
+            out.push(rest[..end].to_string());
+            i = start + 1 + end + 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn extract_meta_pairs(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for part in s.split("<meta").skip(1) {
+        let tag = match part.find('>') {
+            Some(i) => &part[..i],
+            None => continue,
+        };
+        let name = extract_attr(tag, "name");
+        let content = extract_attr(tag, "content");
+        if let (Some(n), Some(c)) = (name, content) {
+            out.push((n, c));
+        }
+    }
+    out
+}
+
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{attr}=");
+    let i = lower.find(&needle)?;
+    let start = i + needle.len();
+    let b = tag.as_bytes();
+    if start >= tag.len() {
+        return None;
+    }
+    let quote = b[start] as char;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &tag[start + 1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser};
@@ -351,5 +471,45 @@ mod tests {
                 .map(String::as_str),
             Some("\t")
         );
+    }
+
+    #[test]
+    fn html_parser_extracts_title_meta_links_charset_and_body() {
+        let p = HtmlParser;
+        let out = p
+            .parse(
+                br#"<html><head><title>Hello</title><meta charset="utf-8"><meta name="author" content="alice"></head><body><a href="https://example.com">x</a>text</body></html>"#,
+                "text/html",
+            )
+            .expect("html");
+        assert_eq!(
+            out.metadata
+                .values("html.title")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("Hello")
+        );
+        assert_eq!(
+            out.metadata
+                .values("html.charset")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("utf-8")
+        );
+        assert_eq!(
+            out.metadata
+                .values("html.meta.author")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            out.metadata
+                .values("html.link")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("https://example.com")
+        );
+        assert!(out.content.as_deref().unwrap_or("").contains("text"));
     }
 }
