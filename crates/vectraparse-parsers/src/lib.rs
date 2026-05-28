@@ -1,3 +1,5 @@
+pub mod content_handler;
+
 use vectraparse_core::metadata::Metadata;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
