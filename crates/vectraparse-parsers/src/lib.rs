@@ -1,4 +1,5 @@
 pub mod content_handler;
+pub mod embedded;
 
 use vectraparse_core::metadata::Metadata;
 
