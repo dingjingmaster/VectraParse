@@ -422,6 +422,44 @@ impl Parser for DerivedTextParser {
     }
 }
 
+pub struct LightweightSpecializedParser;
+impl Parser for LightweightSpecializedParser {
+    fn name(&self) -> &'static str {
+        "LightweightSpecializedParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/applefile"
+            || media_type == "application/x-plist"
+            || media_type == "application/x-bplist"
+            || media_type == "application/xml"
+            || media_type.ends_with("+xml")
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8(input.to_vec()).ok()?;
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "LightweightSpecializedParser");
+        let profile = if lower.contains("applesingle") || lower.contains("appledouble") {
+            "AppleSingle"
+        } else if lower.contains("<plist") || lower.contains("bplist00") {
+            "PList"
+        } else if lower.contains("<fictionbook") {
+            "FictionBook"
+        } else if lower.contains("<dc") || lower.contains("dublin core") {
+            "DcXML"
+        } else {
+            "unknown-lightweight"
+        };
+        metadata.insert("lightweight.profile", profile);
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -708,7 +746,8 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
-        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+        LightweightSpecializedParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
+        XmlParser,
     };
 
     #[test]
@@ -947,6 +986,40 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("envi-header")
+        );
+    }
+
+    #[test]
+    fn lightweight_specialized_parser_profiles_match() {
+        let p = LightweightSpecializedParser;
+        let plist = p
+            .parse(b"<?xml version='1.0'?><plist><dict/></plist>", "application/x-plist")
+            .expect("plist");
+        assert_eq!(
+            plist
+                .metadata
+                .values("lightweight.profile")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("PList")
+        );
+        let fb = p
+            .parse(b"<FictionBook><body/></FictionBook>", "application/xml")
+            .expect("fb");
+        assert_eq!(
+            fb.metadata
+                .values("lightweight.profile")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("FictionBook")
+        );
+        let dc = p.parse(b"<dc:title>x</dc:title>", "application/xml").expect("dc");
+        assert_eq!(
+            dc.metadata
+                .values("lightweight.profile")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("DcXML")
         );
     }
 }
