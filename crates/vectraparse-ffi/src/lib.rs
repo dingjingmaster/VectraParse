@@ -263,10 +263,11 @@ pub extern "C" fn vectraparse_capabilities_json(out: *mut VectraParseResult) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        vectraparse_create_handle, vectraparse_destroy_handle, vectraparse_detect,
-        vectraparse_result_free, VectraParseError, VectraParseHandle, VectraParseOptions,
-        VectraParseResult,
+        vectraparse_capabilities_json, vectraparse_create_handle, vectraparse_destroy_handle,
+        vectraparse_detect, vectraparse_detect_with_hints, vectraparse_parse, vectraparse_result_free,
+        VectraParseError, VectraParseHandle, VectraParseOptions, VectraParseResult,
     };
+    use std::ffi::CString;
     use std::ptr;
 
     #[test]
@@ -294,5 +295,85 @@ mod tests {
         assert!(matches!(rc, VectraParseError::Internal));
         vectraparse_result_free(&mut out as *mut VectraParseResult);
         vectraparse_destroy_handle(handle);
+    }
+
+    #[test]
+    fn ffi_detect_parse_hints_and_capabilities_roundtrip() {
+        let mut handle: *mut VectraParseHandle = ptr::null_mut();
+        assert!(matches!(
+            vectraparse_create_handle(&mut handle as *mut *mut VectraParseHandle),
+            VectraParseError::Ok
+        ));
+        let input = b"<html><title>x</title></html>";
+        let mut out = VectraParseResult {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        assert!(matches!(
+            vectraparse_detect(
+                handle,
+                input.as_ptr(),
+                input.len(),
+                ptr::null(),
+                &mut out as *mut VectraParseResult
+            ),
+            VectraParseError::Ok
+        ));
+        vectraparse_result_free(&mut out as *mut VectraParseResult);
+        // double free must be safe
+        vectraparse_result_free(&mut out as *mut VectraParseResult);
+
+        let rn = CString::new("a.docx").expect("cstr");
+        let hint = CString::new("application/octet-stream").expect("cstr");
+        let forced = CString::new("text/plain").expect("cstr");
+        assert!(matches!(
+            vectraparse_detect_with_hints(
+                handle,
+                input.as_ptr(),
+                input.len(),
+                ptr::null(),
+                rn.as_ptr(),
+                hint.as_ptr(),
+                forced.as_ptr(),
+                &mut out as *mut VectraParseResult
+            ),
+            VectraParseError::Ok
+        ));
+        vectraparse_result_free(&mut out as *mut VectraParseResult);
+
+        assert!(matches!(
+            vectraparse_parse(
+                handle,
+                input.as_ptr(),
+                input.len(),
+                ptr::null(),
+                &mut out as *mut VectraParseResult
+            ),
+            VectraParseError::Ok
+        ));
+        vectraparse_result_free(&mut out as *mut VectraParseResult);
+
+        assert!(matches!(
+            vectraparse_capabilities_json(&mut out as *mut VectraParseResult),
+            VectraParseError::Ok
+        ));
+        vectraparse_result_free(&mut out as *mut VectraParseResult);
+        vectraparse_destroy_handle(handle);
+    }
+
+    #[test]
+    fn ffi_returns_null_pointer_error_on_null_inputs() {
+        let mut out = VectraParseResult {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let rc = vectraparse_detect(
+            ptr::null_mut(),
+            b"x".as_ptr(),
+            1,
+            ptr::null(),
+            &mut out as *mut VectraParseResult,
+        );
+        assert!(matches!(rc, VectraParseError::NullPointer));
     }
 }
