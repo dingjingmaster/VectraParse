@@ -989,6 +989,60 @@ impl Parser for MboxParser {
     }
 }
 
+pub struct OutlookMailboxParser;
+impl Parser for OutlookMailboxParser {
+    fn name(&self) -> &'static str {
+        "OutlookMailboxParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/vnd.ms-outlook" || media_type == "application/x-tnef"
+    }
+    fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "OutlookMailboxParser");
+        let kind = if media_type == "application/x-tnef"
+            || lower.contains("tnef")
+            || lower.contains("winmail.dat")
+        {
+            "tnef"
+        } else if lower.contains("__substg1.0_") || lower.contains("message class") {
+            "msg"
+        } else if lower.contains("!bdn") || lower.contains("pst") {
+            "pst"
+        } else {
+            return None;
+        };
+        metadata.insert("mail.store_kind", kind);
+        let attachment_count = if kind == "tnef" {
+            lower.matches("attachrenddata").count() + lower.matches("attattach").count()
+        } else {
+            lower.matches("attach").count()
+        };
+        metadata.insert("mail.attachment_count", attachment_count.to_string());
+        let message_count = if kind == "pst" {
+            lower.matches("subject").count().max(1)
+        } else {
+            1
+        };
+        metadata.insert("mail.message_count", message_count.to_string());
+        let mut warnings = Vec::new();
+        if attachment_count > 512 {
+            warnings.push("mail-attachment-limit".to_string());
+        }
+        if kind == "pst" && input.len() > 64 * 1024 * 1024 {
+            warnings.push("mail-store-size-limit".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -1390,7 +1444,8 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, PdfParser, Rfc822MimeParser, RtfParser,
+        LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
+        PdfParser, Rfc822MimeParser, RtfParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -2100,5 +2155,46 @@ mod tests {
         }
         let out = p.parse(mail.as_bytes(), "application/x-mbox").expect("mbox");
         assert!(out.warnings.iter().any(|w| w == "mail-attachment-limit"));
+    }
+
+    #[test]
+    fn outlook_mailbox_parser_detects_msg_pst_tnef() {
+        let p = OutlookMailboxParser;
+        let msg = p
+            .parse(
+                b"__substg1.0_...Message Class: IPM.Note...attach...",
+                "application/vnd.ms-outlook",
+            )
+            .expect("msg");
+        assert_eq!(
+            msg.metadata
+                .values("mail.store_kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("msg")
+        );
+        let pst = p
+            .parse(b"...!BDN...pst...Subject: a\nSubject: b\nattach...", "application/vnd.ms-outlook")
+            .expect("pst");
+        assert_eq!(
+            pst.metadata
+                .values("mail.store_kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("pst")
+        );
+        let tnef = p
+            .parse(
+                b"...winmail.dat...TNEF...AttachRendData...attAttach...",
+                "application/x-tnef",
+            )
+            .expect("tnef");
+        assert_eq!(
+            tnef.metadata
+                .values("mail.store_kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("tnef")
+        );
     }
 }
