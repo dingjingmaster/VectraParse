@@ -1,0 +1,10 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: vectraparse
+Description: VectraParse C ABI wrapper
+Version: 0.1.0
+Libs: -L${libdir} -lvectraparse_ffi
+Cflags: -I${includedir}

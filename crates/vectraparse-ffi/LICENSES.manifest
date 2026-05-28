@@ -1,0 +1,7 @@
+# License Manifest (vectraparse-ffi)
+
+- vectraparse-ffi: MIT
+- vectraparse-core: MIT
+- vectraparse-mime: MIT
+- vectraparse-parsers: MIT
+- vectraparse-enhance: MIT
