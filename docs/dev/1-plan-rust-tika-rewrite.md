@@ -77,7 +77,7 @@
 | P1-04 | 实现 glob/name/hint/content-type override 检测链路 | 扩展名、资源名、显式 content-type 对照测试 | 完成 |
 | P1-05 | 实现 XML/HTML/root element 细分检测和文本/二进制回退 | XML root、HTML meta charset、plain text 样本测试 | 完成 |
 | P1-06 | 实现 ZIP 容器 detector：OOXML、ODF、EPUB、iWork、JAR/APK 等 specialization | ZIP 内部路径 golden 测试；zip bomb 限制测试 | 完成 |
-| P1-07 | 实现 OLE/POIFS detector 和 CFB 基础读取 | DOC/XLS/PPT/MSG/Access/owner file 检测样本对照 | 待开始 |
+| P1-07 | 实现 OLE/POIFS detector 和 CFB 基础读取 | DOC/XLS/PPT/MSG/Access/owner file 检测样本对照 | 完成 |
 | P1-08 | 实现 BPList detector 和 Apple plist 识别 | binary plist/XML plist 样本对照 | 待开始 |
 | P1-09 | 实现高级 detector：`OverrideDetector`、`ZeroSizeFileDetector`、`NameDetector`、`TypeDetector`、`TrainedModelDetector`、`NNExampleModelDetector` | provider 映射测试；模型 detector 可关闭/可配置测试 | 待开始 |
 | P1-10 | 实现 encoding detector：HTML、universal、ICU4J 等价或替代策略 | 多编码文本、HTML charset、BOM、错误编码对照测试 | 待开始 |
@@ -193,6 +193,7 @@
 | 2026-05-28 | 完成 P1-04 检测优先链路初版 | 在 `vectraparse-mime` 新增 force/hint/resource name/glob/magic 优先链路与回退测试 |
 | 2026-05-28 | 完成 P1-05 XML/HTML/root 与文本回退初版 | 在 `vectraparse-mime` 增加 XML root 细分、HTML 检测和 plain text 回退测试 |
 | 2026-05-28 | 完成 P1-06 ZIP 容器细分初版 | 在 `vectraparse-mime` 增加 OOXML/ODF/EPUB/iWork/JAR/APK 的 ZIP specialization 检测 |
+| 2026-05-28 | 完成 P1-07 OLE/POIFS 细分初版 | 在 `vectraparse-mime` 增加 CFB magic 与 DOC/XLS/PPT/MSG/Access 基础识别 |
 
 ## 10. P0-01 默认确认结果
 
