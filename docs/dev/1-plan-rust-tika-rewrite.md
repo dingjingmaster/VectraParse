@@ -120,7 +120,7 @@
 | P6-03 | 实现地理/工程数据：GDAL、DWG、Geo、GeographicInformation | 样本 golden；GDAL/native 依赖隔离测试 | 完成 |
 | P6-04 | 实现 ISA-Tab、Grobid/Journal、Pooled Time Series、POT、PRT 等专业格式 | 每格式 golden；外部服务/模型降级测试 | 完成 |
 | P6-05 | 实现 crypto/security 格式：PKCS#7、TSD、密码 provider、加密文档错误模型 | 加密样本、密码正确/错误、权限 metadata 测试 | 完成 |
-| P6-06 | 实现 Java class、可执行文件、AFM/TrueType 字体 parser | class/ELF/PE/Mach-O/font golden；安全扫描限制测试 | 待开始 |
+| P6-06 | 实现 Java class、可执行文件、AFM/TrueType 字体 parser | class/ELF/PE/Mach-O/font golden；安全扫描限制测试 | 完成 |
 | P7-01 | 实现语言识别 API、n-gram 资源和 `LanguageIdentifier` 等价能力 | 多语种 corpus；低置信度/短文本测试 | 待开始 |
 | P7-02 | 实现语言 provider：Optimaize、Text、Lingo24 等价或替代 | provider 切换、禁用、配置错误测试 | 待开始 |
 | P7-03 | 实现翻译 provider：Microsoft、Google、Lingo24、Cached、Joshua、Moses、Yandex 的配置边界 | mock 服务、缓存、密钥缺失、超时降级测试 | 待开始 |
@@ -150,7 +150,7 @@
 | M2 基础提取 | TXT/CSV/HTML/XML/source/strings/feed/轻量文本格式 | 结果 JSON、metadata、资源限制、差异报告稳定 | 完成 |
 | M3 文档与容器主链路 | 压缩、OOXML、ODF、EPUB、iWork、PDF、旧 Office/OLE、RTF、HWP/CHM/WordPerfect | 常见文档主链路可递归提取正文、metadata 和嵌入文档 | 完成 |
 | M4 邮件与媒体 | RFC822/MBOX/PST/MSG/TNEF、图片、音频、视频、captioning/recognition 接入 | 邮件附件和媒体 metadata 通过 golden，外部能力可关闭 | 完成 |
-| M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 待开始 |
+| M5 专业格式与安全格式 | 数据库、科学数据、地理工程、crypto、Java/可执行、字体 | 每个专业格式有样本和 feature 策略，native 依赖不污染默认包 | 完成 |
 | M6 内容增强 | 语言识别、翻译、NLP/NER、sentiment、cTAKES、OCR/external parser | 模型/服务能力可配置、可降级、可测试 | 待开始 |
 | M7 发布硬化 | ABI、fuzz、性能、文档、license、release 包 | 静态库/动态库可交付给外部项目使用 | 待开始 |
 
@@ -190,6 +190,7 @@
 | 2026-05-28 | 完成 P6-03 地理/工程 parser | 覆盖 GDAL/DWG/Geo/GeographicInformation 并补充 native 隔离告警测试 |
 | 2026-05-28 | 完成 P6-04 专业格式 parser | 覆盖 ISA-Tab/Grobid/PTS/POT/PRT，并补外部服务禁用与超时降级测试 |
 | 2026-05-28 | 完成 P6-05 加密与安全 parser | 覆盖 PKCS#7/TSD/加密文档密码状态和权限 metadata 测试 |
+| 2026-05-28 | 完成 P6-06 二进制与字体 parser | 覆盖 Java class/可执行/AFM/TrueType，并补安全扫描限制测试，M5 达成 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
