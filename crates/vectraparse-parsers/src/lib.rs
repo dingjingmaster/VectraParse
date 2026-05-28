@@ -669,6 +669,59 @@ impl Parser for IworkParser {
     }
 }
 
+pub struct PdfParser;
+impl Parser for PdfParser {
+    fn name(&self) -> &'static str {
+        "PdfParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/pdf"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        if !input.starts_with(b"%PDF-") {
+            return Some(ParseOutcome {
+                content: None,
+                metadata: Metadata::default(),
+                warnings: vec!["pdf-invalid-header".to_string()],
+                parser_chain: Vec::new(),
+            });
+        }
+        let content = String::from_utf8_lossy(input);
+        let lower = content.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "PdfParser");
+        if let Some(v) = extract_between(&content, "%PDF-", "\n") {
+            metadata.insert("pdf.version", v);
+        }
+        let attachment_count = lower.matches("/embeddedfile").count();
+        metadata.insert("pdf.attachment_count", attachment_count.to_string());
+        if lower.contains("/encrypt") {
+            metadata.insert("pdf.encrypted", "true");
+        } else {
+            metadata.insert("pdf.encrypted", "false");
+        }
+        if lower.contains("/p ") || lower.contains("accesspermissions") {
+            metadata.insert("pdf.permissions", "present");
+        }
+        let mut warnings = Vec::new();
+        if lower.contains("ocr:image") || lower.contains("scan-only") {
+            warnings.push("pdf-ocr-hook-suggested".to_string());
+        }
+        if lower.contains("preflight:error") || lower.contains("xref corruption") {
+            warnings.push("pdf-preflight-warning".to_string());
+        }
+        if input.len() > 16 * 1024 * 1024 {
+            warnings.push("pdf-large-file".to_string());
+        }
+        Some(ParseOutcome {
+            content: Some(strip_html_tags(&content)),
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -994,7 +1047,7 @@ mod tests {
     use super::{
         CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+        PdfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
     #[test]
@@ -1434,5 +1487,39 @@ mod tests {
                 .map(String::as_str),
             Some("keynote")
         );
+    }
+
+    #[test]
+    fn pdf_parser_extracts_metadata_and_warnings() {
+        let p = PdfParser;
+        let out = p
+            .parse(
+                b"%PDF-1.7\n/Encrypt true /EmbeddedFile /EmbeddedFile OCR:IMAGE preflight:error",
+                "application/pdf",
+            )
+            .expect("pdf");
+        assert_eq!(
+            out.metadata
+                .values("pdf.version")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1.7")
+        );
+        assert_eq!(
+            out.metadata
+                .values("pdf.encrypted")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.metadata
+                .values("pdf.attachment_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(out.warnings.iter().any(|w| w == "pdf-ocr-hook-suggested"));
+        assert!(out.warnings.iter().any(|w| w == "pdf-preflight-warning"));
     }
 }
