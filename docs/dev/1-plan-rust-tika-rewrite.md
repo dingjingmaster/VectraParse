@@ -103,7 +103,7 @@
 | P4-03 | 实现 ODF/OpenDocument/OpenOffice parser | odt/ods/odp golden；manifest 和 metadata 测试 | 完成 |
 | P4-04 | 实现 EPUB parser | EPUB spine/metadata/嵌入资源 golden | 完成 |
 | P4-05 | 实现 iWork package parser | pages/numbers/keynote 样本对照 | 完成 |
-| P4-06 | 实现 PDF parser：文本、metadata、附件、权限、加密、OCR hook、preflight | PDF golden；加密/损坏/大文件/附件测试 | 待开始 |
+| P4-06 | 实现 PDF parser：文本、metadata、附件、权限、加密、OCR hook、preflight | PDF golden；加密/损坏/大文件/附件测试 | 完成 |
 | P4-07 | 实现 OLE/CFB 旧 Office：DOC/XLS/PPT、OfficeParser、OldExcel、MSOwnerFile | OLE golden；宏/嵌入对象安全审查 | 待开始 |
 | P4-08 | 实现 Microsoft 专有格式：OneNote、Access/Jackcess、TNEF、EMF、WMF、MSG/PST 联动 | 样本 golden；native/feature 依赖检查 | 待开始 |
 | P4-09 | 实现 RTF 和 RTF object data 递归 | RTF golden；嵌入对象测试 | 待开始 |
@@ -221,6 +221,7 @@
 | 2026-05-28 | 完成 P4-03 ODF parser 初版 | 在 `vectraparse-parsers` 增加 odt/ods/odp 类型识别及 manifest/meta metadata 提取 |
 | 2026-05-28 | 完成 P4-04 EPUB parser 初版 | 在 `vectraparse-parsers` 增加 spine/metadata/嵌入资源识别与 metadata 输出 |
 | 2026-05-28 | 完成 P4-05 iWork parser 初版 | 在 `vectraparse-parsers` 增加 pages/numbers/keynote 识别与 iwa 计数 metadata 输出 |
+| 2026-05-28 | 完成 P4-06 PDF parser 初版 | 在 `vectraparse-parsers` 增加 PDF 版本/附件/权限/加密识别与 OCR/preflight 告警 |
 
 ## 10. P0-01 默认确认结果
 
