@@ -24,6 +24,10 @@ impl Metadata {
         self.inner.get(key).map(Vec::as_slice)
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys().map(String::as_str)
+    }
+
     pub fn to_json(&self) -> String {
         let mut out = String::from("{");
         for (idx, (key, vals)) in self.inner.iter().enumerate() {
