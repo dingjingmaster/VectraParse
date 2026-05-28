@@ -844,6 +844,63 @@ mod tests {
     }
 
     #[test]
+    fn tika_detect_golden_matrix_matches() {
+        struct Case<'a> {
+            name: &'a str,
+            bytes: &'a [u8],
+            hints: DetectHints<'a>,
+            expected: &'a str,
+        }
+        let cases = vec![
+            Case {
+                name: "magic-pdf",
+                bytes: b"%PDF-1.7\n...",
+                hints: DetectHints::default(),
+                expected: "application/pdf",
+            },
+            Case {
+                name: "glob-docx",
+                bytes: b"plain content",
+                hints: DetectHints {
+                    resource_name: Some("sample.docx"),
+                    ..DetectHints::default()
+                },
+                expected: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            },
+            Case {
+                name: "rootxml-atom",
+                bytes: br#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>"#,
+                hints: DetectHints::default(),
+                expected: "application/atom+xml",
+            },
+            Case {
+                name: "container-ooxml",
+                bytes: b"PK\x03\x04...word/document.xml...[Content_Types].xml",
+                hints: DetectHints::default(),
+                expected: "application/x-tika-ooxml",
+            },
+            Case {
+                name: "encoding-text",
+                bytes: "hello world".as_bytes(),
+                hints: DetectHints::default(),
+                expected: "text/plain",
+            },
+        ];
+        let mut mismatches = Vec::new();
+        for c in cases {
+            let actual = detect_media_type(c.bytes, &c.hints);
+            if actual != c.expected {
+                mismatches.push(format!("{}: expected {}, got {}", c.name, c.expected, actual));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "detect golden mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn detect_bplist_and_xml_plist() {
         assert_eq!(
             detect_media_type(b"bplist00....", &DetectHints::default()),
