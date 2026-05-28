@@ -73,7 +73,7 @@
 | P0-10 | 引入 CI/本地验证入口：fmt、clippy、test、ABI smoke、golden、fuzz smoke、bench smoke | 文档化验证命令；本地最小流水线通过 | 完成 |
 | P1-01 | 转换 `tika-mimetypes.xml`，生成 mime-type、alias、subclass、magic、glob、rootXML 表 | 与 Tika XML 计数对齐；生成表快照测试 | 完成 |
 | P1-02 | 实现 `MediaTypeRegistry` 等价能力：normalize、alias、specialize、supertype 查询 | Tika registry 用例对照测试 | 完成 |
-| P1-03 | 实现 magic matcher：读取窗口、优先级、offset、mask、空文件识别 | magic golden 测试；损坏/短输入测试 | 待开始 |
+| P1-03 | 实现 magic matcher：读取窗口、优先级、offset、mask、空文件识别 | magic golden 测试；损坏/短输入测试 | 完成 |
 | P1-04 | 实现 glob/name/hint/content-type override 检测链路 | 扩展名、资源名、显式 content-type 对照测试 | 待开始 |
 | P1-05 | 实现 XML/HTML/root element 细分检测和文本/二进制回退 | XML root、HTML meta charset、plain text 样本测试 | 待开始 |
 | P1-06 | 实现 ZIP 容器 detector：OOXML、ODF、EPUB、iWork、JAR/APK 等 specialization | ZIP 内部路径 golden 测试；zip bomb 限制测试 | 待开始 |
@@ -189,6 +189,7 @@
 | 2026-05-27 | 完成里程碑 M0 基础架构 | P0-01 到 P0-10 全部完成，`make pipeline` 通过 |
 | 2026-05-27 | 完成 P1-01 MIME 计数生成 | 引入 build.rs 读取 `tika-mimetypes.xml` 并生成计数常量及对齐测试 |
 | 2026-05-28 | 完成 P1-02 `MediaTypeRegistry` 初版 | 在 `vectraparse-mime` 新增 normalize/alias/specialize/supertype 能力，并通过定向单元测试 |
+| 2026-05-28 | 完成 P1-03 magic matcher 初版 | 在 `vectraparse-mime` 新增读取窗口、优先级、offset、mask、空文件识别与短输入回退测试 |
 
 ## 10. P0-01 默认确认结果
 
