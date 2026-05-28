@@ -44,6 +44,13 @@ pub struct MagicMatch {
     pub priority: i32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetectHints<'a> {
+    pub resource_name: Option<&'a str>,
+    pub content_type_hint: Option<&'a str>,
+    pub force_content_type: Option<&'a str>,
+}
+
 #[derive(Debug, Default)]
 pub struct MagicMatcher {
     rules: Vec<MagicRule>,
@@ -145,6 +152,49 @@ fn magic_matches_rule(input: &[u8], rule: &MagicRule) -> bool {
                 .zip(mask.iter())
                 .all(|((a, expected), m)| (a & m) == (expected & m))
         }
+    }
+}
+
+pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
+    let registry = MediaTypeRegistry::from_generated();
+    if let Some(forced) = hints
+        .force_content_type
+        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+    {
+        return forced;
+    }
+    if let Some(hint) = hints
+        .content_type_hint
+        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+    {
+        return hint;
+    }
+    if let Some(by_name) = hints
+        .resource_name
+        .and_then(media_type_from_resource_name)
+        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+    {
+        return by_name;
+    }
+    MagicMatcher::default_rules().detect(input, 64).mime
+}
+
+fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    let (_, ext) = trimmed.rsplit_once('.')?;
+    let ext = ext.trim().to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => Some("application/pdf"),
+        "zip" => Some("application/zip"),
+        "txt" => Some("text/plain"),
+        "htm" | "html" => Some("text/html"),
+        "xml" => Some("application/xml"),
+        "csv" => Some("text/csv"),
+        "json" => Some("application/json"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
     }
 }
 
@@ -265,7 +315,10 @@ fn normalize_media_type(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MagicMatcher, MagicRule, MediaTypeRegistry, generated_stats, source_path};
+    use super::{
+        DetectHints, MagicMatcher, MagicRule, MediaTypeRegistry, detect_media_type, generated_stats,
+        source_path,
+    };
 
     #[test]
     fn generated_counts_match_expected_tika_snapshot() {
@@ -364,6 +417,60 @@ mod tests {
         assert_eq!(
             matcher.detect(b"\xFA", 2).mime,
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn detect_chain_prioritizes_force_then_hint_then_name_then_magic() {
+        let bytes = b"%PDF-1.7\n...";
+        assert_eq!(
+            detect_media_type(
+                bytes,
+                &DetectHints {
+                    force_content_type: Some("application/zip"),
+                    content_type_hint: Some("application/pdf"),
+                    resource_name: Some("x.docx"),
+                }
+            ),
+            "application/zip"
+        );
+        assert_eq!(
+            detect_media_type(
+                bytes,
+                &DetectHints {
+                    force_content_type: None,
+                    content_type_hint: Some("application/xml"),
+                    resource_name: Some("x.docx"),
+                }
+            ),
+            "application/xml"
+        );
+        assert_eq!(
+            detect_media_type(
+                bytes,
+                &DetectHints {
+                    force_content_type: None,
+                    content_type_hint: None,
+                    resource_name: Some("x.docx"),
+                }
+            ),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+    }
+
+    #[test]
+    fn detect_chain_falls_back_to_magic() {
+        let bytes = b"%PDF-1.7\n...";
+        assert_eq!(
+            detect_media_type(
+                bytes,
+                &DetectHints {
+                    resource_name: Some("x.unknown"),
+                    content_type_hint: None,
+                    force_content_type: None
+                }
+            ),
+            "application/pdf"
         );
     }
 }
