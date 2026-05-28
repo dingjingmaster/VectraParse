@@ -117,7 +117,7 @@
 | P5-07 | 实现 captioning 和对象识别接入点 | 模型/服务禁用、超时、失败降级测试 | 完成 |
 | P6-01 | 实现数据库/表格：DBF、SQLite、Access、JDBC 等价边界 | dbf/sqlite/access golden；连接型能力默认禁用审查 | 完成 |
 | P6-02 | 实现科学数据：NetCDF、HDF、GRIB、MAT、SAS | 每格式 metadata/text golden；native 依赖 feature 测试 | 完成 |
-| P6-03 | 实现地理/工程数据：GDAL、DWG、Geo、GeographicInformation | 样本 golden；GDAL/native 依赖隔离测试 | 待开始 |
+| P6-03 | 实现地理/工程数据：GDAL、DWG、Geo、GeographicInformation | 样本 golden；GDAL/native 依赖隔离测试 | 完成 |
 | P6-04 | 实现 ISA-Tab、Grobid/Journal、Pooled Time Series、POT、PRT 等专业格式 | 每格式 golden；外部服务/模型降级测试 | 待开始 |
 | P6-05 | 实现 crypto/security 格式：PKCS#7、TSD、密码 provider、加密文档错误模型 | 加密样本、密码正确/错误、权限 metadata 测试 | 待开始 |
 | P6-06 | 实现 Java class、可执行文件、AFM/TrueType 字体 parser | class/ELF/PE/Mach-O/font golden；安全扫描限制测试 | 待开始 |
@@ -187,6 +187,7 @@
 | 2026-05-28 | 完成 P5-07 captioning/recognition 接入点 | 增加禁用、超时、失败降级分支及测试，M4 里程碑达成 |
 | 2026-05-28 | 完成 P6-01 数据库/表格 parser | 覆盖 DBF/SQLite/Access/JDBC 边界并固定连接型能力默认禁用 |
 | 2026-05-28 | 完成 P6-02 科学数据 parser | 覆盖 NetCDF/HDF/GRIB/MAT/SAS 并补充 native 依赖可选告警测试 |
+| 2026-05-28 | 完成 P6-03 地理/工程 parser | 覆盖 GDAL/DWG/Geo/GeographicInformation 并补充 native 隔离告警测试 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
