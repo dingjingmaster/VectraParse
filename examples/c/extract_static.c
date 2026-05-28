@@ -104,7 +104,21 @@ static char *json_unescape_utf8(const char *in) {
   size_t len = 0, cap = 0;
   for (const char *p = in; *p != '\0'; p++) {
     if (*p != '\\') {
-      append_utf8(&out, &len, &cap, (unsigned char)*p);
+      /* Keep original UTF-8 bytes as-is. */
+      if (len + 2 > cap) {
+        size_t new_cap = (cap == 0) ? 64 : (cap * 2);
+        while (new_cap < len + 2) {
+          new_cap *= 2;
+        }
+        char *new_buf = (char *)realloc(out, new_cap);
+        if (new_buf == NULL) {
+          break;
+        }
+        out = new_buf;
+        cap = new_cap;
+      }
+      out[len++] = *p;
+      out[len] = '\0';
       continue;
     }
     p++;
