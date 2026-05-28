@@ -519,23 +519,12 @@ impl Parser for PackageParser {
                         if !file.is_file() {
                             continue;
                         }
-                        let lower = name.to_ascii_lowercase();
-                        let is_text_like = lower.ends_with(".txt")
-                            || lower.ends_with(".md")
-                            || lower.ends_with(".csv")
-                            || lower.ends_with(".json")
-                            || lower.ends_with(".xml")
-                            || lower.ends_with(".html")
-                            || lower.ends_with(".log");
-                        if is_text_like && file.size() <= 128 * 1024 {
+                        if file.size() <= 4 * 1024 * 1024 {
                             let mut buf = Vec::new();
                             if file.read_to_end(&mut buf).is_ok()
-                                && let Ok(s) = String::from_utf8(buf)
+                                && let Some(snippet) = extract_archive_entry_snippet(&name, &buf)
                             {
-                                let snippet: String = s.chars().take(800).collect();
-                                if !snippet.trim().is_empty() {
-                                    text_parts.push(format!("[{name}]\n{snippet}"));
-                                }
+                                text_parts.push(format!("[{name}]\n{snippet}"));
                             }
                         }
                     }
@@ -553,7 +542,7 @@ impl Parser for PackageParser {
                     if !content.is_empty() {
                         content.push('\n');
                     }
-                    content.push_str("Extracted Text Snippets:\n");
+                    content.push_str("Entry Contents:\n");
                     content.push_str(&text_parts.join("\n\n"));
                 }
             }
@@ -564,6 +553,51 @@ impl Parser for PackageParser {
             warnings,
             parser_chain: Vec::new(),
         })
+    }
+}
+
+fn extract_archive_entry_snippet(name: &str, buf: &[u8]) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let text_like = lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".html")
+        || lower.ends_with(".log");
+    if text_like
+        && let Ok(s) = String::from_utf8(buf.to_vec())
+    {
+        let snippet: String = s.chars().take(1200).collect();
+        if !snippet.trim().is_empty() {
+            return Some(snippet);
+        }
+    }
+    if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
+        return extract_ooxml_snippet(buf);
+    }
+    None
+}
+
+fn extract_ooxml_snippet(buf: &[u8]) -> Option<String> {
+    use std::io::Read;
+    let mut archive = ZipArchive::new(std::io::Cursor::new(buf)).ok()?;
+    let mut xml = String::new();
+    if let Ok(mut doc) = archive.by_name("word/document.xml") {
+        let _ = doc.read_to_string(&mut xml);
+    } else if let Ok(mut ss) = archive.by_name("xl/sharedStrings.xml") {
+        let _ = ss.read_to_string(&mut xml);
+    } else if let Ok(mut slide) = archive.by_name("ppt/slides/slide1.xml") {
+        let _ = slide.read_to_string(&mut xml);
+    } else {
+        return None;
+    }
+    let clean = strip_html_tags(&xml);
+    let snippet: String = clean.chars().take(1200).collect();
+    if snippet.trim().is_empty() {
+        None
+    } else {
+        Some(snippet)
     }
 }
 

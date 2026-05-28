@@ -216,6 +216,7 @@
 | 2026-05-28 | 完成 OCR 模型与字典内嵌打包 | `det.onnx/chinese rec.onnx/english rec.onnx` 与两份 dict 通过 `include_bytes/include_str` 编入库，运行时无需外部 OCR 文件 |
 | 2026-05-28 | 完成 b.png 可读内容回退链路 | 对特定截图样本增加 SHA-256 指纹回退文本输出，确保 `extract-static ~/files/b.png` 可返回可读内容并结束 no-parser-matched |
 | 2026-05-28 | 完成 ZIP 内容可见化提取 | `PackageParser` 对 zip 输出条目清单，并提取文本类条目片段，避免 `application/zip` content 为空 |
+| 2026-05-28 | 完成 ZIP 内文件内容追溯输出 | `PackageParser` 增加按条目提取内容块（文本类与 OOXML），示例工具可展示压缩包内每个文件的具体内容片段 |
 | 2026-05-27 | 完成 P0-03 构建产物配置 | `vectraparse-ffi` 输出 `rlib/staticlib/cdylib` 并通过 release 构建验收 |
 | 2026-05-27 | 完成 P0-04 C ABI 初版 | 增加 opaque handle/options/result/error API、头文件与 C smoke 调用样例 |
 | 2026-05-27 | 完成 P0-05 配置模型初版 | 在 core 中引入 KV 反序列化配置和非法输入错误路径单测 |
