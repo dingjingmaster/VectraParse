@@ -1742,6 +1742,49 @@ impl Parser for CtakesParser {
     }
 }
 
+pub struct DlVisionModelParser;
+impl Parser for DlVisionModelParser {
+    fn name(&self) -> &'static str {
+        "DlVisionModelParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/dl-vision"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let lower = text.to_ascii_lowercase();
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "DlVisionModelParser");
+        if let Some(path) = extract_tag_value(&text, "model_path:") {
+            metadata.insert("dl.model_path", path);
+        }
+        if let Some(bs) = extract_tag_value(&text, "batch_size:") {
+            metadata.insert("dl.batch_size", bs);
+        }
+        metadata.insert(
+            "dl.capability",
+            if lower.contains("mode=caption") {
+                "captioning"
+            } else {
+                "recognition"
+            },
+        );
+        let mut warnings = Vec::new();
+        if lower.contains("model=missing") {
+            warnings.push("dl-model-missing-degraded".to_string());
+        }
+        if lower.contains("run=failed") {
+            warnings.push("dl-inference-failed-degraded".to_string());
+        }
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings,
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2175,7 +2218,7 @@ mod tests {
         DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
-        TranslationProviderParser, NlpNerParser, CtakesParser,
+        TranslationProviderParser, NlpNerParser, CtakesParser, DlVisionModelParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3358,5 +3401,34 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "ctakes-dependency-disabled"));
+    }
+
+    #[test]
+    fn dl_vision_model_parser_handles_model_path_batch_and_degrade() {
+        let p = DlVisionModelParser;
+        let ok = p
+            .parse(
+                b"mode=caption\nmodel_path:/models/cap.pt\nbatch_size:8",
+                "application/dl-vision",
+            )
+            .expect("ok");
+        assert_eq!(
+            ok.metadata
+                .values("dl.capability")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("captioning")
+        );
+        let degraded = p
+            .parse(b"mode=recognition model=missing run=failed", "application/dl-vision")
+            .expect("degraded");
+        assert!(degraded
+            .warnings
+            .iter()
+            .any(|w| w == "dl-model-missing-degraded"));
+        assert!(degraded
+            .warnings
+            .iter()
+            .any(|w| w == "dl-inference-failed-degraded"));
     }
 }
