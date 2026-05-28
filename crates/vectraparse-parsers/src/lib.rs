@@ -1825,6 +1825,37 @@ impl Parser for OcrExternalParser {
     }
 }
 
+pub struct XmpNormalizeParser;
+impl Parser for XmpNormalizeParser {
+    fn name(&self) -> &'static str {
+        "XmpNormalizeParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "application/xmp-metadata"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        let text = String::from_utf8(input.to_vec()).ok()?;
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "XmpNormalizeParser");
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim().to_ascii_lowercase().replace(':', ".");
+                let value = v.trim().to_string();
+                if !key.is_empty() && !value.is_empty() {
+                    metadata.insert(format!("xmp.{key}"), value);
+                }
+            }
+        }
+        metadata.insert("xmp.normalized", "true");
+        Some(ParseOutcome {
+            content: None,
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
 fn decode_utf16le(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -2259,7 +2290,7 @@ mod tests {
         BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
         LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
         TranslationProviderParser, NlpNerParser, CtakesParser, DlVisionModelParser,
-        OcrExternalParser,
+        OcrExternalParser, XmpNormalizeParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
 
@@ -3491,5 +3522,30 @@ mod tests {
         );
         assert!(out.warnings.iter().any(|w| w == "ocr-timeout"));
         assert!(out.warnings.iter().any(|w| w == "ocr-path-restricted"));
+    }
+
+    #[test]
+    fn xmp_normalize_parser_maps_and_normalizes_keys() {
+        let p = XmpNormalizeParser;
+        let out = p
+            .parse(
+                b"dc:title = Example\nxmp:CreatorTool=Vectra\npdf:Author = Ding",
+                "application/xmp-metadata",
+            )
+            .expect("xmp");
+        assert_eq!(
+            out.metadata
+                .values("xmp.dc.title")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("Example")
+        );
+        assert_eq!(
+            out.metadata
+                .values("xmp.xmp.creatortool")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("Vectra")
+        );
     }
 }
