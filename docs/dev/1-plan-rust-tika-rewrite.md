@@ -75,7 +75,7 @@
 | P1-02 | 实现 `MediaTypeRegistry` 等价能力：normalize、alias、specialize、supertype 查询 | Tika registry 用例对照测试 | 完成 |
 | P1-03 | 实现 magic matcher：读取窗口、优先级、offset、mask、空文件识别 | magic golden 测试；损坏/短输入测试 | 完成 |
 | P1-04 | 实现 glob/name/hint/content-type override 检测链路 | 扩展名、资源名、显式 content-type 对照测试 | 完成 |
-| P1-05 | 实现 XML/HTML/root element 细分检测和文本/二进制回退 | XML root、HTML meta charset、plain text 样本测试 | 待开始 |
+| P1-05 | 实现 XML/HTML/root element 细分检测和文本/二进制回退 | XML root、HTML meta charset、plain text 样本测试 | 完成 |
 | P1-06 | 实现 ZIP 容器 detector：OOXML、ODF、EPUB、iWork、JAR/APK 等 specialization | ZIP 内部路径 golden 测试；zip bomb 限制测试 | 待开始 |
 | P1-07 | 实现 OLE/POIFS detector 和 CFB 基础读取 | DOC/XLS/PPT/MSG/Access/owner file 检测样本对照 | 待开始 |
 | P1-08 | 实现 BPList detector 和 Apple plist 识别 | binary plist/XML plist 样本对照 | 待开始 |
@@ -191,6 +191,7 @@
 | 2026-05-28 | 完成 P1-02 `MediaTypeRegistry` 初版 | 在 `vectraparse-mime` 新增 normalize/alias/specialize/supertype 能力，并通过定向单元测试 |
 | 2026-05-28 | 完成 P1-03 magic matcher 初版 | 在 `vectraparse-mime` 新增读取窗口、优先级、offset、mask、空文件识别与短输入回退测试 |
 | 2026-05-28 | 完成 P1-04 检测优先链路初版 | 在 `vectraparse-mime` 新增 force/hint/resource name/glob/magic 优先链路与回退测试 |
+| 2026-05-28 | 完成 P1-05 XML/HTML/root 与文本回退初版 | 在 `vectraparse-mime` 增加 XML root 细分、HTML 检测和 plain text 回退测试 |
 
 ## 10. P0-01 默认确认结果
 
