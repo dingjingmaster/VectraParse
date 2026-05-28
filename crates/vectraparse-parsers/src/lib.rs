@@ -137,16 +137,28 @@ impl Parser for TextAndCsvParser {
         "TextAndCsvParser"
     }
     fn supports(&self, media_type: &str) -> bool {
-        media_type == "text/csv"
+        media_type == "text/csv" || media_type == "text/tab-separated-values"
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
         let content = String::from_utf8(input.to_vec()).ok()?;
+        let delimiter = detect_delimiter(&content);
+        let (bad_rows, row_count) = analyze_delimited_rows(&content, delimiter);
         let mut metadata = Metadata::default();
         metadata.insert("parser", "TextAndCsvParser");
+        metadata.insert("csv.delimiter", delimiter.to_string());
+        metadata.insert("csv.rows", row_count.to_string());
+        metadata.insert("csv.bad_rows", bad_rows.to_string());
+        if content.contains('"') {
+            metadata.insert("csv.quote_style", "double-quote");
+        }
+        let mut warnings = Vec::new();
+        if bad_rows > 0 {
+            warnings.push("csv-bad-row-detected".to_string());
+        }
         Some(ParseOutcome {
             content: Some(content),
             metadata,
-            warnings: Vec::new(),
+            warnings,
             parser_chain: Vec::new(),
         })
     }
@@ -215,6 +227,59 @@ fn decode_utf16be(input: &[u8]) -> Option<String> {
     String::from_utf16(&out).ok()
 }
 
+fn detect_delimiter(content: &str) -> char {
+    let sample = content.lines().take(8).collect::<Vec<_>>().join("\n");
+    let comma = sample.matches(',').count();
+    let tab = sample.matches('\t').count();
+    let semi = sample.matches(';').count();
+    if tab >= comma && tab >= semi {
+        '\t'
+    } else if semi > comma {
+        ';'
+    } else {
+        ','
+    }
+}
+
+fn analyze_delimited_rows(content: &str, delimiter: char) -> (usize, usize) {
+    let mut expected_cols: Option<usize> = None;
+    let mut bad_rows = 0usize;
+    let mut row_count = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        row_count += 1;
+        let cols = split_csv_like(line, delimiter).len();
+        match expected_cols {
+            None => expected_cols = Some(cols),
+            Some(exp) if exp != cols => bad_rows += 1,
+            _ => {}
+        }
+    }
+    (bad_rows, row_count)
+}
+
+fn split_csv_like(line: &str, delimiter: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut in_quote = false;
+    for ch in line.chars() {
+        if ch == '"' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if ch == delimiter && !in_quote {
+            out.push(buf.clone());
+            buf.clear();
+            continue;
+        }
+        buf.push(ch);
+    }
+    out.push(buf);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser};
@@ -254,5 +319,37 @@ mod tests {
         assert_eq!(empty.content.as_deref(), Some(""));
         assert!(empty.warnings.iter().any(|w| w == "empty-input"));
         assert!(p.parse(&[0, 159, 146, 150], "text/plain").is_none());
+    }
+
+    #[test]
+    fn csv_tsv_parser_handles_dialect_escape_and_bad_rows() {
+        let p = TextAndCsvParser;
+        let out = p
+            .parse(b"col1,col2\n\"a,b\",c\nx", "text/csv")
+            .expect("csv");
+        assert_eq!(
+            out.metadata
+                .values("csv.delimiter")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some(",")
+        );
+        assert_eq!(
+            out.metadata
+                .values("csv.bad_rows")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(out.warnings.iter().any(|w| w == "csv-bad-row-detected"));
+
+        let tsv = p.parse(b"a\tb\n1\t2", "text/tab-separated-values").expect("tsv");
+        assert_eq!(
+            tsv.metadata
+                .values("csv.delimiter")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("\t")
+        );
     }
 }
