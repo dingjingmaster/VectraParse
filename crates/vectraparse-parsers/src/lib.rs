@@ -791,18 +791,20 @@ impl Parser for OleLegacyParser {
         if lower.contains("ole10native") || lower.contains("embedded object") {
             warnings.push("ole-embedded-object".to_string());
         }
-        let utf16_lines = extract_utf16le_strings(input, 4, 16 * 1024);
-        let ascii_lines = extract_ascii_strings(input, 4, 16 * 1024);
-        let mut merged = Vec::new();
-        for line in utf16_lines.into_iter().chain(ascii_lines.into_iter()) {
-            if is_human_text_line(&line) {
-                merged.push(line);
+        let text = extract_doc_text_external(input).unwrap_or_else(|| {
+            let utf16_lines = extract_utf16le_strings(input, 4, 16 * 1024);
+            let ascii_lines = extract_ascii_strings(input, 4, 16 * 1024);
+            let mut merged = Vec::new();
+            for line in utf16_lines.into_iter().chain(ascii_lines.into_iter()) {
+                if is_human_text_line(&line) {
+                    merged.push(line);
+                }
+                if merged.len() >= 300 {
+                    break;
+                }
             }
-            if merged.len() >= 300 {
-                break;
-            }
-        }
-        let text = merged.join("\n");
+            merged.join("\n")
+        });
         Some(ParseOutcome {
             content: if text.is_empty() { Some(String::new()) } else { Some(text) },
             metadata,
@@ -2396,6 +2398,44 @@ fn is_human_text_line(s: &str) -> bool {
         .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ('\u{4E00}'..='\u{9FFF}').contains(c))
         .count();
     good * 100 / total >= 70
+}
+
+fn extract_doc_text_external(input: &[u8]) -> Option<String> {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if !input.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
+        return None;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("vectraparse-doc-{nanos}.doc"));
+    fs::write(&path, input).ok()?;
+
+    let antiword = Command::new("antiword").arg(&path).output().ok();
+    let out = antiword
+        .as_ref()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let catdoc = Command::new("catdoc")
+                .args(["-d", "utf-8"])
+                .arg(&path)
+                .output()
+                .ok()?;
+            if !catdoc.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&catdoc.stdout).to_string();
+            if s.trim().is_empty() { None } else { Some(s) }
+        });
+
+    let _ = fs::remove_file(&path);
+    out
 }
 
 fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec<String> {
