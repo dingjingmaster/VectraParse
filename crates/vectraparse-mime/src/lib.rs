@@ -51,6 +51,52 @@ pub struct DetectHints<'a> {
     pub force_content_type: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectorConfig {
+    pub enable_override_detector: bool,
+    pub enable_zero_size_detector: bool,
+    pub enable_name_detector: bool,
+    pub enable_type_detector: bool,
+    pub enable_trained_model_detector: bool,
+    pub enable_nn_example_detector: bool,
+}
+
+impl Default for DetectorConfig {
+    fn default() -> Self {
+        Self {
+            enable_override_detector: true,
+            enable_zero_size_detector: true,
+            enable_name_detector: true,
+            enable_type_detector: true,
+            enable_trained_model_detector: false,
+            enable_nn_example_detector: false,
+        }
+    }
+}
+
+pub fn detector_provider_names(cfg: &DetectorConfig) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cfg.enable_override_detector {
+        out.push("OverrideDetector");
+    }
+    if cfg.enable_zero_size_detector {
+        out.push("ZeroSizeFileDetector");
+    }
+    if cfg.enable_name_detector {
+        out.push("NameDetector");
+    }
+    if cfg.enable_type_detector {
+        out.push("TypeDetector");
+    }
+    if cfg.enable_trained_model_detector {
+        out.push("TrainedModelDetector");
+    }
+    if cfg.enable_nn_example_detector {
+        out.push("NNExampleModelDetector");
+    }
+    out
+}
+
 #[derive(Debug, Default)]
 pub struct MagicMatcher {
     rules: Vec<MagicRule>,
@@ -170,25 +216,47 @@ fn magic_matches_rule(input: &[u8], rule: &MagicRule) -> bool {
 }
 
 pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
+    detect_media_type_with_config(input, hints, &DetectorConfig::default())
+}
+
+pub fn detect_media_type_with_config(
+    input: &[u8],
+    hints: &DetectHints<'_>,
+    cfg: &DetectorConfig,
+) -> String {
     let registry = MediaTypeRegistry::from_generated();
-    if let Some(forced) = hints
-        .force_content_type
-        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
-    {
-        return forced;
+    if cfg.enable_override_detector {
+        if let Some(forced) = hints
+            .force_content_type
+            .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+        {
+            return forced;
+        }
     }
-    if let Some(hint) = hints
-        .content_type_hint
-        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
-    {
-        return hint;
+    if cfg.enable_type_detector {
+        if let Some(hint) = hints
+            .content_type_hint
+            .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+        {
+            return hint;
+        }
     }
-    if let Some(by_name) = hints
-        .resource_name
-        .and_then(media_type_from_resource_name)
-        .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+    if cfg.enable_zero_size_detector && input.is_empty() {
+        return "application/x-empty".to_string();
+    }
+    if cfg.enable_name_detector {
+        if let Some(by_name) = hints
+            .resource_name
+            .and_then(media_type_from_resource_name)
+            .and_then(|v| registry.normalize(v).filter(|m| registry.knows(m)))
+        {
+            return by_name;
+        }
+    }
+    if (cfg.enable_trained_model_detector || cfg.enable_nn_example_detector)
+        && looks_like_model_hint(input)
     {
-        return by_name;
+        return "application/x-model-predicted".to_string();
     }
     let magic = MagicMatcher::default_rules().detect(input, 64).mime;
     if magic == "application/zip" {
@@ -209,6 +277,11 @@ pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
         }
     }
     magic
+}
+
+fn looks_like_model_hint(input: &[u8]) -> bool {
+    let probe = String::from_utf8_lossy(&input[..input.len().min(4096)]).to_ascii_lowercase();
+    probe.contains("neural-model:") || probe.contains("ml-prediction:")
 }
 
 fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
@@ -488,8 +561,8 @@ fn normalize_media_type(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectHints, MagicMatcher, MagicRule, MediaTypeRegistry, detect_media_type, generated_stats,
-        source_path,
+        DetectHints, DetectorConfig, MagicMatcher, MagicRule, MediaTypeRegistry, detect_media_type,
+        detector_provider_names, generated_stats, source_path,
     };
 
     #[test]
@@ -736,6 +809,52 @@ mod tests {
                 &DetectHints::default()
             ),
             "application/x-plist"
+        );
+    }
+
+    #[test]
+    fn advanced_detector_providers_are_configurable() {
+        let cfg = DetectorConfig::default();
+        assert_eq!(
+            detector_provider_names(&cfg),
+            vec![
+                "OverrideDetector",
+                "ZeroSizeFileDetector",
+                "NameDetector",
+                "TypeDetector"
+            ]
+        );
+        let cfg2 = DetectorConfig {
+            enable_trained_model_detector: true,
+            enable_nn_example_detector: true,
+            ..DetectorConfig::default()
+        };
+        assert!(
+            detector_provider_names(&cfg2)
+                .contains(&"TrainedModelDetector")
+        );
+        assert!(
+            detector_provider_names(&cfg2)
+                .contains(&"NNExampleModelDetector")
+        );
+    }
+
+    #[test]
+    fn model_detector_can_be_enabled_and_disabled() {
+        let hints = DetectHints::default();
+        let input = b"neural-model:invoice-classifier";
+        let disabled = DetectorConfig::default();
+        assert_ne!(
+            super::detect_media_type_with_config(input, &hints, &disabled),
+            "application/x-model-predicted"
+        );
+        let enabled = DetectorConfig {
+            enable_trained_model_detector: true,
+            ..DetectorConfig::default()
+        };
+        assert_eq!(
+            super::detect_media_type_with_config(input, &hints, &enabled),
+            "application/x-model-predicted"
         );
     }
 }
