@@ -74,7 +74,7 @@ impl TractOcrEngine {
             let crop = crop_box(img, b);
             let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
             let output = self.rec.run(tvec!(rec_input.into()))?;
-            let logits = output[0].to_array_view::<f32>()?;
+            let logits = select_rec_logits(&output)?;
             let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
             if !text.trim().is_empty() {
                 lines.push((b.1, b.0, text, confidence));
@@ -94,7 +94,7 @@ impl TractOcrEngine {
         if text.trim().is_empty() {
             let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
             let output = self.rec.run(tvec!(rec_input.into()))?;
-            let logits = output[0].to_array_view::<f32>()?;
+            let logits = select_rec_logits(&output)?;
             let (fallback_text, fallback_confidence) = ctc_greedy_decode(&logits, &self.alphabet);
             text = fallback_text;
             confidence = fallback_confidence;
@@ -103,10 +103,28 @@ impl TractOcrEngine {
             {
                 let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
                 let output = rec_alt.run(tvec!(rec_input.into()))?;
-                let logits = output[0].to_array_view::<f32>()?;
+                let logits = select_rec_logits(&output)?;
                 let (alt_text, alt_confidence) = ctc_greedy_decode(&logits, &self.alphabet_alt);
                 text = alt_text;
                 confidence = alt_confidence;
+            }
+            if text.trim().is_empty() {
+                let mut line_texts = Vec::new();
+                let mut confs = Vec::new();
+                for line in fallback_line_crops(img) {
+                    let rec_input = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
+                    let output = self.rec.run(tvec!(rec_input.into()))?;
+                    let logits = select_rec_logits(&output)?;
+                    let (t, c) = ctc_greedy_decode(&logits, &self.alphabet);
+                    if !t.trim().is_empty() {
+                        line_texts.push(t);
+                        confs.push(c);
+                    }
+                }
+                if !line_texts.is_empty() {
+                    text = line_texts.join("\n");
+                    confidence = confs.iter().sum::<f32>() / confs.len() as f32;
+                }
             }
         }
         let warning = if self.alphabet.is_empty() {
@@ -120,6 +138,24 @@ impl TractOcrEngine {
             warning,
         })
     }
+}
+
+fn select_rec_logits(outputs: &TVec<TValue>) -> TractResult<tract_ndarray::ArrayViewD<'_, f32>> {
+    let mut best_idx = 0usize;
+    let mut best_score = 0usize;
+    for (i, out) in outputs.iter().enumerate() {
+        if let Ok(arr) = out.to_array_view::<f32>()
+            && arr.ndim() == 3
+        {
+            let shape = arr.shape();
+            let score = shape[1].max(shape[2]);
+            if score > best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+    }
+    outputs[best_idx].to_array_view::<f32>()
 }
 
 impl Default for OcrConfig {
@@ -193,12 +229,21 @@ fn preprocess_det_image(
     image: &DynamicImage,
     side: usize,
 ) -> TractResult<(Tensor, f32, f32, u32, u32)> {
-    let rgb = image.to_rgb8();
+    let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
-    let resized = image::imageops::resize(&rgb, side as u32, side as u32, FilterType::Triangle);
-    let mut data = vec![0f32; 1 * 3 * side * side];
-    for y in 0..side {
-        for x in 0..side {
+    let max_side = side as f32;
+    let base = (src_w.max(src_h)) as f32;
+    let ratio = if base > max_side {
+        max_side / base
+    } else {
+        1.0
+    };
+    let resize_w = ((((src_w as f32) * ratio).round() as usize).max(32) / 32) * 32;
+    let resize_h = ((((src_h as f32) * ratio).round() as usize).max(32) / 32) * 32;
+    let resized = image::imageops::resize(&rgb, resize_w as u32, resize_h as u32, FilterType::Triangle);
+    let mut data = vec![0f32; 1 * 3 * resize_h * resize_w];
+    for y in 0..resize_h {
+        for x in 0..resize_w {
             let px = resized.get_pixel(x as u32, y as u32);
             let bgr = [px[2] as f32, px[1] as f32, px[0] as f32];
             let norm = [
@@ -207,14 +252,14 @@ fn preprocess_det_image(
                 ((bgr[2] / 255.0) - 0.406) / 0.225,
             ];
             for c in 0..3 {
-                let idx = c * side * side + y * side + x;
+                let idx = c * resize_h * resize_w + y * resize_w + x;
                 data[idx] = norm[c];
             }
         }
     }
-    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, side, side), data)?;
-    let sx = src_w as f32 / side as f32;
-    let sy = src_h as f32 / side as f32;
+    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, resize_h, resize_w), data)?;
+    let sx = src_w as f32 / resize_w as f32;
+    let sy = src_h as f32 / resize_h as f32;
     Ok((arr.into_tensor(), sx, sy, src_w, src_h))
 }
 
@@ -290,7 +335,7 @@ fn crop_box(img: &DynamicImage, b: BoxRect) -> DynamicImage {
 }
 
 fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) -> TractResult<Tensor> {
-    let rgb = image.to_rgb8();
+    let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
     let ratio = src_w as f32 / src_h as f32;
     let mut resized_w = (ratio * target_h as f32).ceil() as usize;
@@ -318,7 +363,98 @@ fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) 
     Ok(arr.into_tensor())
 }
 
+fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
+    let rgba = image.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            let a = p[3] as f32 / 255.0;
+            let r = (p[0] as f32 * a + 255.0 * (1.0 - a)).round() as u8;
+            let g = (p[1] as f32 * a + 255.0 * (1.0 - a)).round() as u8;
+            let b = (p[2] as f32 * a + 255.0 * (1.0 - a)).round() as u8;
+            out.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+    }
+    out
+}
+
+fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let mut row_score = vec![0usize; h as usize];
+    for y in 0..h {
+        let mut c = 0usize;
+        for x in 0..w {
+            let p = rgb.get_pixel(x, y);
+            let lum = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
+            if lum < 230 {
+                c += 1;
+            }
+        }
+        row_score[y as usize] = c;
+    }
+    let threshold = (w as usize / 80).max(12);
+    let mut bands = Vec::new();
+    let mut y = 0usize;
+    while y < h as usize {
+        if row_score[y] < threshold {
+            y += 1;
+            continue;
+        }
+        let start = y;
+        let mut end = y;
+        while end + 1 < h as usize && row_score[end + 1] >= threshold / 2 {
+            end += 1;
+        }
+        y = end + 1;
+        let height = end - start + 1;
+        if !(10..=96).contains(&height) {
+            continue;
+        }
+        let mut min_x = w;
+        let mut max_x = 0u32;
+        for yy in start as u32..=end as u32 {
+            for xx in 0..w {
+                let p = rgb.get_pixel(xx, yy);
+                let lum = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
+                if lum < 230 {
+                    min_x = min_x.min(xx);
+                    max_x = max_x.max(xx);
+                }
+            }
+        }
+        if max_x > min_x && (max_x - min_x) >= 24 {
+            bands.push((min_x, start as u32, max_x + 1, end as u32 + 1));
+        }
+    }
+    bands.sort_by_key(|(_, y0, _, _)| *y0);
+    bands
+        .into_iter()
+        .take(48)
+        .map(|(x0, y0, x1, y1)| image.crop_imm(x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)))
+        .collect()
+}
+
 fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[String]) -> (String, f32) {
+    let a = ctc_greedy_decode_with_blank(logits, alphabet, 0);
+    let b = ctc_greedy_decode_with_blank(logits, alphabet, usize::MAX);
+    if b.0.chars().count() > a.0.chars().count() {
+        b
+    } else {
+        a
+    }
+}
+
+fn ctc_greedy_decode_with_blank(
+    logits: &tract_ndarray::ArrayViewD<'_, f32>,
+    alphabet: &[String],
+    blank_hint: usize,
+) -> (String, f32) {
     if logits.ndim() != 3 {
         return (String::new(), 0.0);
     }
@@ -331,7 +467,11 @@ fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[St
     if classes <= 1 {
         return (String::new(), 0.0);
     }
-    let blank_id = 0usize;
+    let blank_id = if blank_hint == usize::MAX {
+        classes - 1
+    } else {
+        blank_hint.min(classes - 1)
+    };
     let mut prev = blank_id;
     let mut text = String::new();
     let mut prob_sum = 0.0f32;

@@ -1414,6 +1414,7 @@ dependencies = [
 name = "vectraparse-parsers"
 version = "0.1.0"
 dependencies = [
+ "sha2",
  "vectraparse-core",
  "vectraparse-mime",
  "vectraparse-ocr",
