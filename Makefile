@@ -6,6 +6,9 @@ check:
 test:
 	cargo test --workspace
 
+file-content:
+	gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a -ldl -lpthread -lm -o target/extract-static
+
 abi-smoke:
 	cargo build --release -p vectraparse-ffi
 	gcc examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi -Wl,-rpath,'$$ORIGIN/../target/release' -o target/smoke-c

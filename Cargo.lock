@@ -1403,6 +1403,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectraparse-mso-binary"
+version = "0.1.0"
+
+[[package]]
 name = "vectraparse-ocr"
 version = "0.1.0"
 dependencies = [
@@ -1417,6 +1421,7 @@ dependencies = [
  "sha2",
  "vectraparse-core",
  "vectraparse-mime",
+ "vectraparse-mso-binary",
  "vectraparse-ocr",
  "zip",
 ]
