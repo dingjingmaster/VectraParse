@@ -4,6 +4,7 @@ pub mod extractor;
 pub mod security;
 
 use vectraparse_core::metadata::Metadata;
+use vectraparse_mime::detect_encoding;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParseOutcome {
@@ -91,18 +92,57 @@ impl CompositeParser {
     }
 }
 
-pub struct TextParser;
-impl Parser for TextParser {
+pub struct TxtParser;
+impl Parser for TxtParser {
     fn name(&self) -> &'static str {
-        "TextParser"
+        "TxtParser"
     }
     fn supports(&self, media_type: &str) -> bool {
-        media_type == "text/plain" || media_type == "text/csv"
+        media_type == "text/plain"
+    }
+    fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
+        if input.is_empty() {
+            return Some(ParseOutcome {
+                content: Some(String::new()),
+                metadata: Metadata::default(),
+                warnings: vec!["empty-input".to_string()],
+                parser_chain: Vec::new(),
+            });
+        }
+        let enc = detect_encoding(input);
+        if enc == "binary" {
+            return None;
+        }
+        let content = match enc {
+            "utf-8" => String::from_utf8(input.to_vec()).ok()?,
+            "utf-16le" => decode_utf16le(input)?,
+            "utf-16be" => decode_utf16be(input)?,
+            _ => String::from_utf8_lossy(input).to_string(),
+        };
+        let mut metadata = Metadata::default();
+        metadata.insert("parser", "TxtParser");
+        metadata.insert("encoding", enc);
+        Some(ParseOutcome {
+            content: Some(content),
+            metadata,
+            warnings: Vec::new(),
+            parser_chain: Vec::new(),
+        })
+    }
+}
+
+pub struct TextAndCsvParser;
+impl Parser for TextAndCsvParser {
+    fn name(&self) -> &'static str {
+        "TextAndCsvParser"
+    }
+    fn supports(&self, media_type: &str) -> bool {
+        media_type == "text/csv"
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
         let content = String::from_utf8(input.to_vec()).ok()?;
         let mut metadata = Metadata::default();
-        metadata.insert("parser", "TextParser");
+        metadata.insert("parser", "TextAndCsvParser");
         Some(ParseOutcome {
             content: Some(content),
             metadata,
@@ -153,30 +193,66 @@ impl Parser for MetadataOnlyParser {
     }
 }
 
+fn decode_utf16le(input: &[u8]) -> Option<String> {
+    if !input.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for chunk in input.chunks_exact(2) {
+        out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    String::from_utf16(&out).ok()
+}
+
+fn decode_utf16be(input: &[u8]) -> Option<String> {
+    if !input.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for chunk in input.chunks_exact(2) {
+        out.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    String::from_utf16(&out).ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CompositeParser, HtmlParser, MetadataOnlyParser, TextParser};
+    use super::{CompositeParser, HtmlParser, MetadataOnlyParser, Parser, TextAndCsvParser, TxtParser};
 
     #[test]
     fn mime_to_parser_mapping_and_fallback() {
         let composite = CompositeParser::new(vec![
             Box::new(MetadataOnlyParser),
             Box::new(HtmlParser),
-            Box::new(TextParser),
+            Box::new(TxtParser),
+            Box::new(TextAndCsvParser),
         ]);
         let text = composite
             .parse(b"hello", "text/plain")
             .expect("text parser should parse");
         assert_eq!(text.content.as_deref(), Some("hello"));
-        assert!(text.parser_chain.contains(&"TextParser".to_string()));
+        assert!(text.parser_chain.contains(&"TxtParser".to_string()));
         assert!(text.metadata.values("supplement").is_some());
         assert!(composite.parse(b"\xFF\xFE", "application/pdf").is_none());
     }
 
     #[test]
     fn multiple_parser_dispatch_returns_all_matches() {
-        let composite = CompositeParser::new(vec![Box::new(TextParser), Box::new(MetadataOnlyParser)]);
+        let composite = CompositeParser::new(vec![
+            Box::new(TxtParser),
+            Box::new(TextAndCsvParser),
+            Box::new(MetadataOnlyParser),
+        ]);
         let all = composite.parse_multiple(b"a,b,c", "text/csv");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn txt_parser_handles_empty_and_binary() {
+        let p = TxtParser;
+        let empty = p.parse(b"", "text/plain").expect("empty");
+        assert_eq!(empty.content.as_deref(), Some(""));
+        assert!(empty.warnings.iter().any(|w| w == "empty-input"));
+        assert!(p.parse(&[0, 159, 146, 150], "text/plain").is_none());
     }
 }
