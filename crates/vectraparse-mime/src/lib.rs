@@ -177,6 +177,9 @@ pub fn detect_media_type(input: &[u8], hints: &DetectHints<'_>) -> String {
         return by_name;
     }
     let magic = MagicMatcher::default_rules().detect(input, 64).mime;
+    if magic == "application/zip" {
+        return specialize_zip_container(input).to_string();
+    }
     if magic == "application/octet-stream" {
         if let Some(refined) = detect_xml_html_or_text(input) {
             return refined;
@@ -202,6 +205,35 @@ fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
         "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         _ => None,
     }
+}
+
+fn specialize_zip_container(input: &[u8]) -> &'static str {
+    let probe = String::from_utf8_lossy(&input[..input.len().min(128 * 1024)]);
+    if probe.contains("word/") || probe.contains("ppt/") || probe.contains("xl/") {
+        return "application/x-tika-ooxml";
+    }
+    if probe.contains("mimetypeapplication/vnd.oasis.opendocument.text")
+        || probe.contains("mimetypeapplication/vnd.oasis.opendocument.spreadsheet")
+        || probe.contains("mimetypeapplication/vnd.oasis.opendocument.presentation")
+    {
+        return "application/vnd.oasis.opendocument";
+    }
+    if probe.contains("META-INF/container.xml") || probe.contains("OEBPS/") {
+        return "application/epub+zip";
+    }
+    if probe.contains("Index/Document.iwa")
+        || probe.contains("Index/Tables/")
+        || probe.contains("Index/Metadata.iwa")
+    {
+        return "application/x-iwork-package";
+    }
+    if probe.contains("AndroidManifest.xml") || probe.contains("classes.dex") {
+        return "application/vnd.android.package-archive";
+    }
+    if probe.contains("META-INF/MANIFEST.MF") {
+        return "application/java-archive";
+    }
+    "application/zip"
 }
 
 fn detect_xml_html_or_text(input: &[u8]) -> Option<String> {
@@ -574,6 +606,35 @@ mod tests {
         assert_eq!(
             detect_media_type(b"just plain ascii text", &DetectHints::default()),
             "text/plain"
+        );
+    }
+
+    #[test]
+    fn detect_zip_specialization_chain() {
+        assert_eq!(
+            detect_media_type(
+                b"PK\x03\x04...word/document.xml...[Content_Types].xml",
+                &DetectHints::default()
+            ),
+            "application/x-tika-ooxml"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"PK\x03\x04...META-INF/container.xml...OEBPS/content.opf",
+                &DetectHints::default()
+            ),
+            "application/epub+zip"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"PK\x03\x04...META-INF/MANIFEST.MF...",
+                &DetectHints::default()
+            ),
+            "application/java-archive"
+        );
+        assert_eq!(
+            detect_media_type(b"PK\x03\x04...random...", &DetectHints::default()),
+            "application/zip"
         );
     }
 }
