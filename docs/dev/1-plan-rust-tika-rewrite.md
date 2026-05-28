@@ -79,7 +79,7 @@
 | P1-06 | 实现 ZIP 容器 detector：OOXML、ODF、EPUB、iWork、JAR/APK 等 specialization | ZIP 内部路径 golden 测试；zip bomb 限制测试 | 完成 |
 | P1-07 | 实现 OLE/POIFS detector 和 CFB 基础读取 | DOC/XLS/PPT/MSG/Access/owner file 检测样本对照 | 完成 |
 | P1-08 | 实现 BPList detector 和 Apple plist 识别 | binary plist/XML plist 样本对照 | 完成 |
-| P1-09 | 实现高级 detector：`OverrideDetector`、`ZeroSizeFileDetector`、`NameDetector`、`TypeDetector`、`TrainedModelDetector`、`NNExampleModelDetector` | provider 映射测试；模型 detector 可关闭/可配置测试 | 待开始 |
+| P1-09 | 实现高级 detector：`OverrideDetector`、`ZeroSizeFileDetector`、`NameDetector`、`TypeDetector`、`TrainedModelDetector`、`NNExampleModelDetector` | provider 映射测试；模型 detector 可关闭/可配置测试 | 完成 |
 | P1-10 | 实现 encoding detector：HTML、universal、ICU4J 等价或替代策略 | 多编码文本、HTML charset、BOM、错误编码对照测试 | 待开始 |
 | P1-11 | 暴露 detect API：内存、文件路径、带 hint 输入、能力查询 | Rust API 和 C ABI detect smoke/golden 测试 | 待开始 |
 | P2-01 | 实现输入抽象：内存、文件、流、mark/reset、临时资源、读取上限 | 大文件、短读、临时文件清理、并发读取测试 | 待开始 |
@@ -195,6 +195,7 @@
 | 2026-05-28 | 完成 P1-06 ZIP 容器细分初版 | 在 `vectraparse-mime` 增加 OOXML/ODF/EPUB/iWork/JAR/APK 的 ZIP specialization 检测 |
 | 2026-05-28 | 完成 P1-07 OLE/POIFS 细分初版 | 在 `vectraparse-mime` 增加 CFB magic 与 DOC/XLS/PPT/MSG/Access 基础识别 |
 | 2026-05-28 | 完成 P1-08 plist 检测初版 | 在 `vectraparse-mime` 增加 binary plist magic 和 XML plist 特征识别 |
+| 2026-05-28 | 完成 P1-09 高级 detector 配置初版 | 在 `vectraparse-mime` 增加 detector 开关、provider 映射与模型 detector 可配置测试 |
 
 ## 10. P0-01 默认确认结果
 
