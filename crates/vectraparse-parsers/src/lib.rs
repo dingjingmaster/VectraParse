@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
 use vectraparse_core::metadata::Metadata;
 use vectraparse_mime::detect_encoding;
-use vectraparse_mso_binary::extract_legacy_mso_text;
+use vectraparse_mso_binary::{build_text_blocks, extract_legacy_mso_text};
 use vectraparse_ocr::{OcrConfig, TractOcrEngine};
 use zip::ZipArchive;
 
@@ -855,9 +855,24 @@ impl Parser for OleLegacyParser {
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
         let extracted = extract_legacy_mso_text(input)?;
+        let blocks = build_text_blocks(extracted.kind, &extracted.text);
         let mut metadata = Metadata::default();
         metadata.insert("parser", "OleLegacyParser");
         metadata.insert("ole.kind", extracted.kind);
+        metadata.insert("ole.block_count", blocks.len().to_string());
+        metadata.insert("ole.block.text_len_total", extracted.text.len().to_string());
+        let mut section_names: Vec<String> = Vec::new();
+        for block in blocks {
+            if !section_names.iter().any(|s| s == &block.section) {
+                section_names.push(block.section.clone());
+            }
+            metadata.insert("ole.block.section", block.section);
+            metadata.insert("ole.block.text_len", block.text.len().to_string());
+            if let Some(offset) = block.source_offset {
+                metadata.insert("ole.block.offset", offset.to_string());
+            }
+        }
+        metadata.insert("ole.block.section_count_distinct", section_names.len().to_string());
         Some(ParseOutcome {
             content: Some(extracted.text),
             metadata,
@@ -3037,6 +3052,9 @@ mod tests {
         );
         assert!(doc.warnings.iter().any(|w| w == "ole-macro-present"));
         assert!(doc.warnings.iter().any(|w| w == "ole-embedded-object"));
+        assert!(doc.metadata.values("ole.block_count").is_some());
+        assert!(doc.metadata.values("ole.block.text_len_total").is_some());
+        assert!(doc.metadata.values("ole.block.section_count_distinct").is_some());
 
         let xls = p
             .parse(

@@ -1416,6 +1416,7 @@ name = "vectraparse-mso-binary"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "vectraparse-ocr",
 ]
 
 [[package]]

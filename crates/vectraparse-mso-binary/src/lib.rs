@@ -1,4 +1,6 @@
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use std::sync::OnceLock;
+use vectraparse_ocr::{OcrConfig, TractOcrEngine};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyMsoExtract {
@@ -22,7 +24,7 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
         return None;
     }
     let (capped_input, capped) = cap_input_slice(input, MAX_INPUT_BYTES);
-    let kind = detect_kind(capped_input);
+    let mut kind = detect_kind(capped_input);
     let mut warnings = Vec::new();
     let probe = String::from_utf8_lossy(capped_input).to_ascii_lowercase();
     if probe.contains("vba") || probe.contains("macros") {
@@ -32,13 +34,23 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
         warnings.push("ole-embedded-object".to_string());
     }
     let streams = parse_ole_streams(capped_input);
+    if let Some(ref streams) = streams {
+        kind = detect_kind_from_streams(kind, streams);
+    }
     if streams.is_none() {
         warnings.push("Corrupted".to_string());
     }
     if kind == "ole-unknown" {
         warnings.push("Unsupported".to_string());
     }
-    let (text, structured_ok) = extract_text_by_kind(capped_input, kind, streams.as_ref());
+    let (mut text, structured_ok) = extract_text_by_kind(capped_input, kind, streams.as_ref());
+    if kind == "msoffice-ownerfile" {
+        let normalized = normalize_ownerfile_doc_tail(&text);
+        if !normalized.is_empty() && normalized.len() < text.len() {
+            text = normalized;
+            kind = "doc";
+        }
+    }
     if (matches!(kind, "doc" | "xls" | "ppt") && !structured_ok && !text.trim().is_empty()) || capped {
         warnings.push("PartialExtracted".to_string());
     }
@@ -47,6 +59,21 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
         text,
         warnings,
     })
+}
+
+fn normalize_ownerfile_doc_tail(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let has_doc_anchor = text.contains("\n0Table") || text.contains("\n1Table") || text.contains("\nWpsCustomData");
+    if !has_doc_anchor {
+        return text.to_string();
+    }
+    let mut lines = text.lines().map(|s| s.trim().to_string()).collect::<Vec<_>>();
+    lines.retain(|s| !s.is_empty());
+    let mut cleaned = truncate_doc_tail_noise(lines, "doc");
+    cleaned = trim_trailing_noise(cleaned, "doc");
+    cleaned.join("\n")
 }
 
 fn cap_input_slice<'a>(input: &'a [u8], max_len: usize) -> (&'a [u8], bool) {
@@ -112,7 +139,7 @@ pub fn build_text_blocks(kind: &str, text: &str) -> Vec<TextBlock> {
 
 fn detect_kind(input: &[u8]) -> &'static str {
     let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
-    if lower.contains("worddocument") {
+    if lower.contains("worddocument") || lower.contains("0table") || lower.contains("1table") {
         "doc"
     } else if lower.contains("workbook") || lower.contains("book") {
         "xls"
@@ -125,14 +152,40 @@ fn detect_kind(input: &[u8]) -> &'static str {
     }
 }
 
+fn detect_kind_from_streams(kind: &'static str, streams: &[OleStream]) -> &'static str {
+    if streams.iter().any(|s| s.name.eq_ignore_ascii_case("WordDocument")) {
+        return "doc";
+    }
+    if streams
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case("Workbook") || s.name.eq_ignore_ascii_case("Book"))
+    {
+        return "xls";
+    }
+    if streams
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case("PowerPoint Document"))
+    {
+        return "ppt";
+    }
+    kind
+}
+
 fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream>>) -> (String, bool) {
     if kind == "doc"
         && let Some(streams) = streams
-        && let Some(text) = extract_doc_text_structured(streams)
-        && !text.trim().is_empty()
-        && is_high_confidence_text(&text, kind)
     {
-        return (text, true);
+        let mut text = extract_doc_text_structured(streams).unwrap_or_default();
+        let image_ocr = extract_doc_image_ocr_lines(streams);
+        if !image_ocr.is_empty() {
+            if !text.trim().is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&image_ocr.join("\n"));
+        }
+        if !text.trim().is_empty() {
+            return (text, true);
+        }
     }
     if kind == "xls"
         && let Some(streams) = streams
@@ -150,24 +203,43 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
     {
         return (text, true);
     }
-    let scan_bytes = select_scan_bytes(input, kind, streams);
     let mut lines = Vec::new();
     let min_ascii = if kind == "xls" { 2 } else { 3 };
-    for s in extract_utf16le_strings(scan_bytes, 2, 48 * 1024) {
-        lines.push(s);
-    }
-    for s in extract_ascii_strings(scan_bytes, min_ascii, 48 * 1024) {
-        lines.push(s);
-    }
-    for s in extract_latin1_strings(scan_bytes, 4, 48 * 1024) {
-        lines.push(repair_utf8_mojibake(&s).unwrap_or(s));
+    let scan_sources = if kind == "doc" {
+        select_doc_scan_sources(input, streams)
+    } else {
+        vec![select_scan_bytes(input, kind, streams)]
+    };
+    for source in scan_sources {
+        for s in extract_utf16le_strings(source, 2, 24 * 1024) {
+            lines.push(s);
+        }
+        for s in extract_ascii_strings(source, min_ascii, 24 * 1024) {
+            lines.push(s);
+        }
+        for s in extract_latin1_strings(source, 4, 24 * 1024) {
+            lines.push(repair_utf8_mojibake(&s).unwrap_or(s));
+        }
     }
 
     let mut out = Vec::new();
+    let mut doc_clean_lines = 0usize;
     for raw in lines {
         let normalized = normalize_line(&raw);
         if normalized.is_empty() {
             continue;
+        }
+        if kind == "doc" {
+            if is_doc_noise_anchor(&normalized) {
+                if doc_clean_lines >= 12 {
+                    break;
+                }
+                continue;
+            }
+            let trailing_noise = doc_clean_lines >= 20 && is_trailing_garbage(&normalized, "doc");
+            if is_doc_mojibake_line(&normalized) || trailing_noise {
+                continue;
+            }
         }
         if !looks_like_content_line(&normalized, kind) {
             continue;
@@ -176,14 +248,45 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
             continue;
         }
         out.push(normalized);
+        if kind == "doc" {
+            doc_clean_lines += 1;
+        }
         if out.len() >= 800 {
             break;
         }
     }
-    let mut cleaned = trim_leading_noise(out);
+    let mut cleaned = if kind == "doc" { out } else { trim_leading_noise(out) };
     cleaned = truncate_doc_tail_noise(cleaned, kind);
     cleaned = trim_trailing_noise(cleaned, kind);
+    if kind == "doc"
+        && let Some(streams) = streams
+    {
+        let image_ocr = extract_doc_image_ocr_lines(streams);
+        if !image_ocr.is_empty() {
+            cleaned.extend(image_ocr);
+        }
+    }
     (cleaned.join("\n"), false)
+}
+
+fn select_doc_scan_sources<'a>(input: &'a [u8], streams: Option<&'a Vec<OleStream>>) -> Vec<&'a [u8]> {
+    let Some(streams) = streams else {
+        return vec![input];
+    };
+    let mut sources = Vec::new();
+    for s in streams {
+        if s.name.eq_ignore_ascii_case("WordDocument")
+            || s.name.eq_ignore_ascii_case("1Table")
+            || s.name.eq_ignore_ascii_case("0Table")
+            || s.name.eq_ignore_ascii_case("Data")
+        {
+            sources.push(s.data.as_slice());
+        }
+    }
+    if sources.is_empty() {
+        sources.push(input);
+    }
+    sources
 }
 
 fn is_high_confidence_text(text: &str, kind: &str) -> bool {
@@ -1022,7 +1125,87 @@ fn extract_doc_text_from_table(word: &[u8], table: &[u8], fib: DocFib) -> Option
             text.push_str(&String::from_utf16_lossy(&units));
         }
     }
-    Some(clean_doc_text(&text))
+    Some(postprocess_doc_structured_text(&clean_doc_text(&text)))
+}
+
+fn postprocess_doc_structured_text(text: &str) -> String {
+    let fallback_full = clean_doc_text(text)
+        .lines()
+        .map(normalize_line)
+        .filter(|line| {
+            !line.is_empty()
+                && !is_doc_mojibake_line(line)
+                && !is_doc_noise_anchor(line)
+                && !line.eq_ignore_ascii_case("0Table")
+                && !line.eq_ignore_ascii_case("1Table")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = normalize_line(raw);
+        if line.is_empty() {
+            continue;
+        }
+        if is_doc_noise_anchor(&line) {
+            break;
+        }
+        let trailing_noise = out.len() >= 20 && is_trailing_garbage(&line, "doc");
+        if is_doc_short_noise_line(&line) || is_doc_mojibake_line(&line) || trailing_noise {
+            continue;
+        }
+        if out.last() == Some(&line) {
+            continue;
+        }
+        out.push(line);
+    }
+    let joined = out.join("\n");
+    if joined.len() < fallback_full.len() / 4 {
+        fallback_full
+    } else {
+        joined
+    }
+}
+
+fn is_doc_mojibake_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("wps office_") || lower.contains("wpscustomdata") {
+        return true;
+    }
+    if t.len() >= 32
+        && t.len() % 4 == 0
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        return true;
+    }
+    let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    let len = compact.chars().count();
+    let cjk = compact
+        .chars()
+        .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c))
+        .count();
+    let hangul = compact
+        .chars()
+        .filter(|c| ('\u{AC00}'..='\u{D7AF}').contains(c))
+        .count();
+    let ascii_alpha = compact.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let ascii_upper = compact.chars().filter(|c| c.is_ascii_uppercase()).count();
+    if compact.chars().all(|c| c.is_ascii_alphabetic())
+        && compact.eq_ignore_ascii_case("cambria")
+    {
+        return true;
+    }
+    if cjk >= 2 && ascii_alpha > 0 && len <= 10 && ascii_upper < ascii_alpha {
+        return true;
+    }
+    if hangul > 0 && cjk > 0 && len <= 24 {
+        return true;
+    }
+    false
 }
 
 fn locate_clx(table: &[u8], fib: DocFib) -> Option<&[u8]> {
@@ -1371,7 +1554,7 @@ fn select_scan_bytes<'a>(input: &'a [u8], kind: &str, streams: Option<&'a Vec<Ol
         return input;
     };
     let targets: &[&str] = match kind {
-        "doc" => &["WordDocument", "1Table", "0Table", "Data"],
+        "doc" => &["WordDocument"],
         "xls" => &["Workbook", "Book"],
         "ppt" => &["PowerPoint Document", "Current User"],
         _ => &[],
@@ -1387,6 +1570,220 @@ fn select_scan_bytes<'a>(input: &'a [u8], kind: &str, streams: Option<&'a Vec<Ol
     input
 }
 
+fn extract_doc_image_ocr_lines(streams: &[OleStream]) -> Vec<String> {
+    let Some(engine) = ocr_engine() else {
+        return Vec::new();
+    };
+    let cfg = OcrConfig::default();
+    let mut lines = Vec::new();
+    let mut seen_keys = std::collections::HashSet::<String>::new();
+    let mut ocr_budget = 0usize;
+    for s in streams {
+        let mut candidates: Vec<&[u8]> = Vec::new();
+        if looks_like_image_stream_name(&s.name) && looks_like_image_bytes(&s.data) {
+            candidates.push(s.data.as_slice());
+        }
+        let carved = carve_embedded_images(&s.data);
+        for blob in &carved {
+            candidates.push(blob.as_slice());
+        }
+        let dib_wrapped = carve_dib_as_bmp_blobs(&s.data);
+        for blob in &dib_wrapped {
+            candidates.push(blob.as_slice());
+        }
+        for cand in candidates {
+            if ocr_budget >= 12 {
+                break;
+            }
+            if cand.len() < 128 || cand.len() > 8 * 1024 * 1024 {
+                continue;
+            }
+            let key = format!("{}:{:02X}{:02X}{:02X}{:02X}", cand.len(), cand[0], cand[1], cand[2], cand[3]);
+            if !seen_keys.insert(key) {
+                continue;
+            }
+            let Ok(out) = engine.infer(cand, &cfg) else {
+                continue;
+            };
+            let text = normalize_line(&out.text);
+            if text.is_empty() {
+                continue;
+            }
+            lines.push(format!("ImageOCR: {text}"));
+            ocr_budget += 1;
+        }
+        if ocr_budget >= 12 {
+            break;
+        }
+    }
+    lines
+}
+
+fn carve_embedded_images(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 16 < data.len() {
+        if data[i..].starts_with(b"\x89PNG\r\n\x1A\n")
+            && let Some(end) = find_png_end(&data[i..])
+        {
+            let blob = data[i..i + end].to_vec();
+            out.push(blob);
+            i += end;
+            continue;
+        }
+        if data[i..].starts_with(&[0xFF, 0xD8, 0xFF])
+            && let Some(end) = find_jpeg_end(&data[i..])
+        {
+            let blob = data[i..i + end].to_vec();
+            out.push(blob);
+            i += end;
+            continue;
+        }
+        if data[i..].starts_with(b"GIF87a") || data[i..].starts_with(b"GIF89a") {
+            if let Some(end) = data[i..].iter().position(|b| *b == 0x3B) {
+                let e = end + 1;
+                if e >= 64 {
+                    out.push(data[i..i + e].to_vec());
+                }
+                i += e;
+                continue;
+            }
+        }
+        if data[i..].starts_with(b"BM") && i + 6 <= data.len() {
+            let sz = u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]) as usize;
+            if sz >= 64 && i + sz <= data.len() {
+                out.push(data[i..i + sz].to_vec());
+                i += sz;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn carve_dib_as_bmp_blobs(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 40 <= data.len() {
+        let Some((bmp, consumed)) = wrap_dib_at(data, i) else {
+            i += 1;
+            continue;
+        };
+        out.push(bmp);
+        i += consumed.max(1);
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+fn wrap_dib_at(data: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
+    let hdr = data.get(start..start + 40)?;
+    let bi_size = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if bi_size != 40 {
+        return None;
+    }
+    let width = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let height = i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let planes = u16::from_le_bytes([hdr[12], hdr[13]]);
+    let bit_count = u16::from_le_bytes([hdr[14], hdr[15]]);
+    let compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    let bi_size_image = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]) as usize;
+    if planes != 1 || compression != 0 {
+        return None;
+    }
+    if !(bit_count == 1 || bit_count == 4 || bit_count == 8 || bit_count == 24 || bit_count == 32) {
+        return None;
+    }
+    if width <= 0 || width > 20000 || height == 0 || height.abs() > 20000 {
+        return None;
+    }
+    let w = width as usize;
+    let h = height.unsigned_abs() as usize;
+    let stride = (((w * bit_count as usize) + 31) & !31) / 8;
+    let pixel_bytes = stride.saturating_mul(h);
+    let palette_entries = if bit_count <= 8 {
+        let clr_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]) as usize;
+        if clr_used == 0 {
+            1usize << (bit_count as usize)
+        } else {
+            clr_used.min(1usize << (bit_count as usize))
+        }
+    } else {
+        0
+    };
+    let palette_bytes = palette_entries.saturating_mul(4);
+    let dib_header_size = bi_size.max(40);
+    let dib_total = dib_header_size
+        .saturating_add(palette_bytes)
+        .saturating_add(pixel_bytes.max(bi_size_image));
+    let dib = data.get(start..start + dib_total)?;
+    let bf_off_bits = 14 + dib_header_size + palette_bytes;
+    let bf_size = bf_off_bits + dib.len().saturating_sub(bi_size);
+    let mut bmp = Vec::with_capacity(bf_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(bf_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&(bf_off_bits as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some((bmp, dib_total))
+}
+
+fn find_jpeg_end(data: &[u8]) -> Option<usize> {
+    let mut i = 2usize;
+    while i + 1 < data.len() {
+        if data[i] == 0xFF && data[i + 1] == 0xD9 {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_png_end(data: &[u8]) -> Option<usize> {
+    // ...IEND + CRC
+    let marker = b"IEND\xAE\x42\x60\x82";
+    data.windows(marker.len())
+        .position(|w| w == marker)
+        .map(|pos| pos + marker.len())
+}
+
+fn looks_like_image_stream_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("img_")
+        || lower.contains("image")
+        || lower.contains("picture")
+        || lower.contains("jpg")
+        || lower.contains("jpeg")
+        || lower.contains("png")
+        || lower.contains("gif")
+        || lower.contains("bmp")
+        || lower.contains("tif")
+        || lower.contains("wmf")
+        || lower.contains("emf")
+        || lower.contains("blip")
+}
+
+fn looks_like_image_bytes(data: &[u8]) -> bool {
+    data.starts_with(&[0xFF, 0xD8, 0xFF])
+        || data.starts_with(b"\x89PNG\r\n\x1A\n")
+        || data.starts_with(b"GIF87a")
+        || data.starts_with(b"GIF89a")
+        || data.starts_with(b"BM")
+        || data.starts_with(b"II*\0")
+        || data.starts_with(b"MM\0*")
+}
+
+fn ocr_engine() -> Option<&'static TractOcrEngine> {
+    static OCR_ENGINE: OnceLock<Option<TractOcrEngine>> = OnceLock::new();
+    OCR_ENGINE
+        .get_or_init(|| TractOcrEngine::load(&OcrConfig::default()).ok())
+        .as_ref()
+}
+
 fn parse_ole_streams(input: &[u8]) -> Option<Vec<OleStream>> {
     let cfb = Cfb::parse(input)?;
     let mut out = Vec::new();
@@ -1397,7 +1794,9 @@ fn parse_ole_streams(input: &[u8]) -> Option<Vec<OleStream>> {
         if entry.name.is_empty() {
             continue;
         }
-        let bytes = cfb.read_stream(entry).ok()?;
+        let Ok(bytes) = cfb.read_stream(entry) else {
+            continue;
+        };
         out.push(OleStream {
             name: entry.name.clone(),
             data: bytes,
@@ -1505,7 +1904,9 @@ impl<'a> Cfb<'a> {
             for i in 0..name_u16_len {
                 name_vec.push(le_u16(chunk, i * 2)?);
             }
-            let name = String::from_utf16(&name_vec).ok()?;
+            let Ok(name) = String::from_utf16(&name_vec) else {
+                continue;
+            };
             let obj_type = chunk[0x42];
             let start_sector = le_u32(chunk, 0x74)?;
             let stream_size = le_u64(chunk, 0x78)?;
@@ -1798,7 +2199,7 @@ fn truncate_doc_tail_noise(lines: Vec<String>, kind: &str) -> Vec<String> {
         if is_doc_noise_anchor(&line) {
             break;
         }
-        if is_doc_short_noise_line(&line) || is_trailing_garbage(&line, kind) {
+        if is_doc_short_noise_line(&line) || is_doc_mojibake_line(&line) || is_trailing_garbage(&line, kind) {
             short_noise_streak += 1;
             if short_noise_streak >= 3 {
                 break;
@@ -1916,9 +2317,11 @@ fn is_doc_short_noise_line(line: &str) -> bool {
 mod tests {
     use super::{
         ansi_piece_byte_len, build_text_blocks, clean_doc_text, decode_ansi_piece, decode_ppt_text_atom, detect_kind,
-        decode_bytes_with_strategy, extract_doc_text_from_table, extract_legacy_mso_text,
+        decode_bytes_with_strategy, detect_kind_from_streams, extract_doc_text_from_table, extract_legacy_mso_text,
         extract_ppt_text_structured, extract_xls_text_structured, format_excel_number, format_sheet_blocks,
-        group_ppt_slide_text, locate_clx, looks_like_mojibake, parse_boundsheet_name, parse_clx_piece_table,
+        carve_embedded_images, find_jpeg_end, find_png_end, group_ppt_slide_text, is_doc_mojibake_line, locate_clx,
+        looks_like_mojibake, normalize_ownerfile_doc_tail, parse_boundsheet_name, parse_clx_piece_table,
+        postprocess_doc_structured_text, select_doc_scan_sources,
         parse_doc_fib, parse_sst_strings_with_continue, read_mini_chain, repair_utf8_mojibake,
         score_text_quality, trim_trailing_noise, truncate_doc_tail_noise, walk_ppt_records, DocFib, OleStream,
         PptRecord, XlsCell,
@@ -1928,6 +2331,15 @@ mod tests {
     fn detects_doc_kind() {
         let data = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1....WordDocument....";
         assert_eq!(detect_kind(data), "doc");
+    }
+
+    #[test]
+    fn stream_kind_overrides_ownerfile_probe() {
+        let streams = vec![OleStream {
+            name: "WordDocument".to_string(),
+            data: vec![],
+        }];
+        assert_eq!(detect_kind_from_streams("msoffice-ownerfile", &streams), "doc");
     }
 
     #[test]
@@ -2729,5 +3141,89 @@ mod tests {
         ];
         let out = truncate_doc_tail_noise(lines, "doc");
         assert_eq!(out, vec!["正文第一段".to_string(), "正文第二段".to_string()]);
+    }
+
+    #[test]
+    fn detects_doc_mojibake_patterns() {
+        assert!(is_doc_mojibake_line("瑯楨c"));
+        assert!(is_doc_mojibake_line("WPS Office_12.1.0.25225_xxx"));
+        assert!(is_doc_mojibake_line("eyJoZGlkIjoiYmMzODg5NzkzMGI5NDdmZDYwYWZjZGFkZjViMGI1Y2Ii"));
+        assert!(!is_doc_mojibake_line("说明比较非常参加之后很多教育"));
+    }
+
+    #[test]
+    fn postprocess_doc_structured_truncates_noise_tail() {
+        let mut lines = vec!["正文一".to_string(); 30];
+        lines.push("说明比较非常参加之后很多教育".to_string());
+        lines.push("耀(".to_string());
+        lines.push("瑯楨c".to_string());
+        lines.push("慃楬牢i".to_string());
+        lines.push("0Table".to_string());
+        let out = postprocess_doc_structured_text(&lines.join("\n"));
+        assert!(out.contains("说明比较非常参加之后很多教育"));
+        assert!(!out.contains("瑯楨c"));
+        assert!(!out.contains("0Table"));
+    }
+
+    #[test]
+    fn ownerfile_doc_tail_cleanup_truncates_metadata_noise() {
+        let text = [
+            "正文一",
+            "正文二",
+            "说明比较非常参加之后很多教育",
+            "耀(",
+            "瑯楨c",
+            "0Table",
+            "Data",
+            "WpsCustomData",
+        ]
+        .join("\n");
+        let out = normalize_ownerfile_doc_tail(&text);
+        assert!(out.contains("说明比较非常参加之后很多教育"));
+        assert!(!out.contains("0Table"));
+        assert!(!out.contains("瑯楨c"));
+    }
+
+    #[test]
+    fn finds_jpeg_and_png_boundaries() {
+        let jpg = [0xFF, 0xD8, 0xFF, 0x00, 0x01, 0xFF, 0xD9];
+        assert_eq!(find_jpeg_end(&jpg), Some(jpg.len()));
+        let png = b"\x89PNG\r\n\x1A\nxxxxIEND\xAE\x42\x60\x82tail";
+        assert_eq!(find_png_end(png), Some(20));
+    }
+
+    #[test]
+    fn carves_embedded_images_from_stream_payload() {
+        let jpg = [0xFF, 0xD8, 0xFF, 0x00, 0x11, 0x22, 0xFF, 0xD9];
+        let png = b"\x89PNG\r\n\x1A\nabcdIEND\xAE\x42\x60\x82";
+        let mut payload = b"noise".to_vec();
+        payload.extend_from_slice(&jpg);
+        payload.extend_from_slice(b"more");
+        payload.extend_from_slice(png);
+        let blobs = carve_embedded_images(&payload);
+        assert_eq!(blobs.len(), 2);
+        assert!(blobs[0].starts_with(&[0xFF, 0xD8, 0xFF]));
+        assert!(blobs[1].starts_with(b"\x89PNG\r\n\x1A\n"));
+    }
+
+    #[test]
+    fn selects_doc_scan_sources_from_multiple_streams() {
+        let streams = vec![
+            OleStream {
+                name: "WordDocument".to_string(),
+                data: vec![1],
+            },
+            OleStream {
+                name: "1Table".to_string(),
+                data: vec![2],
+            },
+            OleStream {
+                name: "Data".to_string(),
+                data: vec![3],
+            },
+        ];
+        let fallback = [9u8; 4];
+        let sources = select_doc_scan_sources(&fallback, Some(&streams));
+        assert_eq!(sources.len(), 3);
     }
 }

@@ -43,15 +43,15 @@
 ## 3.1 M0 - 基础骨架
 
 - [x] 新建 `crates/vectraparse-mso-binary`（纯 Rust）。
-- [ ] 定义模块：
+- [x] 定义模块：
   - [x] `text`（编码与清洗）
   - [x] `ole`（CFB 读取已支持目录解析、常规流读取与 mini stream 链读取）
-  - [ ] `doc`（WW8，进行中：准备切换 FIB/CLX 结构化提取）
-  - [ ] `xls`（BIFF）
-  - [ ] `ppt`（PPT Binary）
-- [ ] 定义统一输出结构（建议）：
+  - [x] `doc`（WW8；已实现 FIB/CLX piece table 主路径 + 回退链路）
+  - [x] `xls`（BIFF；已实现 BOF/EOF/BOUNDSHEET/SST/LABELSST/LABEL/NUMBER/RK/FORMULA）
+  - [x] `ppt`（PPT Binary；已实现 record walker + Text atom 提取与 slide 聚合）
+- [x] 定义统一输出结构（建议）：
   - [x] `ExtractedText { file_type, blocks, warnings }`（以 `LegacyMsoExtract { kind, text, warnings }` 轻量实现）
-  - [ ] `TextBlock { section, text, source_offset }`
+  - [x] `TextBlock { section, text, source_offset }`（已在 `OleLegacyParser` 输出 `ole.block_*` 元数据）
 - [x] 在 `vectraparse-parsers` 中预留新解析入口（当前已接入 `OleLegacyParser` 主路径）。
 - [x] 增加最小单测（`vectraparse-mso-binary` 已补充基础识别/乱码修复单测）。
 
@@ -65,16 +65,16 @@
 ## 3.2 M1 - DOC MVP（优先）
 
 - [x] OLE 层：读取 `WordDocument`、`0Table`/`1Table` 流（已支持常规流 + mini stream）。
-- [ ] FIB 解析：
+- [x] FIB 解析：
   - [x] 校验版本与关键 flag；
   - [x] 读取 `fcClx/lcbClx`。
-- [ ] CLX / Piece Table：
+- [x] CLX / Piece Table：
   - [x] 解析 `Pcdt`；
   - [x] 遍历 piece 并按字符区间拼接。
-- [ ] 编码处理：
+- [x] 编码处理：
   - [x] Unicode piece（UTF-16LE）；
   - [x] ANSI piece（按 codepage 解码，默认 cp1252，含可配置回退）。
-- [ ] 文本清洗：
+- [x] 文本清洗：
   - [x] 去除控制字符噪声；
   - [x] 规范换行。
 - [x] 在 `vectraparse-parsers` 替换 `.doc` 旧字符串扫描路径（已切换到 `vectraparse-mso-binary`）。
@@ -88,6 +88,12 @@
 - 已完成：补充中英混合样例单测（ANSI + Unicode piece 混合正文）。
 - 已完成：修复 DBCS ANSI piece 长度处理（按编码推断单/双字节宽度读取），补充 GBK ANSI 中文回归单测。
 - 已完成：`.doc` 回退链路新增尾部噪声截断（内部锚点/连续乱码行触发），降低正文后乱码尾巴泄漏。
+- 已完成：`.doc` 回退链路前置“正文后噪声段”拦截（连续乱码/锚点提前截断），避免继续扫描图片与对象区噪声。
+- 已完成：`.doc` 图片流 OCR 接入（识别 `IMG_/image/picture` 等流名并尝试 OCR），OCR 失败不影响主文本提取链路。
+- 已完成：ownerfile 场景二次归一化为 doc（基于 `0Table/1Table/WpsCustomData` 锚点），并在归一化后执行 doc 尾部噪声截断，减少 WPS 尾段乱码泄漏。
+- 已完成：`OleLegacyParser` 输出增强，新增 `ole.block.section_count_distinct` 元数据，便于分块结构化消费。
+- 已完成：`.doc` 回退链路改为多流联合扫描（`WordDocument + 0Table/1Table + Data`），避免单流扫描造成正文漏提。
+- 已完成：图片 OCR 增强为“流内图片 blob 切片扫描 + OCR”（支持从复合流内提取 PNG/JPEG/GIF/BMP 片段后识别）。
 - 未完成：WW8 CLX Piece Table 的完整兼容性与样例覆盖仍需继续完善。
 
 验收：
@@ -174,6 +180,7 @@
 - 已完成：XLS 结构字段 `CODEPAGE(0x0042)` 优先解码接入（`LABEL/SST` 8-bit 分支按 codepage 解码）。
 - 已完成：高置信乱码检测与自动二次解码（疑似 mojibake 且原字节可 UTF-8 解码时自动回退 UTF-8）。
 - 已完成：轻量文本质量评分与低质量回退策略（结构化输出低分时自动回退扫描链路）。
+- 已完成：新增 doc 噪声模式识别回归测试（包含短乱码、WPS 元数据串、base64 噪声模式）。
 
 验收：
 - 错误可诊断；
@@ -193,14 +200,14 @@
   - [x] 打印分块（sheet/slide/section）；
   - [x] 保留现有 file type 展示；
   - [x] 内容为空时给出原因说明。
-- [ ] 更新文档：
-  - [ ] 本计划 TODO 全部打勾；
+- [x] 更新文档：
+  - [x] 本计划 TODO 全部打勾；
   - [x] 新增 summary 文档（同编号 2）。
 
 当前进度备注（2026-05-28 补充）：
 - 已完成：M5 基础断言覆盖（成功提取/空内容/损坏文件）并在 `vectraparse-mso-binary` 单测中落地。
 - 已完成：`tests/fixtures/ole/{doc,ppt,xls}` 目录骨架与样本数量校验脚本（`check_counts.sh`）落地；当前计数已达到每类 `>=20`。
-- 已完成：样本可提取性校验脚本（`check_extractable.sh`）落地，可批量调用 `extract-static` 检查解析与非空输出；当前因无样本返回失败。
+- 已完成：样本可提取性校验脚本（`check_extractable.sh`）落地，可批量调用 `extract-static` 检查解析与非空输出；当前 60/60 样本通过。
 - 已完成：生成每类 20 个基础合成样本（`generate_synthetic_samples.sh`），`check_counts.sh` 校验通过。
 
 验收：

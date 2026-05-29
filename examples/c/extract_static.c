@@ -290,8 +290,12 @@ int main(int argc, char **argv) {
   char *mime = extract_json_string_field(detect_out.data, detect_out.len, "mime_type");
   char *content_json = extract_json_string_field(parse_out.data, parse_out.len, "content");
   char *content = json_unescape_utf8(content_json);
+  const char *debug_json = getenv("VECTRAPARSE_DEBUG_JSON");
 
   printf("File Type: %s\n\n", mime != NULL ? mime : "(unknown)");
+  if (debug_json != NULL && debug_json[0] == '1') {
+    printf("Raw Parse JSON:\n%.*s\n\n", (int)parse_out.len, (const char *)parse_out.data);
+  }
   if (content == NULL || content[0] == '\0') {
     printf("Content:\n(empty)\nReason: parser returned empty content or file has no extractable text.\n");
   } else {
