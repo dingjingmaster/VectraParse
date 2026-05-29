@@ -1187,6 +1187,7 @@ fn parse_doc_piece_table_plcf(word: &[u8], plcf: &[u8], ccp_text: usize, fib: Do
     Some(clean_doc_text(&text))
 }
 
+#[allow(dead_code)]
 fn extract_doc_text_from_table(
     word: &[u8],
     table: &[u8],
@@ -1423,6 +1424,7 @@ fn is_common_doc_body_char(ch: char) -> bool {
         || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
 }
 
+#[allow(dead_code)]
 fn postprocess_doc_structured_text(text: &str) -> String {
     let fallback_full = clean_doc_text(text)
         .lines()
@@ -1503,6 +1505,7 @@ fn is_doc_mojibake_line(line: &str) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn locate_clx(table: &[u8], fib: DocFib) -> Option<&[u8]> {
     if fib.lcb_clx >= 8 {
         let start = fib.fc_clx as usize;
@@ -1515,12 +1518,14 @@ fn locate_clx(table: &[u8], fib: DocFib) -> Option<&[u8]> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct DocPieceTableWindow {
     fc_clx: u32,
     lcb_clx: u32,
     ccp_text: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct DocFib {
     use_1table: bool,
@@ -1564,6 +1569,7 @@ fn parse_doc_fib(word: &[u8]) -> Option<DocFib> {
     })
 }
 
+#[allow(dead_code)]
 fn parse_doc_piece_table_window_from_office_core(word: &[u8]) -> Option<DocPieceTableWindow> {
     let fc_clx = le_u32(word, 0x160)?;
     let lcb_clx = le_u32(word, 0x164)?;
@@ -1578,6 +1584,7 @@ fn parse_doc_piece_table_window_from_office_core(word: &[u8]) -> Option<DocPiece
     })
 }
 
+#[allow(dead_code)]
 fn locate_clx_in_window(table: &[u8], window: DocPieceTableWindow) -> Option<&[u8]> {
     if window.lcb_clx < 8 {
         return None;
@@ -1660,6 +1667,7 @@ fn lcid_to_encoding(lid: u16) -> Option<&'static Encoding> {
     Encoding::for_label(label.as_bytes())
 }
 
+#[allow(dead_code)]
 fn scan_for_clx(table: &[u8]) -> Option<&[u8]> {
     let limit = table.len().saturating_sub(8);
     for i in 0..limit {
@@ -1679,6 +1687,7 @@ fn scan_for_clx(table: &[u8]) -> Option<&[u8]> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct PlcPiece {
     cp_start: u32,
     cp_end: u32,
@@ -1686,6 +1695,7 @@ struct PlcPiece {
     compressed: bool,
 }
 
+#[allow(dead_code)]
 fn parse_clx_piece_table(clx: &[u8]) -> Option<Vec<PlcPiece>> {
     let mut pos = 0usize;
     while pos + 5 <= clx.len() {
