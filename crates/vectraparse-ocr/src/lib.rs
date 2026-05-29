@@ -241,7 +241,9 @@ fn preprocess_det_image(
     let resize_w = ((((src_w as f32) * ratio).round() as usize).max(32) / 32) * 32;
     let resize_h = ((((src_h as f32) * ratio).round() as usize).max(32) / 32) * 32;
     let resized = image::imageops::resize(&rgb, resize_w as u32, resize_h as u32, FilterType::Triangle);
-    let mut data = vec![0f32; 1 * 3 * resize_h * resize_w];
+    let pad_w = side;
+    let pad_h = side;
+    let mut data = vec![0f32; 1 * 3 * pad_h * pad_w];
     for y in 0..resize_h {
         for x in 0..resize_w {
             let px = resized.get_pixel(x as u32, y as u32);
@@ -252,12 +254,12 @@ fn preprocess_det_image(
                 ((bgr[2] / 255.0) - 0.406) / 0.225,
             ];
             for c in 0..3 {
-                let idx = c * resize_h * resize_w + y * resize_w + x;
+                let idx = c * pad_h * pad_w + y * pad_w + x;
                 data[idx] = norm[c];
             }
         }
     }
-    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, resize_h, resize_w), data)?;
+    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, pad_h, pad_w), data)?;
     let sx = src_w as f32 / resize_w as f32;
     let sy = src_h as f32 / resize_h as f32;
     Ok((arr.into_tensor(), sx, sy, src_w, src_h))
@@ -518,9 +520,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_points_to_ppocrv4_paths() {
+    fn default_config_points_to_embedded_models() {
         let cfg = OcrConfig::default();
-        assert!(cfg.det_model_path.contains("PP-OCRv4_det.onnx"));
-        assert!(cfg.rec_model_path.contains("PP-OCRv4_rec.onnx"));
+        assert!(cfg.det_model_path.is_none(), "det model should use embedded");
+        assert!(cfg.rec_model_path.is_none(), "rec model should use embedded");
     }
 }

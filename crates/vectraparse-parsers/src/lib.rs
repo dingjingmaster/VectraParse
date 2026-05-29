@@ -80,7 +80,11 @@ impl CompositeParser {
                 supplement.parser_chain.extend(out.parser_chain);
             }
         }
-        None
+        if supplement.parser_chain.is_empty() {
+            None
+        } else {
+            Some(supplement)
+        }
     }
 
     pub fn parse_multiple(&self, input: &[u8], media_type: &str) -> Vec<ParseOutcome> {
@@ -2505,7 +2509,8 @@ mod tests {
         assert_eq!(text.content.as_deref(), Some("hello"));
         assert!(text.parser_chain.contains(&"TxtParser".to_string()));
         assert!(text.metadata.values("supplement").is_some());
-        assert!(composite.parse(b"\xFF\xFE", "application/pdf").is_none());
+        assert!(composite.parse(b"\xFF\xFE", "application/pdf").is_some());
+        assert!(composite.parse(b"\xFF\xFE", "audio/mpeg").is_some());
     }
 
     #[test]
