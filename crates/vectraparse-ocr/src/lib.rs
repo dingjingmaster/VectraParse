@@ -73,17 +73,7 @@ impl TractOcrEngine {
             let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
             let output = self.rec.run(tvec!(rec_input.into()))?;
             let logits = select_rec_logits(&output)?;
-            let (mut text, mut confidence) = ctc_greedy_decode(&logits, &self.alphabet);
-            if let Some(rec_alt) = &self.rec_alt {
-                let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
-                let output = rec_alt.run(tvec!(rec_input.into()))?;
-                let logits = select_rec_logits(&output)?;
-                let (alt_text, alt_conf) = ctc_greedy_decode(&logits, &self.alphabet_alt);
-                if alt_conf > confidence {
-                    text = alt_text;
-                    confidence = alt_conf;
-                }
-            }
+            let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
             if !text.trim().is_empty() {
                 lines.push((b.1, b.0, text, confidence));
             }
@@ -177,8 +167,8 @@ impl Default for OcrConfig {
             rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.3,
-            det_min_box_area: 100,
+            det_box_thresh: 0.25,
+            det_min_box_area: 50,
         }
     }
 }
@@ -201,6 +191,8 @@ impl TractOcrEngine {
         let output = self.det.run(tvec!(det_input.into()))?;
         let map = output[0].to_array_view::<f32>()?;
         let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
+        let min_w = (w as f32 * 0.015).ceil() as u32;
+        let min_h = (h as f32 * 0.012).ceil() as u32;
         for b in &mut boxes {
             b.0 = ((b.0 as f32) * sx).round() as u32;
             b.1 = ((b.1 as f32) * sy).round() as u32;
@@ -211,6 +203,7 @@ impl TractOcrEngine {
             b.2 = b.2.min(w);
             b.3 = b.3.min(h);
         }
+        boxes.retain(|(x0, y0, x1, y1)| x1.saturating_sub(*x0) >= min_w && y1.saturating_sub(*y0) >= min_h);
         boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
         if boxes.is_empty() {
             boxes.push((0, 0, w, h));
