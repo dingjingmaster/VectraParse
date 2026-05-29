@@ -48,9 +48,7 @@ impl TractOcrEngine {
         let rec_alt = cfg
             .rec_alt_model_path
             .as_deref()
-            .and_then(|p| {
-                load_model(Some(p), EMBED_REC_EN_ONNX).ok()
-            });
+            .and_then(|p| load_model(Some(p), EMBED_REC_EN_ONNX).ok());
         let alphabet = load_dict(cfg.rec_dict_path.as_deref(), EMBED_DICT_ZH);
         let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref(), EMBED_DICT_EN);
         Ok(Self {
@@ -75,7 +73,17 @@ impl TractOcrEngine {
             let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
             let output = self.rec.run(tvec!(rec_input.into()))?;
             let logits = select_rec_logits(&output)?;
-            let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
+            let (mut text, mut confidence) = ctc_greedy_decode(&logits, &self.alphabet);
+            if let Some(rec_alt) = &self.rec_alt {
+                let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
+                let output = rec_alt.run(tvec!(rec_input.into()))?;
+                let logits = select_rec_logits(&output)?;
+                let (alt_text, alt_conf) = ctc_greedy_decode(&logits, &self.alphabet_alt);
+                if alt_conf > confidence {
+                    text = alt_text;
+                    confidence = alt_conf;
+                }
+            }
             if !text.trim().is_empty() {
                 lines.push((b.1, b.0, text, confidence));
             }
@@ -169,8 +177,8 @@ impl Default for OcrConfig {
             rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.18,
-            det_min_box_area: 20,
+            det_box_thresh: 0.3,
+            det_min_box_area: 100,
         }
     }
 }
