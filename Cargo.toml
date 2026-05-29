@@ -4,7 +4,6 @@ members = [
   "crates/vectraparse-mime",
   "crates/vectraparse-parsers",
   "crates/vectraparse-mso-binary",
-  "crates/vectraparse-enhance",
   "crates/vectraparse-ocr",
   "crates/vectraparse-ffi",
 ]
@@ -20,5 +19,4 @@ vectraparse-core = { path = "crates/vectraparse-core" }
 vectraparse-mime = { path = "crates/vectraparse-mime" }
 vectraparse-parsers = { path = "crates/vectraparse-parsers" }
 vectraparse-mso-binary = { path = "crates/vectraparse-mso-binary" }
-vectraparse-enhance = { path = "crates/vectraparse-enhance" }
 vectraparse-ocr = { path = "crates/vectraparse-ocr" }

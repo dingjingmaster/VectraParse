@@ -66,7 +66,7 @@ impl Parser for NetworkParser {
             warnings.push("isolation-disabled".to_string());
         }
         Some(ParseOutcome {
-            content: Some("network-parser-result".to_string()),
+            content: None,
             metadata: md,
             warnings,
             parser_chain: vec!["NetworkParser".to_string()],

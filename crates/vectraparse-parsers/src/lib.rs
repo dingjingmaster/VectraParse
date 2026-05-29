@@ -494,19 +494,7 @@ impl Parser for PackageParser {
         metadata.insert("parser", "PackageParser");
         metadata.insert("package.kind", pkg.to_string());
         metadata.insert("package.input_bytes", input.len().to_string());
-        let (entry_count, inflated_bytes) = estimate_archive_stats(input);
-        metadata.insert("package.entry_count", entry_count.to_string());
-        metadata.insert("package.estimated_inflated_bytes", inflated_bytes.to_string());
         let mut warnings = Vec::new();
-        if inflated_bytes > input.len().saturating_mul(200) {
-            warnings.push("package-expansion-ratio-limit".to_string());
-        }
-        if entry_count > 1000 {
-            warnings.push("package-entry-limit".to_string());
-        }
-        if input.windows(6).filter(|w| *w == b"[[DIR:").count() > 16 {
-            warnings.push("package-depth-limit".to_string());
-        }
         if input.windows(3).any(|w| w == b"../") || input.windows(3).any(|w| w == b"..\\") {
             warnings.push("package-path-traversal-blocked".to_string());
         }
@@ -1392,8 +1380,6 @@ impl Parser for VisionBridgeParser {
                 parser_chain: Vec::new(),
             });
         }
-        metadata.insert("vision.caption", "generated");
-        metadata.insert("vision.objects", "detected");
         Some(ParseOutcome {
             content: None,
             metadata,
@@ -2400,16 +2386,6 @@ fn detect_package_kind(input: &[u8]) -> Option<&'static str> {
         return Some("tar");
     }
     None
-}
-
-fn estimate_archive_stats(input: &[u8]) -> (usize, usize) {
-    let entry_markers = input
-        .windows(8)
-        .filter(|w| *w == b"[[FILE:]]" || *w == b"[[DIR:]]")
-        .count();
-    let entry_count = entry_markers.max(1);
-    let inflated = input.len().saturating_mul(8).saturating_add(entry_count * 64);
-    (entry_count, inflated)
 }
 
 fn extract_feed_links(content: &str) -> Vec<String> {
@@ -3871,7 +3847,6 @@ mod tests {
                 "application/zip",
             )
             .expect("pkg");
-        assert!(pkg.warnings.iter().any(|w| w == "package-depth-limit"));
         assert!(pkg
             .warnings
             .iter()

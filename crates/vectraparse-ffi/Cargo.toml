@@ -12,8 +12,6 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 vectraparse-core.workspace = true
 vectraparse-mime.workspace = true
 vectraparse-parsers.workspace = true
-vectraparse-enhance = { workspace = true, optional = true }
 
 [features]
 default = []
-enhance = ["dep:vectraparse-enhance"]

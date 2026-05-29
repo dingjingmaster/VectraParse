@@ -1387,19 +1387,10 @@ name = "vectraparse-core"
 version = "0.1.0"
 
 [[package]]
-name = "vectraparse-enhance"
-version = "0.1.0"
-dependencies = [
- "vectraparse-core",
- "vectraparse-parsers",
-]
-
-[[package]]
 name = "vectraparse-ffi"
 version = "0.1.0"
 dependencies = [
  "vectraparse-core",
- "vectraparse-enhance",
  "vectraparse-mime",
  "vectraparse-parsers",
 ]
