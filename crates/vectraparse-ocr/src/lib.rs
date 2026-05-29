@@ -474,6 +474,7 @@ fn ctc_greedy_decode_with_blank(
     } else {
         blank_hint.min(classes - 1)
     };
+    let blank_at_end = blank_id == classes - 1 && blank_id > 0;
     let mut prev = blank_id;
     let mut text = String::new();
     let mut prob_sum = 0.0f32;
@@ -494,7 +495,12 @@ fn ctc_greedy_decode_with_blank(
             }
         }
         if best_id != blank_id && best_id != prev {
-            if let Some(ch) = alphabet.get(best_id - 1) {
+            let idx = if blank_at_end {
+                best_id
+            } else {
+                best_id.saturating_sub(1)
+            };
+            if let Some(ch) = alphabet.get(idx) {
                 text.push_str(ch);
             } else {
                 text.push('?');
