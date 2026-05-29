@@ -20,3 +20,4 @@
 | 2 | 2026-05-28 | L3 | research | [2-research-ole-doc-ppt-xls-extraction.md](2-research-ole-doc-ppt-xls-extraction.md) | 已完成 | 基于 LibreOffice 源码路径调研 OLE 二进制 Office（`.doc/.ppt/.xls`）可行提取方案，结论为可通过纯 Rust 重写解析链路达成且不引入新的系统二进制依赖。 |
 | 2 | 2026-05-28 | L3 | plan | [2-plan-ole-doc-ppt-xls-extraction.md](2-plan-ole-doc-ppt-xls-extraction.md) | 进行中 | 基于调研拆解 `.doc/.ppt/.xls` 纯 Rust 实施 TODO，按里程碑定义验收标准、测试命令与提交节奏。 |
 | 2 | 2026-05-28 | L3 | summary | [2-summary-ole-doc-ppt-xls-extraction.md](2-summary-ole-doc-ppt-xls-extraction.md) | 进行中 | 阶段性总结 DOC/XLS/PPT 结构化提取、编码与稳定性增强进展，记录当前验证范围与剩余收口事项。 |
+| 3 | 2026-05-29 | L2 | fix | [3-fix-doc-piece-table-main-text.md](3-fix-doc-piece-table-main-text.md) | 已完成 | 参考 `/data/code/office-core` 的 `.doc` 提取逻辑，为 Piece Table 主文本越界场景增加 `ccpText` 裁剪，减少正文后尾部噪声并补充回归测试。 |

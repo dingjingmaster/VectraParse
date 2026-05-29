@@ -1053,79 +1053,374 @@ fn decode_rk_value(rk: u32) -> f64 {
 }
 
 fn extract_doc_text_structured(streams: &[OleStream]) -> Option<String> {
-    let fib = parse_doc_fib(
-        streams
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case("WordDocument"))?
-            .data
-            .as_slice(),
-    )?;
     let word = streams
         .iter()
         .find(|s| s.name.eq_ignore_ascii_case("WordDocument"))?
         .data
         .as_slice();
-    let mut table_candidates: Vec<(&str, &[u8])> = streams
-        .iter()
-        .filter(|s| s.name.eq_ignore_ascii_case("1Table") || s.name.eq_ignore_ascii_case("0Table"))
-        .map(|s| (s.name.as_str(), s.data.as_slice()))
-        .collect();
-    if table_candidates.is_empty() {
+    let fib_flags = le_u16(word, 0x0A)?;
+    if (fib_flags & 0x0100) != 0 || (fib_flags & 0x8000) != 0 {
         return None;
     }
-    table_candidates.sort_by_key(|(name, _)| {
-        if fib.use_1table {
-            (!name.eq_ignore_ascii_case("1Table")) as u8
-        } else {
-            (!name.eq_ignore_ascii_case("0Table")) as u8
-        }
+    let use_one_table = (fib_flags & 0x0200) != 0;
+    let fib = parse_doc_fib(word).unwrap_or(DocFib {
+        use_1table: use_one_table,
+        fc_clx: 0,
+        lcb_clx: 0,
+        lid: le_u16(word, 0x06).unwrap_or(0),
+        chs: le_u16(word, 0x12).unwrap_or(0),
+        chs_tables: le_u16(word, 0x14).unwrap_or(0),
     });
-    let mut best = String::new();
-    for (_, table) in table_candidates {
-        if let Some(text) = extract_doc_text_from_table(word, table, fib)
-            && text.len() > best.len()
-        {
-            best = text;
-        }
-    }
-    if best.trim().is_empty() {
+    let primary_name = if use_one_table { "1Table" } else { "0Table" };
+    let fallback_name = if use_one_table { "0Table" } else { "1Table" };
+    let primary = streams
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(primary_name))
+        .map(|s| s.data.as_slice());
+    let fallback = streams
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(fallback_name))
+        .map(|s| s.data.as_slice());
+
+    let text = if let Some(table) = primary {
+        parse_doc_text_from_office_core(word, table, fib)
+            .filter(|text| is_high_confidence_text(text, "doc"))
+            .or_else(|| fallback_doc_text_from_office_core(word, Some(table)))
+    } else if let Some(table) = fallback {
+        parse_doc_text_from_office_core(word, table, fib)
+            .filter(|text| is_high_confidence_text(text, "doc"))
+            .or_else(|| fallback_doc_text_from_office_core(word, Some(table)))
+    } else {
+        fallback_doc_text_from_office_core(word, None)
+    }?;
+
+    if text.trim().is_empty() {
         None
     } else {
-        Some(best)
+        Some(text)
     }
 }
 
-fn extract_doc_text_from_table(word: &[u8], table: &[u8], fib: DocFib) -> Option<String> {
-    let clx = locate_clx(table, fib)?;
-    let plc = parse_clx_piece_table(clx)?;
-    let mut text = String::new();
-    for piece in plc {
-        let cp_chars = piece.cp_end.saturating_sub(piece.cp_start) as usize;
-        if cp_chars == 0 {
-            continue;
-        }
-        if piece.compressed {
-            let fc = piece.fc as usize;
-            let end = fc.saturating_add(ansi_piece_byte_len(cp_chars, fib));
-            if end > word.len() {
-                continue;
+fn parse_doc_text_from_office_core(word: &[u8], table: &[u8], fib: DocFib) -> Option<String> {
+    let ccp_text = le_u32(word, 0x34)? as usize;
+    let fc_clx = le_u32(word, 0x160)? as usize;
+    let lcb_clx = le_u32(word, 0x164)? as usize;
+    let clx = table.get(fc_clx..fc_clx.checked_add(lcb_clx)?)?;
+    parse_doc_piece_table_from_office_core(word, clx, ccp_text, fib)
+}
+
+fn parse_doc_piece_table_from_office_core(
+    word: &[u8],
+    clx: &[u8],
+    ccp_text: usize,
+    fib: DocFib,
+) -> Option<String> {
+    let mut cursor = 0usize;
+    while cursor < clx.len() {
+        let kind = *clx.get(cursor)?;
+        cursor += 1;
+        match kind {
+            0x01 => {
+                let skip = le_u16(clx, cursor)? as usize;
+                cursor = cursor.checked_add(2 + skip)?;
             }
-            text.push_str(&decode_ansi_piece(&word[fc..end], fib));
-        } else {
-            let fc = piece.fc as usize;
-            let byte_len = cp_chars.saturating_mul(2);
-            let end = fc.saturating_add(byte_len);
-            if end > word.len() {
-                continue;
+            0x02 => {
+                let plcf_len = le_u32(clx, cursor)? as usize;
+                cursor += 4;
+                let plcf = clx.get(cursor..cursor.checked_add(plcf_len)?)?;
+                return parse_doc_piece_table_plcf(word, plcf, ccp_text, fib);
             }
-            let mut units = Vec::with_capacity(cp_chars);
-            for ch in word[fc..end].chunks_exact(2) {
-                units.push(u16::from_le_bytes([ch[0], ch[1]]));
-            }
-            text.push_str(&String::from_utf16_lossy(&units));
+            _ => return None,
         }
     }
-    Some(postprocess_doc_structured_text(&clean_doc_text(&text)))
+    None
+}
+
+fn parse_doc_piece_table_plcf(word: &[u8], plcf: &[u8], ccp_text: usize, fib: DocFib) -> Option<String> {
+    if plcf.len() < 16 {
+        return None;
+    }
+    let piece_count = plcf.len().checked_sub(4)? / 12;
+    let cp_table_len = (piece_count + 1).checked_mul(4)?;
+    if cp_table_len + piece_count * 8 != plcf.len() {
+        return None;
+    }
+    let mut text = String::new();
+    for piece_index in 0..piece_count {
+        let cp_start = le_u32(plcf, piece_index * 4)? as usize;
+        let mut cp_end = le_u32(plcf, (piece_index + 1) * 4)? as usize;
+        if ccp_text > 0 && cp_start >= ccp_text {
+            break;
+        }
+        if ccp_text > 0 {
+            cp_end = cp_end.min(ccp_text);
+        }
+        if cp_end <= cp_start {
+            continue;
+        }
+        let pcd_offset = cp_table_len + piece_index * 8;
+        let fc_raw = le_u32(plcf, pcd_offset + 2)?;
+        let compressed = (fc_raw & 0x4000_0000) != 0;
+        let fc = if compressed {
+            ((fc_raw & 0x3FFF_FFFF) / 2) as usize
+        } else {
+            fc_raw as usize
+        };
+        let piece_chars = cp_end - cp_start;
+        if compressed {
+            let piece_len = ansi_piece_byte_len(piece_chars, fib);
+            let piece = word.get(fc..fc.checked_add(piece_len)?)?;
+            text.push_str(&clean_doc_text(&decode_ansi_piece(piece, fib)));
+        } else {
+            let piece_len = piece_chars.checked_mul(2)?;
+            let piece = word.get(fc..fc.checked_add(piece_len)?)?;
+            let mut units = Vec::with_capacity(piece_chars);
+            for ch in piece.chunks_exact(2) {
+                units.push(u16::from_le_bytes([ch[0], ch[1]]));
+            }
+            text.push_str(&clean_doc_text(&String::from_utf16_lossy(&units)));
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    Some(clean_doc_text(&text))
+}
+
+fn extract_doc_text_from_table(
+    word: &[u8],
+    table: &[u8],
+    fib: DocFib,
+    preferred_piece_table: Option<DocPieceTableWindow>,
+) -> Option<String> {
+    let ccp_text = preferred_piece_table
+        .map(|window| window.ccp_text)
+        .unwrap_or_else(|| le_u32(word, 0x34).unwrap_or(0) as usize);
+    let clx = preferred_piece_table
+        .and_then(|window| locate_clx_in_window(table, window))
+        .or_else(|| locate_clx(table, fib))?;
+    parse_doc_piece_table_from_office_core(word, clx, ccp_text, fib)
+}
+
+fn fallback_doc_text_from_office_core(word: &[u8], table: Option<&[u8]>) -> Option<String> {
+    let mut runs = scan_text_runs_from_office_core(word, 4);
+    if let Some(table) = table {
+        runs.extend(scan_text_runs_from_office_core(table, 4));
+    }
+    let filtered: Vec<String> = dedupe_runs_from_office_core(runs)
+        .into_iter()
+        .filter(|run| looks_like_body_text_from_office_core(run))
+        .collect();
+    let text = filtered.join("\n");
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn scan_text_runs_from_office_core(bytes: &[u8], min_chars: usize) -> Vec<String> {
+    let mut runs = Vec::new();
+    runs.extend(scan_utf16le_runs_from_office_core(bytes, min_chars));
+    runs.extend(scan_ascii_runs_from_office_core(bytes, min_chars));
+    dedupe_runs_from_office_core(runs)
+}
+
+fn dedupe_runs_from_office_core(runs: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for run in runs {
+        let run = run.trim().to_string();
+        if run.is_empty() {
+            continue;
+        }
+        if deduped.last() == Some(&run) {
+            continue;
+        }
+        if !deduped.contains(&run) {
+            deduped.push(run);
+        }
+    }
+    deduped
+}
+
+fn scan_utf16le_runs_from_office_core(bytes: &[u8], min_chars: usize) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + min_chars * 2 <= bytes.len() {
+        let mut words = Vec::new();
+        let start = cursor;
+        while cursor + 1 < bytes.len() {
+            let code_unit = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+            let allowed = matches!(code_unit, 0x0009 | 0x000A | 0x000D)
+                || (0x0020..=0xFFFD).contains(&code_unit);
+            if !allowed || code_unit == 0 {
+                break;
+            }
+            words.push(code_unit);
+            cursor += 2;
+        }
+        if words.len() >= min_chars && cursor > start {
+            let text = normalize_text_from_office_core(&String::from_utf16_lossy(&words));
+            if !text.is_empty() {
+                runs.push(text);
+            }
+        }
+        cursor = if cursor > start {
+            cursor.saturating_add(2).min(bytes.len())
+        } else {
+            start + 2
+        };
+    }
+    runs
+}
+
+fn scan_ascii_runs_from_office_core(bytes: &[u8], min_chars: usize) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let start = cursor;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            let allowed = matches!(byte, b'\t' | b'\n' | b'\r') || (0x20..=0x7E).contains(&byte);
+            if !allowed {
+                break;
+            }
+            cursor += 1;
+        }
+        if cursor - start >= min_chars {
+            let text = normalize_text_from_office_core(&decode_single_byte_from_office_core(&bytes[start..cursor]));
+            if !text.is_empty() {
+                runs.push(text);
+            }
+        }
+        cursor = if cursor > start {
+            cursor.saturating_add(1).min(bytes.len())
+        } else {
+            cursor + 1
+        };
+    }
+    runs
+}
+
+fn normalize_text_from_office_core(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut last_was_space = false;
+    let mut last_was_newline = false;
+    for character in input.chars() {
+        match character {
+            '\r' | '\u{0007}' | '\u{000B}' | '\u{000C}' => {
+                if !last_was_newline {
+                    normalized.push('\n');
+                    last_was_newline = true;
+                }
+                last_was_space = false;
+            }
+            '\n' => {
+                if !last_was_newline {
+                    normalized.push('\n');
+                    last_was_newline = true;
+                }
+                last_was_space = false;
+            }
+            '\t' => {
+                normalized.push('\t');
+                last_was_space = false;
+                last_was_newline = false;
+            }
+            character if character.is_control() => {
+                if !last_was_space {
+                    normalized.push(' ');
+                    last_was_space = true;
+                }
+                last_was_newline = false;
+            }
+            character if character.is_whitespace() => {
+                if !last_was_space {
+                    normalized.push(' ');
+                    last_was_space = true;
+                }
+                last_was_newline = false;
+            }
+            character => {
+                normalized.push(character);
+                last_was_space = false;
+                last_was_newline = false;
+            }
+        }
+    }
+    normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_single_byte_from_office_core(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| decode_cp1252_from_office_core(*byte)).collect()
+}
+
+fn decode_cp1252_from_office_core(byte: u8) -> char {
+    match byte {
+        0x80 => '€',
+        0x82 => '‚',
+        0x83 => 'ƒ',
+        0x84 => '„',
+        0x85 => '…',
+        0x86 => '†',
+        0x87 => '‡',
+        0x88 => 'ˆ',
+        0x89 => '‰',
+        0x8A => 'Š',
+        0x8B => '‹',
+        0x8C => 'Œ',
+        0x8E => 'Ž',
+        0x91 => '‘',
+        0x92 => '’',
+        0x93 => '“',
+        0x94 => '”',
+        0x95 => '•',
+        0x96 => '–',
+        0x97 => '—',
+        0x98 => '˜',
+        0x99 => '™',
+        0x9A => 'š',
+        0x9B => '›',
+        0x9C => 'œ',
+        0x9E => 'ž',
+        0x9F => 'Ÿ',
+        0x00..=0x1F => ' ',
+        _ => byte as char,
+    }
+}
+
+fn looks_like_body_text_from_office_core(text: &str) -> bool {
+    let mut total = 0usize;
+    let mut common = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if is_common_doc_body_char(ch) {
+            common += 1;
+        }
+    }
+    total >= 4 && common * 100 >= total * 85
+}
+
+fn is_common_doc_body_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || ch.is_ascii_punctuation()
+        || matches!(
+            ch,
+            '，' | '。' | '；' | '：' | '！' | '？' | '（' | '）' | '【' | '】' | '《' | '》' | '、' | '“'
+                | '”' | '‘' | '’' | '￥' | '…' | '·' | '—' | '－'
+        )
+        || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+        || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+        || ('\u{3000}'..='\u{303F}').contains(&ch)
+        || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
 }
 
 fn postprocess_doc_structured_text(text: &str) -> String {
@@ -1220,6 +1515,13 @@ fn locate_clx(table: &[u8], fib: DocFib) -> Option<&[u8]> {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct DocPieceTableWindow {
+    fc_clx: u32,
+    lcb_clx: u32,
+    ccp_text: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct DocFib {
     use_1table: bool,
     fc_clx: u32,
@@ -1260,6 +1562,29 @@ fn parse_doc_fib(word: &[u8]) -> Option<DocFib> {
         chs,
         chs_tables,
     })
+}
+
+fn parse_doc_piece_table_window_from_office_core(word: &[u8]) -> Option<DocPieceTableWindow> {
+    let fc_clx = le_u32(word, 0x160)?;
+    let lcb_clx = le_u32(word, 0x164)?;
+    let ccp_text = le_u32(word, 0x34)? as usize;
+    if lcb_clx == 0 || ccp_text == 0 {
+        return None;
+    }
+    Some(DocPieceTableWindow {
+        fc_clx,
+        lcb_clx,
+        ccp_text,
+    })
+}
+
+fn locate_clx_in_window(table: &[u8], window: DocPieceTableWindow) -> Option<&[u8]> {
+    if window.lcb_clx < 8 {
+        return None;
+    }
+    let start = window.fc_clx as usize;
+    let end = start.saturating_add(window.lcb_clx as usize);
+    table.get(start..end)
 }
 
 fn decode_ansi_piece(bytes: &[u8], fib: DocFib) -> String {
@@ -2320,11 +2645,11 @@ mod tests {
         decode_bytes_with_strategy, detect_kind_from_streams, extract_doc_text_from_table, extract_legacy_mso_text,
         extract_ppt_text_structured, extract_xls_text_structured, format_excel_number, format_sheet_blocks,
         carve_embedded_images, find_jpeg_end, find_png_end, group_ppt_slide_text, is_doc_mojibake_line, locate_clx,
-        looks_like_mojibake, normalize_ownerfile_doc_tail, parse_boundsheet_name, parse_clx_piece_table,
-        postprocess_doc_structured_text, select_doc_scan_sources,
-        parse_doc_fib, parse_sst_strings_with_continue, read_mini_chain, repair_utf8_mojibake,
-        score_text_quality, trim_trailing_noise, truncate_doc_tail_noise, walk_ppt_records, DocFib, OleStream,
-        PptRecord, XlsCell,
+        locate_clx_in_window, looks_like_mojibake, normalize_ownerfile_doc_tail, parse_boundsheet_name,
+        parse_clx_piece_table, parse_doc_fib, parse_doc_piece_table_window_from_office_core,
+        parse_sst_strings_with_continue, postprocess_doc_structured_text, read_mini_chain,
+        repair_utf8_mojibake, score_text_quality, select_doc_scan_sources, trim_trailing_noise,
+        truncate_doc_tail_noise, walk_ppt_records, DocFib, DocPieceTableWindow, OleStream, PptRecord, XlsCell,
     };
 
     #[test]
@@ -2429,6 +2754,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_office_core_piece_table_window() {
+        let mut word = vec![0u8; 0x168];
+        word[0x34..0x38].copy_from_slice(&5u32.to_le_bytes());
+        word[0x160..0x164].copy_from_slice(&12u32.to_le_bytes());
+        word[0x164..0x168].copy_from_slice(&16u32.to_le_bytes());
+        let window = parse_doc_piece_table_window_from_office_core(&word).expect("piece table window");
+        assert_eq!(window.ccp_text, 5);
+        assert_eq!(window.fc_clx, 12);
+        assert_eq!(window.lcb_clx, 16);
+    }
+
+    #[test]
+    fn locate_clx_in_window_uses_exact_offsets() {
+        let window = DocPieceTableWindow {
+            fc_clx: 4,
+            lcb_clx: 8,
+            ccp_text: 5,
+        };
+        let table = b"xxxxabcdefghtail";
+        let clx = locate_clx_in_window(table, window).expect("window clx");
+        assert_eq!(clx, b"abcdefgh");
+    }
+
+    #[test]
     fn parses_clx_piece_table() {
         // CLX: [0x02][lcb=16] + PlcPcd (n=1): cp[0]=0, cp[1]=5, pcd.fc=0x40000000(ANSI, fc=0)
         let mut clx = vec![0x02];
@@ -2467,7 +2816,7 @@ mod tests {
         table.extend_from_slice(&[0, 0]);
 
         let fib = parse_doc_fib(&word).expect("fib");
-        let text = extract_doc_text_from_table(&word, &table, fib).expect("doc text");
+        let text = extract_doc_text_from_table(&word, &table, fib, None).expect("doc text");
         assert_eq!(text, "Hello");
     }
 
@@ -2526,7 +2875,7 @@ mod tests {
         table.extend_from_slice(&[0, 0]);
 
         let fib = parse_doc_fib(&word).expect("fib");
-        let text = extract_doc_text_from_table(&word, &table, fib).expect("mixed text");
+        let text = extract_doc_text_from_table(&word, &table, fib, None).expect("mixed text");
         assert_eq!(text, "ABC中文");
     }
 
@@ -2553,8 +2902,40 @@ mod tests {
         table.extend_from_slice(&[0, 0]);
 
         let fib = parse_doc_fib(&word).expect("fib");
-        let text = extract_doc_text_from_table(&word, &table, fib).expect("dbcs ansi text");
+        let text = extract_doc_text_from_table(&word, &table, fib, None).expect("dbcs ansi text");
         assert_eq!(text, "中文");
+    }
+
+    #[test]
+    fn caps_doc_piece_output_to_main_text_chars() {
+        let mut word = vec![0u8; 0x1AA];
+        word[0x00..0x02].copy_from_slice(&0xA5ECu16.to_le_bytes());
+        word[0x02..0x04].copy_from_slice(&0x00C1u16.to_le_bytes());
+        word[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes());
+        word[0x34..0x38].copy_from_slice(&5u32.to_le_bytes());
+        word[0x1A2..0x1A6].copy_from_slice(&0u32.to_le_bytes());
+        word[0x1A6..0x1AA].copy_from_slice(&21u32.to_le_bytes());
+
+        let ansi_offset = word.len() as u32;
+        word.extend_from_slice(b"HelloTAIL");
+
+        let mut table = Vec::new();
+        table.push(0x02);
+        table.extend_from_slice(&16u32.to_le_bytes());
+        table.extend_from_slice(&0u32.to_le_bytes());
+        table.extend_from_slice(&9u32.to_le_bytes());
+        table.extend_from_slice(&[0, 0]);
+        table.extend_from_slice(&(0x4000_0000u32 | (ansi_offset * 2)).to_le_bytes());
+        table.extend_from_slice(&[0, 0]);
+
+        let fib = parse_doc_fib(&word).expect("fib");
+        let preferred = Some(DocPieceTableWindow {
+            fc_clx: 0,
+            lcb_clx: 0,
+            ccp_text: 5,
+        });
+        let text = extract_doc_text_from_table(&word, &table, fib, preferred).expect("doc text");
+        assert_eq!(text, "Hello");
     }
 
     #[test]
