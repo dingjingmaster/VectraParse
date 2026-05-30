@@ -193,12 +193,20 @@ impl TractOcrEngine {
         let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
         let min_w = (w as f32 * 0.015).ceil() as u32;
         let min_h = (h as f32 * 0.012).ceil() as u32;
-        let dilate = (w as f32 * 0.005).ceil() as u32;
         for b in &mut boxes {
-            b.0 = ((b.0 as f32 * sx - dilate as f32).max(0.0)) as u32;
-            b.1 = ((b.1 as f32 * sy - dilate as f32).max(0.0)) as u32;
-            b.2 = ((b.2 as f32 * sx + dilate as f32) as u32).min(w);
-            b.3 = ((b.3 as f32 * sy + dilate as f32) as u32).min(h);
+            let bw = (b.2 - b.0) as f32;
+            let bh = (b.3 - b.1) as f32;
+            let perimeter = (bw + bh) * 2.0;
+            let area = bw * bh;
+            let dist = if perimeter > 0.0 { area * 1.5 / perimeter } else { 1.0f32 };
+            let h_expand = (dist * sx * 0.6) as u32;
+            let v_expand = (dist * sy * 0.6) as u32;
+            let x0 = (b.0 as f32 * sx).round() as i32 - h_expand as i32;
+            let y0 = (b.1 as f32 * sy).round() as i32 - v_expand as i32;
+            b.0 = x0.max(0) as u32;
+            b.1 = y0.max(0) as u32;
+            b.2 = ((b.2 as f32 * sx).round() as u32 + h_expand).min(w);
+            b.3 = ((b.3 as f32 * sy).round() as u32 + v_expand).min(h);
         }
         boxes.retain(|(x0, y0, x1, y1)| x1.saturating_sub(*x0) >= min_w && y1.saturating_sub(*y0) >= min_h);
         boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
@@ -461,19 +469,13 @@ fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
 }
 
 fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[String]) -> (String, f32) {
-    let a = ctc_greedy_decode_with_blank(logits, alphabet, 0);
-    let b = ctc_greedy_decode_with_blank(logits, alphabet, usize::MAX);
-    if b.0.chars().count() > a.0.chars().count() {
-        b
-    } else {
-        a
-    }
+    ctc_greedy_decode_with_blank(logits, alphabet, 0)
 }
 
 fn ctc_greedy_decode_with_blank(
     logits: &tract_ndarray::ArrayViewD<'_, f32>,
     alphabet: &[String],
-    blank_hint: usize,
+    _blank_hint: usize,
 ) -> (String, f32) {
     if logits.ndim() != 3 {
         return (String::new(), 0.0);
@@ -487,12 +489,7 @@ fn ctc_greedy_decode_with_blank(
     if classes <= 1 {
         return (String::new(), 0.0);
     }
-    let blank_id = if blank_hint == usize::MAX {
-        classes - 1
-    } else {
-        blank_hint.min(classes - 1)
-    };
-    let blank_at_end = blank_id == classes - 1 && blank_id > 0;
+    let blank_id = 0usize;
     let mut prev = blank_id;
     let mut text = String::new();
     let mut prob_sum = 0.0f32;
@@ -513,12 +510,11 @@ fn ctc_greedy_decode_with_blank(
             }
         }
         if best_id != blank_id && best_id != prev {
-            let idx = if blank_at_end {
-                best_id
-            } else {
-                best_id.saturating_sub(1)
-            };
+            let idx = best_id.saturating_sub(1);
             if let Some(ch) = alphabet.get(idx) {
+                if ch == "\u{3000}" {
+                    continue;
+                }
                 text.push_str(ch);
             } else {
                 text.push('?');
