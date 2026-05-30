@@ -112,12 +112,12 @@ impl OrtOcrEngine {
         let boxes = self.detect_text_boxes(img, cfg)?;
 
         let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
-        for b in boxes {
-            let crop = crop_box(img, b);
-            let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
-            let output = ort::run_session(&self.rec, &[rec_input])?;
+        for b in boxes.iter() {
+            let crop = crop_box(img, *b);
+            let (rec_input, rec_shape) = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
+            let (output, out_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])?;
             let logits = &output[0];
-            let (text, confidence) = ctc_greedy_decode(logits, &self.alphabet);
+            let (text, confidence) = ctc_greedy_decode(logits, &out_shapes[0], &self.alphabet);
             if !text.trim().is_empty() {
                 lines.push((b.1, b.0, text, confidence));
             }
@@ -136,20 +136,20 @@ impl OrtOcrEngine {
         };
 
         if text.trim().is_empty() {
-            let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-            let output = ort::run_session(&self.rec, &[rec_input])?;
-            let logits = &output[0];
-            let (fallback_text, fallback_confidence) = ctc_greedy_decode(logits, &self.alphabet);
+            let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+            let (rec_output, rec_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])?;
+            let logits = &rec_output[0];
+            let (fallback_text, fallback_confidence) = ctc_greedy_decode(logits, &rec_shapes[0], &self.alphabet);
             text = fallback_text;
             confidence = fallback_confidence;
 
             if text.trim().is_empty()
                 && let Some(rec_alt) = &self.rec_alt
             {
-                let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-                let output = ort::run_session(rec_alt, &[rec_input])?;
-                let logits = &output[0];
-                let (alt_text, alt_confidence) = ctc_greedy_decode(logits, &self.alphabet_alt);
+                let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+                let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])?;
+                let logits = &alt_output[0];
+                let (alt_text, alt_confidence) = ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
                 text = alt_text;
                 confidence = alt_confidence;
             }
@@ -158,10 +158,10 @@ impl OrtOcrEngine {
                 let mut line_texts = Vec::new();
                 let mut confs = Vec::new();
                 for line in fallback_line_crops(img) {
-                    let rec_input = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
-                    if let Ok(output) = ort::run_session(&self.rec, &[rec_input]) {
-                        let logits = &output[0];
-                        let (t, c) = ctc_greedy_decode(logits, &self.alphabet);
+                    let (rec_input, rec_shape) = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
+                    if let Ok((ln_output, ln_shapes)) = ort::run_session(&self.rec, &[rec_input], &[rec_shape]) {
+                        let logits = &ln_output[0];
+                        let (t, c) = ctc_greedy_decode(logits, &ln_shapes[0], &self.alphabet);
                         if !t.trim().is_empty() {
                             line_texts.push(t);
                             confs.push(c);
@@ -197,13 +197,16 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
     ) -> Result<Vec<BoxRect>, String> {
-        let (det_input, sx, sy, w, h) = preprocess_det_image(img, cfg.det_img_side)?;
-        let output = ort::run_session(&self.det, &[det_input])?;
-        let map = &output[0];
-        let boxes = extract_boxes_from_map(map, cfg.det_box_thresh, cfg.det_min_box_area, w, h);
+        let (det_input, det_shape, sx, sy, src_w, src_h) = preprocess_det_image(img, cfg.det_img_side)?;
+        let (det_output, _det_shapes) = ort::run_session(&self.det, &[det_input], &[det_shape])?;
+        let map = &det_output[0];
+        let shape = &_det_shapes[0];
+        let map_h = shape.get(2).copied().unwrap_or(960) as u32;
+        let map_w = shape.get(3).copied().unwrap_or(960) as u32;
+        let boxes = extract_boxes_from_map(map, cfg.det_box_thresh, cfg.det_min_box_area, map_w, map_h);
 
-        let min_w = (w as f32 * 0.015).ceil() as u32;
-        let min_h = (h as f32 * 0.012).ceil() as u32;
+        let min_w = (src_w as f32 * 0.015).ceil() as u32;
+        let min_h = (src_h as f32 * 0.012).ceil() as u32;
         let mut scaled: Vec<BoxRect> = Vec::new();
         for b in boxes {
             let bw = (b.2 - b.0) as f32;
@@ -219,8 +222,8 @@ impl OrtOcrEngine {
             let v_expand = (dist * sy * 0.6) as u32;
             let x0 = (b.0 as f32 * sx).round() as i32 - h_expand as i32;
             let y0 = (b.1 as f32 * sy).round() as i32 - v_expand as i32;
-            let x1 = ((b.2 as f32 * sx).round() as u32 + h_expand).min(w);
-            let y1 = ((b.3 as f32 * sy).round() as u32 + v_expand).min(h);
+            let x1 = ((b.2 as f32 * sx).round() as u32 + h_expand).min(src_w);
+            let y1 = ((b.3 as f32 * sy).round() as u32 + v_expand).min(src_h);
             let x0 = x0.max(0) as u32;
             let y0 = y0.max(0) as u32;
             if x1 > x0 && y1 > y0 && x1 - x0 >= min_w && y1 - y0 >= min_h {
@@ -250,7 +253,7 @@ impl OrtOcrEngine {
 
         merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
         if merged.is_empty() {
-            merged.push((0, 0, w, h));
+            merged.push((0, 0, src_w, src_h));
         }
         Ok(merged)
     }
@@ -292,7 +295,7 @@ fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
 fn preprocess_det_image(
     image: &DynamicImage,
     side: usize,
-) -> Result<(Vec<f32>, f32, f32, u32, u32), String> {
+) -> Result<(Vec<f32>, Vec<usize>, f32, f32, u32, u32), String> {
     let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
     let max_side = side as f32;
@@ -325,7 +328,8 @@ fn preprocess_det_image(
 
     let sx = src_w as f32 / resize_w as f32;
     let sy = src_h as f32 / resize_h as f32;
-    Ok((data, sx, sy, src_w, src_h))
+    let shape = vec![1, 3, side, side];
+    Ok((data, shape, sx, sy, src_w, src_h))
 }
 
 fn extract_boxes_from_map(
@@ -401,7 +405,7 @@ fn preprocess_rec_image(
     image: &DynamicImage,
     target_h: usize,
     target_w: usize,
-) -> Result<Vec<f32>, String> {
+) -> Result<(Vec<f32>, Vec<usize>), String> {
     let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
     let ratio = src_w as f32 / src_h as f32;
@@ -425,7 +429,8 @@ fn preprocess_rec_image(
             }
         }
     }
-    Ok(data)
+    let shape = vec![1, 3, target_h, target_w];
+    Ok((data, shape))
 }
 
 fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
@@ -505,8 +510,8 @@ fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
         .collect()
 }
 
-fn ctc_greedy_decode(logits: &[f32], alphabet: &[String]) -> (String, f32) {
-    let shape = g_outer_shape(logits);
+fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -> (String, f32) {
+    let shape = g_outer_shape(logits, out_shape);
     if shape.len() < 2 {
         return (String::new(), 0.0);
     }
@@ -558,17 +563,12 @@ fn ctc_greedy_decode(logits: &[f32], alphabet: &[String]) -> (String, f32) {
     (text, confidence)
 }
 
-fn g_outer_shape(data: &[f32]) -> Vec<usize> {
+fn g_outer_shape(data: &[f32], output_shape: &[usize]) -> Vec<usize> {
     let total = data.len();
-    if total == 0 {
-        return vec![1, 1, total];
-    }
-    let mut shape = ort::last_known_shape();
+    let mut shape = output_shape.to_vec();
     let product: usize = shape.iter().skip(1).product();
-    if product > 0 {
+    if product > 0 && total > 0 {
         shape[0] = total / product;
-    } else {
-        shape = vec![1, 1, total];
     }
     shape
 }
