@@ -245,9 +245,8 @@ fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
     };
     content
         .lines()
-        .map(str::trim)
+        .map(|line| line.to_string())
         .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
         .collect()
 }
 
