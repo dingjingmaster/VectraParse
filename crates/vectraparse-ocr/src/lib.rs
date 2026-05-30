@@ -167,8 +167,8 @@ impl Default for OcrConfig {
             rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.3,
-            det_min_box_area: 100,
+            det_box_thresh: 0.25,
+            det_min_box_area: 30,
         }
     }
 }
@@ -193,7 +193,7 @@ impl TractOcrEngine {
         let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
         let min_w = (w as f32 * 0.015).ceil() as u32;
         let min_h = (h as f32 * 0.012).ceil() as u32;
-        let dilate = (w as f32 * 0.003).ceil() as u32;
+        let dilate = (w as f32 * 0.005).ceil() as u32;
         for b in &mut boxes {
             b.0 = ((b.0 as f32 * sx - dilate as f32).max(0.0)) as u32;
             b.1 = ((b.1 as f32 * sy - dilate as f32).max(0.0)) as u32;
@@ -208,9 +208,9 @@ impl TractOcrEngine {
             if let Some(last) = merged.last_mut() {
                 let y_overlap = last.1 < b.3 && b.1 < last.3;
                 let y_center_diff = ((last.1 + last.3) as i32 - (b.1 + b.3) as i32).unsigned_abs() as u32;
-                let line_h = (last.3 - last.1).max(b.3 - b.1);
+                let line_h = (last.3 - last.1).max(b.3 - b.1).max(1);
                 let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
-                if (y_overlap || y_center_diff < line_h / 2) && x_gap <= line_h * 3 {
+                if (y_overlap || y_center_diff <= line_h) && x_gap <= line_h * 3 {
                     last.0 = last.0.min(b.0);
                     last.1 = last.1.min(b.1);
                     last.2 = last.2.max(b.2);
