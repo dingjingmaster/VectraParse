@@ -1,6 +1,6 @@
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use std::sync::OnceLock;
-use vectraparse_ocr::{OcrConfig, TractOcrEngine};
+use vectraparse_ocr::{OcrConfig, OrtOcrEngine};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyMsoExtract {
@@ -2112,10 +2112,10 @@ fn looks_like_image_bytes(data: &[u8]) -> bool {
         || data.starts_with(b"MM\0*")
 }
 
-fn ocr_engine() -> Option<&'static TractOcrEngine> {
-    static OCR_ENGINE: OnceLock<Option<TractOcrEngine>> = OnceLock::new();
+fn ocr_engine() -> Option<&'static OrtOcrEngine> {
+    static OCR_ENGINE: OnceLock<Option<OrtOcrEngine>> = OnceLock::new();
     OCR_ENGINE
-        .get_or_init(|| TractOcrEngine::load(&OcrConfig::default()).ok())
+        .get_or_init(|| OrtOcrEngine::load(&OcrConfig::default()).ok())
         .as_ref()
 }
 

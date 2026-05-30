@@ -1,10 +1,13 @@
-.PHONY: debug release file-content check test abi-smoke golden fuzz-smoke bench-smoke pipeline
+.PHONY: debug release file-content check test abi-smoke golden fuzz-smoke bench-smoke pipeline ort-build ort-check ort-test
+
+ORT_INSTALL_DIR := $(shell pwd)/build-build/install
+export ORT_INSTALL_DIR
 
 release:
 	cargo build --release
 
 debug:
-	cargo build 
+	cargo build
 
 check:
 	cargo check --workspace
@@ -12,13 +15,25 @@ check:
 test:
 	cargo test --workspace
 
+ort-build:
+	bash build-build/build_ort.sh
+
+ort-check:
+	cargo check --workspace
+
+ort-test:
+	cargo test --workspace
+
 file-content:
-	gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a -ldl -lpthread -lm -o target/extract-static
+	gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a \
+		-Lbuild-build/install/lib -lonnxruntime -ldl -lpthread -lm -o target/extract-static
 
 abi-smoke:
 	cargo build --release -p vectraparse-ffi
-	gcc examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi -Wl,-rpath,'$$ORIGIN/../target/release' -o target/smoke-c
-	LD_LIBRARY_PATH=target/release ./target/smoke-c
+	gcc examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi \
+		-Lbuild-build/install/lib -lonnxruntime \
+		-Wl,-rpath,'$$ORIGIN/../target/release' -Wl,-rpath,'$$ORIGIN/../build-build/install/lib' -o target/smoke-c
+	LD_LIBRARY_PATH=target/release:build-build/install/lib ./target/smoke-c
 
 golden:
 	bash scripts/golden_validate.sh tests/golden/manifest.tsv

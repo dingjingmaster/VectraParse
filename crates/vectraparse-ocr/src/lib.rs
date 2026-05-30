@@ -1,10 +1,9 @@
-use std::fs;
-use std::io::Cursor;
 use std::path::Path;
 
 use image::imageops::FilterType;
 use image::DynamicImage;
-use tract_onnx::prelude::*;
+
+mod ort;
 
 const EMBED_DET_ONNX: &[u8] = include_bytes!("../../../data/det.onnx");
 const EMBED_REC_ZH_ONNX: &[u8] = include_bytes!("../../../data/chinese/rec.onnx");
@@ -26,136 +25,6 @@ pub struct OcrConfig {
     pub det_min_box_area: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct OcrResult {
-    pub text: String,
-    pub confidence: f32,
-    pub warning: Option<String>,
-}
-
-pub struct TractOcrEngine {
-    det: TypedRunnableModel<TypedModel>,
-    rec: TypedRunnableModel<TypedModel>,
-    rec_alt: Option<TypedRunnableModel<TypedModel>>,
-    alphabet: Vec<String>,
-    alphabet_alt: Vec<String>,
-}
-
-impl TractOcrEngine {
-    pub fn load(cfg: &OcrConfig) -> TractResult<Self> {
-        let det = load_model(cfg.det_model_path.as_deref(), EMBED_DET_ONNX)?;
-        let rec = load_model(cfg.rec_model_path.as_deref(), EMBED_REC_ZH_ONNX)?;
-        let rec_alt = cfg
-            .rec_alt_model_path
-            .as_deref()
-            .and_then(|p| load_model(Some(p), EMBED_REC_EN_ONNX).ok());
-        let alphabet = load_dict(cfg.rec_dict_path.as_deref(), EMBED_DICT_ZH);
-        let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref(), EMBED_DICT_EN);
-        Ok(Self {
-            det,
-            rec,
-            rec_alt,
-            alphabet,
-            alphabet_alt,
-        })
-    }
-
-    pub fn infer(&self, image_bytes: &[u8], cfg: &OcrConfig) -> TractResult<OcrResult> {
-        let img = image::load_from_memory(image_bytes)?;
-        self.infer_image(&img, cfg)
-    }
-
-    fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> TractResult<OcrResult> {
-        let boxes = self.detect_text_boxes(img, cfg)?;
-        let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
-        for b in boxes {
-            let crop = crop_box(img, b);
-            let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
-            let output = self.rec.run(tvec!(rec_input.into()))?;
-            let logits = select_rec_logits(&output)?;
-            let (text, confidence) = ctc_greedy_decode(&logits, &self.alphabet);
-            if !text.trim().is_empty() {
-                lines.push((b.1, b.0, text, confidence));
-            }
-        }
-        lines.sort_by_key(|(y, x, _, _)| (*y / 8, *x));
-        let mut text = lines
-            .iter()
-            .map(|(_, _, t, _)| t.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut confidence = if lines.is_empty() {
-            0.0
-        } else {
-            lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
-        };
-        if text.trim().is_empty() {
-            let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-            let output = self.rec.run(tvec!(rec_input.into()))?;
-            let logits = select_rec_logits(&output)?;
-            let (fallback_text, fallback_confidence) = ctc_greedy_decode(&logits, &self.alphabet);
-            text = fallback_text;
-            confidence = fallback_confidence;
-            if text.trim().is_empty()
-                && let Some(rec_alt) = &self.rec_alt
-            {
-                let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-                let output = rec_alt.run(tvec!(rec_input.into()))?;
-                let logits = select_rec_logits(&output)?;
-                let (alt_text, alt_confidence) = ctc_greedy_decode(&logits, &self.alphabet_alt);
-                text = alt_text;
-                confidence = alt_confidence;
-            }
-            if text.trim().is_empty() {
-                let mut line_texts = Vec::new();
-                let mut confs = Vec::new();
-                for line in fallback_line_crops(img) {
-                    let rec_input = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
-                    let output = self.rec.run(tvec!(rec_input.into()))?;
-                    let logits = select_rec_logits(&output)?;
-                    let (t, c) = ctc_greedy_decode(&logits, &self.alphabet);
-                    if !t.trim().is_empty() {
-                        line_texts.push(t);
-                        confs.push(c);
-                    }
-                }
-                if !line_texts.is_empty() {
-                    text = line_texts.join("\n");
-                    confidence = confs.iter().sum::<f32>() / confs.len() as f32;
-                }
-            }
-        }
-        let warning = if self.alphabet.is_empty() {
-            Some("ocr-dictionary-missing".to_string())
-        } else {
-            None
-        };
-        Ok(OcrResult {
-            text,
-            confidence,
-            warning,
-        })
-    }
-}
-
-fn select_rec_logits(outputs: &TVec<TValue>) -> TractResult<tract_ndarray::ArrayViewD<'_, f32>> {
-    let mut best_idx = 0usize;
-    let mut best_score = 0usize;
-    for (i, out) in outputs.iter().enumerate() {
-        if let Ok(arr) = out.to_array_view::<f32>()
-            && arr.ndim() == 3
-        {
-            let shape = arr.shape();
-            let score = shape[1].max(shape[2]);
-            if score > best_score {
-                best_score = score;
-                best_idx = i;
-            }
-        }
-    }
-    outputs[best_idx].to_array_view::<f32>()
-}
-
 impl Default for OcrConfig {
     fn default() -> Self {
         Self {
@@ -173,49 +42,199 @@ impl Default for OcrConfig {
     }
 }
 
-fn load_model(path: Option<&str>, embedded: &[u8]) -> TractResult<TypedRunnableModel<TypedModel>> {
-    let model = if let Some(p) = path {
-        tract_onnx::onnx().model_for_path(Path::new(p))?
-    } else {
-        let mut cursor = Cursor::new(embedded);
-        tract_onnx::onnx().model_for_read(&mut cursor)?
-    };
-    model.into_optimized()?.into_runnable()
+#[derive(Debug, Clone, Default)]
+pub struct OcrResult {
+    pub text: String,
+    pub confidence: f32,
+    pub warning: Option<String>,
+}
+
+pub struct OrtOcrEngine {
+    det: OrtSession,
+    rec: OrtSession,
+    rec_alt: Option<OrtSession>,
+    alphabet: Vec<String>,
+    alphabet_alt: Vec<String>,
+}
+
+struct OrtSession {
+    session_ptr: *mut ort::OrtSession,
+    allocator_ptr: *mut ort::OrtAllocator,
+    memory_info_ptr: *mut ort::OrtMemoryInfo,
+}
+
+unsafe impl Send for OrtSession {}
+unsafe impl Sync for OrtSession {}
+
+impl Drop for OrtSession {
+    fn drop(&mut self) {
+        if !self.session_ptr.is_null() {
+            ort::release_session(self.session_ptr);
+        }
+        if !self.allocator_ptr.is_null() {
+            ort::release_allocator(self.allocator_ptr);
+        }
+        if !self.memory_info_ptr.is_null() {
+            ort::release_memory_info(self.memory_info_ptr);
+        }
+    }
+}
+
+impl OrtOcrEngine {
+    pub fn load(cfg: &OcrConfig) -> Result<Self, String> {
+        ort::ensure_initialized()?;
+
+        let det = load_ort_session(cfg.det_model_path.as_deref(), EMBED_DET_ONNX)
+            .map_err(|e| format!("det model: {e}"))?;
+        let rec = load_ort_session(cfg.rec_model_path.as_deref(), EMBED_REC_ZH_ONNX)
+            .map_err(|e| format!("rec model: {e}"))?;
+        let rec_alt = cfg
+            .rec_alt_model_path
+            .as_deref()
+            .and_then(|p| load_ort_session(Some(p), EMBED_REC_EN_ONNX).ok());
+        let alphabet = load_dict(cfg.rec_dict_path.as_deref(), EMBED_DICT_ZH);
+        let alphabet_alt = load_dict(cfg.rec_alt_dict_path.as_deref(), EMBED_DICT_EN);
+        Ok(Self {
+            det,
+            rec,
+            rec_alt,
+            alphabet,
+            alphabet_alt,
+        })
+    }
+
+    pub fn infer(&self, image_bytes: &[u8], cfg: &OcrConfig) -> Result<OcrResult, String> {
+        let img = image::load_from_memory(image_bytes).map_err(|e| format!("image decode: {e}"))?;
+        self.infer_image(&img, cfg)
+    }
+
+    fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
+        let boxes = self.detect_text_boxes(img, cfg)?;
+
+        let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
+        for b in boxes {
+            let crop = crop_box(img, b);
+            let rec_input = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
+            let output = ort::run_session(&self.rec, &[rec_input])?;
+            let logits = &output[0];
+            let (text, confidence) = ctc_greedy_decode(logits, &self.alphabet);
+            if !text.trim().is_empty() {
+                lines.push((b.1, b.0, text, confidence));
+            }
+        }
+
+        lines.sort_by_key(|(y, x, _, _)| (*y / 8, *x));
+        let mut text = lines
+            .iter()
+            .map(|(_, _, t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut confidence = if lines.is_empty() {
+            0.0
+        } else {
+            lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
+        };
+
+        if text.trim().is_empty() {
+            let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+            let output = ort::run_session(&self.rec, &[rec_input])?;
+            let logits = &output[0];
+            let (fallback_text, fallback_confidence) = ctc_greedy_decode(logits, &self.alphabet);
+            text = fallback_text;
+            confidence = fallback_confidence;
+
+            if text.trim().is_empty()
+                && let Some(rec_alt) = &self.rec_alt
+            {
+                let rec_input = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
+                let output = ort::run_session(rec_alt, &[rec_input])?;
+                let logits = &output[0];
+                let (alt_text, alt_confidence) = ctc_greedy_decode(logits, &self.alphabet_alt);
+                text = alt_text;
+                confidence = alt_confidence;
+            }
+
+            if text.trim().is_empty() {
+                let mut line_texts = Vec::new();
+                let mut confs = Vec::new();
+                for line in fallback_line_crops(img) {
+                    let rec_input = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
+                    if let Ok(output) = ort::run_session(&self.rec, &[rec_input]) {
+                        let logits = &output[0];
+                        let (t, c) = ctc_greedy_decode(logits, &self.alphabet);
+                        if !t.trim().is_empty() {
+                            line_texts.push(t);
+                            confs.push(c);
+                        }
+                    }
+                }
+                if !line_texts.is_empty() {
+                    text = line_texts.join("\n");
+                    confidence = confs.iter().sum::<f32>() / confs.len() as f32;
+                }
+            }
+        }
+
+        let warning = if self.alphabet.is_empty() {
+            Some("ocr-dictionary-missing".to_string())
+        } else {
+            None
+        };
+
+        Ok(OcrResult {
+            text,
+            confidence,
+            warning,
+        })
+    }
 }
 
 type BoxRect = (u32, u32, u32, u32);
 
-impl TractOcrEngine {
-    fn detect_text_boxes(&self, img: &DynamicImage, cfg: &OcrConfig) -> TractResult<Vec<BoxRect>> {
+impl OrtOcrEngine {
+    fn detect_text_boxes(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+    ) -> Result<Vec<BoxRect>, String> {
         let (det_input, sx, sy, w, h) = preprocess_det_image(img, cfg.det_img_side)?;
-        let output = self.det.run(tvec!(det_input.into()))?;
-        let map = output[0].to_array_view::<f32>()?;
-        let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
+        let output = ort::run_session(&self.det, &[det_input])?;
+        let map = &output[0];
+        let boxes = extract_boxes_from_map(map, cfg.det_box_thresh, cfg.det_min_box_area, w, h);
+
         let min_w = (w as f32 * 0.015).ceil() as u32;
         let min_h = (h as f32 * 0.012).ceil() as u32;
-        for b in &mut boxes {
+        let mut scaled: Vec<BoxRect> = Vec::new();
+        for b in boxes {
             let bw = (b.2 - b.0) as f32;
             let bh = (b.3 - b.1) as f32;
             let perimeter = (bw + bh) * 2.0;
             let area = bw * bh;
-            let dist = if perimeter > 0.0 { area * 1.5 / perimeter } else { 1.0f32 };
+            let dist = if perimeter > 0.0 {
+                area * 1.5 / perimeter
+            } else {
+                1.0f32
+            };
             let h_expand = (dist * sx * 0.6) as u32;
             let v_expand = (dist * sy * 0.6) as u32;
             let x0 = (b.0 as f32 * sx).round() as i32 - h_expand as i32;
             let y0 = (b.1 as f32 * sy).round() as i32 - v_expand as i32;
-            b.0 = x0.max(0) as u32;
-            b.1 = y0.max(0) as u32;
-            b.2 = ((b.2 as f32 * sx).round() as u32 + h_expand).min(w);
-            b.3 = ((b.3 as f32 * sy).round() as u32 + v_expand).min(h);
+            let x1 = ((b.2 as f32 * sx).round() as u32 + h_expand).min(w);
+            let y1 = ((b.3 as f32 * sy).round() as u32 + v_expand).min(h);
+            let x0 = x0.max(0) as u32;
+            let y0 = y0.max(0) as u32;
+            if x1 > x0 && y1 > y0 && x1 - x0 >= min_w && y1 - y0 >= min_h {
+                scaled.push((x0, y0, x1, y1));
+            }
         }
-        boxes.retain(|(x0, y0, x1, y1)| x1.saturating_sub(*x0) >= min_w && y1.saturating_sub(*y0) >= min_h);
-        boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
-        boxes.sort_by_key(|(_, y0, _, _)| *y0);
+
+        scaled.sort_by_key(|(_, y0, _, _)| *y0);
         let mut merged: Vec<BoxRect> = Vec::new();
-        for b in boxes {
+        for b in scaled {
             if let Some(last) = merged.last_mut() {
                 let y_overlap = last.1 < b.3 && b.1 < last.3;
-                let y_center_diff = ((last.1 + last.3) as i32 - (b.1 + b.3) as i32).unsigned_abs() as u32;
+                let y_center_diff =
+                    ((last.1 + last.3) as i32 - (b.1 + b.3) as i32).unsigned_abs() as u32;
                 let line_h = (last.3 - last.1).max(b.3 - b.1).max(1);
                 let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
                 if (y_overlap || y_center_diff <= line_h) && x_gap <= line_h * 3 {
@@ -228,18 +247,38 @@ impl TractOcrEngine {
             }
             merged.push(b);
         }
-        let mut boxes = merged;
-        boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
-        if boxes.is_empty() {
-            boxes.push((0, 0, w, h));
+
+        merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
+        if merged.is_empty() {
+            merged.push((0, 0, w, h));
         }
-        Ok(boxes)
+        Ok(merged)
     }
+}
+
+fn load_model_bytes(path: Option<&str>, embedded: &[u8]) -> Vec<u8> {
+    if let Some(p) = path {
+        std::fs::read(Path::new(p)).unwrap_or_else(|_| embedded.to_vec())
+    } else {
+        embedded.to_vec()
+    }
+}
+
+fn load_ort_session(path: Option<&str>, embedded: &[u8]) -> Result<OrtSession, String> {
+    let model_bytes = load_model_bytes(path, embedded);
+    let session_ptr = ort::create_session_from_memory(&model_bytes)?;
+    let allocator_ptr = ort::create_allocator()?;
+    let memory_info_ptr = ort::create_memory_info()?;
+    Ok(OrtSession {
+        session_ptr,
+        allocator_ptr,
+        memory_info_ptr,
+    })
 }
 
 fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
     let content = if let Some(p) = path {
-        fs::read_to_string(p).unwrap_or_else(|_| embedded.to_string())
+        std::fs::read_to_string(p).unwrap_or_else(|_| embedded.to_string())
     } else {
         embedded.to_string()
     };
@@ -253,58 +292,55 @@ fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
 fn preprocess_det_image(
     image: &DynamicImage,
     side: usize,
-) -> TractResult<(Tensor, f32, f32, u32, u32)> {
+) -> Result<(Vec<f32>, f32, f32, u32, u32), String> {
     let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
     let max_side = side as f32;
     let base = (src_w.max(src_h)) as f32;
-    let ratio = if base > max_side {
-        max_side / base
-    } else {
-        1.0
-    };
+    let ratio = if base > max_side { max_side / base } else { 1.0 };
     let resize_w = ((((src_w as f32) * ratio).round() as usize).max(32) / 32) * 32;
     let resize_h = ((((src_h as f32) * ratio).round() as usize).max(32) / 32) * 32;
-    let resized = image::imageops::resize(&rgb, resize_w as u32, resize_h as u32, FilterType::Triangle);
-    let pad_w = side;
-    let pad_h = side;
-    let mut data = vec![0f32; 1 * 3 * pad_h * pad_w];
+    let resized = image::imageops::resize(
+        &rgb,
+        resize_w as u32,
+        resize_h as u32,
+        FilterType::Triangle,
+    );
+
+    let mut data = vec![0f32; 1 * 3 * side * side];
     for y in 0..resize_h {
         for x in 0..resize_w {
             let px = resized.get_pixel(x as u32, y as u32);
-            let bgr = [px[2] as f32, px[1] as f32, px[0] as f32];
             let norm = [
-                (bgr[0] / 255.0 - 0.485) / 0.229,
-                (bgr[1] / 255.0 - 0.456) / 0.224,
-                (bgr[2] / 255.0 - 0.406) / 0.225,
+                (px[2] as f32 / 255.0 - 0.485) / 0.229,
+                (px[1] as f32 / 255.0 - 0.456) / 0.224,
+                (px[0] as f32 / 255.0 - 0.406) / 0.225,
             ];
             for c in 0..3 {
-                let idx = c * pad_h * pad_w + y * pad_w + x;
+                let idx = c * side * side + y * side + x;
                 data[idx] = norm[c];
             }
         }
     }
-    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, pad_h, pad_w), data)?;
+
     let sx = src_w as f32 / resize_w as f32;
     let sy = src_h as f32 / resize_h as f32;
-    Ok((arr.into_tensor(), sx, sy, src_w, src_h))
+    Ok((data, sx, sy, src_w, src_h))
 }
 
 fn extract_boxes_from_map(
-    map: &tract_ndarray::ArrayViewD<'_, f32>,
+    data: &[f32],
     thresh: f32,
     min_area: usize,
+    map_w: u32,
+    map_h: u32,
 ) -> Vec<BoxRect> {
-    if map.ndim() != 4 {
-        return Vec::new();
-    }
-    let h = map.shape()[2];
-    let w = map.shape()[3];
+    let h = map_h as usize;
+    let w = map_w as usize;
     let mut mask = vec![false; h * w];
     for y in 0..h {
         for x in 0..w {
-            let v = map[[0, 0, y, x]];
-            mask[y * w + x] = v >= thresh;
+            mask[y * w + x] = data[y * w + x] >= thresh;
         }
     }
     let mut visited = vec![false; h * w];
@@ -361,7 +397,11 @@ fn crop_box(img: &DynamicImage, b: BoxRect) -> DynamicImage {
     img.crop_imm(x0, y0, w, h)
 }
 
-fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) -> TractResult<Tensor> {
+fn preprocess_rec_image(
+    image: &DynamicImage,
+    target_h: usize,
+    target_w: usize,
+) -> Result<Vec<f32>, String> {
     let rgb = to_rgb_on_white(image);
     let (src_w, src_h) = rgb.dimensions();
     let ratio = src_w as f32 / src_h as f32;
@@ -378,16 +418,14 @@ fn preprocess_rec_image(image: &DynamicImage, target_h: usize, target_w: usize) 
     for y in 0..target_h {
         for x in 0..resized_w {
             let px = resized.get_pixel(x as u32, y as u32);
-            let bgr = [px[2], px[1], px[0]];
             for c in 0..3 {
-                let v = (bgr[c] as f32 / 255.0 - 0.5) / 0.5;
+                let v = (px[2 - c] as f32 / 255.0 - 0.5) / 0.5;
                 let idx = c * target_h * target_w + y * target_w + x;
                 data[idx] = v;
             }
         }
     }
-    let arr = tract_ndarray::Array4::from_shape_vec((1, 3, target_h, target_w), data)?;
-    Ok(arr.into_tensor())
+    Ok(data)
 }
 
 fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
@@ -467,27 +505,22 @@ fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
         .collect()
 }
 
-fn ctc_greedy_decode(logits: &tract_ndarray::ArrayViewD<'_, f32>, alphabet: &[String]) -> (String, f32) {
-    ctc_greedy_decode_with_blank(logits, alphabet, 0)
-}
-
-fn ctc_greedy_decode_with_blank(
-    logits: &tract_ndarray::ArrayViewD<'_, f32>,
-    alphabet: &[String],
-    _blank_hint: usize,
-) -> (String, f32) {
-    if logits.ndim() != 3 {
+fn ctc_greedy_decode(logits: &[f32], alphabet: &[String]) -> (String, f32) {
+    let shape = g_outer_shape(logits);
+    if shape.len() < 2 {
         return (String::new(), 0.0);
     }
-    let shape = logits.shape();
+
     let (steps, classes, channel_first) = if shape[1] > shape[2] {
         (shape[2], shape[1], true)
     } else {
         (shape[1], shape[2], false)
     };
+
     if classes <= 1 {
         return (String::new(), 0.0);
     }
+
     let blank_id = 0usize;
     let mut prev = blank_id;
     let mut text = String::new();
@@ -499,9 +532,9 @@ fn ctc_greedy_decode_with_blank(
         let mut best_val = f32::NEG_INFINITY;
         for c in 0..classes {
             let v = if channel_first {
-                logits[[0, c, t]]
+                logits[c * steps + t]
             } else {
-                logits[[0, t, c]]
+                logits[t * classes + c]
             };
             if v > best_val {
                 best_val = v;
@@ -525,6 +558,21 @@ fn ctc_greedy_decode_with_blank(
     (text, confidence)
 }
 
+fn g_outer_shape(data: &[f32]) -> Vec<usize> {
+    let total = data.len();
+    if total == 0 {
+        return vec![1, 1, total];
+    }
+    let mut shape = ort::last_known_shape();
+    let product: usize = shape.iter().skip(1).product();
+    if product > 0 {
+        shape[0] = total / product;
+    } else {
+        shape = vec![1, 1, total];
+    }
+    shape
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,7 +587,7 @@ mod tests {
     #[test]
     fn default_config_points_to_embedded_models() {
         let cfg = OcrConfig::default();
-        assert!(cfg.det_model_path.is_none(), "det model should use embedded");
-        assert!(cfg.rec_model_path.is_none(), "rec model should use embedded");
+        assert!(cfg.det_model_path.is_none());
+        assert!(cfg.rec_model_path.is_none());
     }
 }

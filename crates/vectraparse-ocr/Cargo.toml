@@ -6,4 +6,3 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp", "tiff"] }
-tract-onnx = "0.21"

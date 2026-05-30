@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use vectraparse_core::metadata::Metadata;
 use vectraparse_mime::detect_encoding;
 use vectraparse_mso_binary::{build_text_blocks, extract_legacy_mso_text};
-use vectraparse_ocr::{OcrConfig, TractOcrEngine};
+use vectraparse_ocr::{OcrConfig, OrtOcrEngine};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1241,10 +1241,10 @@ impl Parser for ImageMetadataParser {
 }
 
 
-fn ocr_engine() -> Option<&'static TractOcrEngine> {
-    static OCR_ENGINE: OnceLock<Option<TractOcrEngine>> = OnceLock::new();
+fn ocr_engine() -> Option<&'static OrtOcrEngine> {
+    static OCR_ENGINE: OnceLock<Option<OrtOcrEngine>> = OnceLock::new();
     OCR_ENGINE
-        .get_or_init(|| match TractOcrEngine::load(&OcrConfig::default()) {
+        .get_or_init(|| match OrtOcrEngine::load(&OcrConfig::default()) {
             Ok(eng) => Some(eng),
             Err(e) => {
                 eprintln!("[OCR] FAILED: {e}");
