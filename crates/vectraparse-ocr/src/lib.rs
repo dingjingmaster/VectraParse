@@ -167,8 +167,8 @@ impl Default for OcrConfig {
             rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.25,
-            det_min_box_area: 50,
+            det_box_thresh: 0.3,
+            det_min_box_area: 64,
         }
     }
 }
@@ -193,17 +193,34 @@ impl TractOcrEngine {
         let mut boxes = extract_boxes_from_map(&map, cfg.det_box_thresh, cfg.det_min_box_area);
         let min_w = (w as f32 * 0.015).ceil() as u32;
         let min_h = (h as f32 * 0.012).ceil() as u32;
+        let dilate = (w as f32 * 0.003).ceil() as u32;
         for b in &mut boxes {
-            b.0 = ((b.0 as f32) * sx).round() as u32;
-            b.1 = ((b.1 as f32) * sy).round() as u32;
-            b.2 = ((b.2 as f32) * sx).round() as u32;
-            b.3 = ((b.3 as f32) * sy).round() as u32;
-            b.0 = b.0.min(w.saturating_sub(1));
-            b.1 = b.1.min(h.saturating_sub(1));
-            b.2 = b.2.min(w);
-            b.3 = b.3.min(h);
+            b.0 = ((b.0 as f32 * sx - dilate as f32).max(0.0)) as u32;
+            b.1 = ((b.1 as f32 * sy - dilate as f32).max(0.0)) as u32;
+            b.2 = ((b.2 as f32 * sx + dilate as f32) as u32).min(w);
+            b.3 = ((b.3 as f32 * sy + dilate as f32) as u32).min(h);
         }
         boxes.retain(|(x0, y0, x1, y1)| x1.saturating_sub(*x0) >= min_w && y1.saturating_sub(*y0) >= min_h);
+        boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
+        boxes.sort_by_key(|(_, y0, _, _)| *y0);
+        let mut merged: Vec<BoxRect> = Vec::new();
+        for b in boxes {
+            if let Some(last) = merged.last_mut() {
+                let y_overlap = last.1 < b.3 && b.1 < last.3;
+                let y_center_diff = ((last.1 + last.3) as i32 - (b.1 + b.3) as i32).unsigned_abs() as u32;
+                let line_h = (last.3 - last.1).max(b.3 - b.1);
+                let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
+                if (y_overlap || y_center_diff < line_h / 2) && x_gap <= line_h * 3 {
+                    last.0 = last.0.min(b.0);
+                    last.1 = last.1.min(b.1);
+                    last.2 = last.2.max(b.2);
+                    last.3 = last.3.max(b.3);
+                    continue;
+                }
+            }
+            merged.push(b);
+        }
+        let mut boxes = merged;
         boxes.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
         if boxes.is_empty() {
             boxes.push((0, 0, w, h));
@@ -250,9 +267,9 @@ fn preprocess_det_image(
             let px = resized.get_pixel(x as u32, y as u32);
             let bgr = [px[2] as f32, px[1] as f32, px[0] as f32];
             let norm = [
-                ((bgr[0] / 255.0) - 0.485) / 0.229,
-                ((bgr[1] / 255.0) - 0.456) / 0.224,
-                ((bgr[2] / 255.0) - 0.406) / 0.225,
+                (bgr[0] / 255.0 - 0.5) / 0.5,
+                (bgr[1] / 255.0 - 0.5) / 0.5,
+                (bgr[2] / 255.0 - 0.5) / 0.5,
             ];
             for c in 0..3 {
                 let idx = c * pad_h * pad_w + y * pad_w + x;
