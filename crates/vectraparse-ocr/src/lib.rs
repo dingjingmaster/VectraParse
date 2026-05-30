@@ -168,7 +168,7 @@ impl Default for OcrConfig {
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
             det_box_thresh: 0.3,
-            det_min_box_area: 64,
+            det_min_box_area: 100,
         }
     }
 }
@@ -267,9 +267,9 @@ fn preprocess_det_image(
             let px = resized.get_pixel(x as u32, y as u32);
             let bgr = [px[2] as f32, px[1] as f32, px[0] as f32];
             let norm = [
-                (bgr[0] / 255.0 - 0.5) / 0.5,
-                (bgr[1] / 255.0 - 0.5) / 0.5,
-                (bgr[2] / 255.0 - 0.5) / 0.5,
+                (bgr[0] / 255.0 - 0.485) / 0.229,
+                (bgr[1] / 255.0 - 0.456) / 0.224,
+                (bgr[2] / 255.0 - 0.406) / 0.225,
             ];
             for c in 0..3 {
                 let idx = c * pad_h * pad_w + y * pad_w + x;
