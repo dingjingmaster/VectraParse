@@ -515,11 +515,9 @@ fn ctc_greedy_decode_with_blank(
                     continue;
                 }
                 text.push_str(ch);
-            } else {
-                text.push('?');
+                prob_sum += best_val;
+                count += 1;
             }
-            prob_sum += best_val;
-            count += 1;
         }
         prev = best_id;
     }
