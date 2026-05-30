@@ -1244,7 +1244,13 @@ impl Parser for ImageMetadataParser {
 fn ocr_engine() -> Option<&'static TractOcrEngine> {
     static OCR_ENGINE: OnceLock<Option<TractOcrEngine>> = OnceLock::new();
     OCR_ENGINE
-        .get_or_init(|| TractOcrEngine::load(&OcrConfig::default()).ok())
+        .get_or_init(|| match TractOcrEngine::load(&OcrConfig::default()) {
+            Ok(eng) => Some(eng),
+            Err(e) => {
+                eprintln!("[OCR] FAILED: {e}");
+                None
+            }
+        })
         .as_ref()
 }
 
