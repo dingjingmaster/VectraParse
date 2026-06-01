@@ -1,4 +1,6 @@
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 use vectraparse_ocr::{OcrConfig, OrtOcrEngine};
 
@@ -18,6 +20,9 @@ pub struct TextBlock {
 
 const OLE_MAGIC: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OLE_IMAGE_OCR_CANDIDATES: usize = 12;
+const MIN_OLE_IMAGE_OCR_BYTES: usize = 128;
+const MAX_OLE_IMAGE_OCR_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
     if !input.starts_with(OLE_MAGIC) {
@@ -43,7 +48,8 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
     if kind == "ole-unknown" {
         warnings.push("Unsupported".to_string());
     }
-    let (mut text, structured_ok) = extract_text_by_kind(capped_input, kind, streams.as_ref());
+    let (mut text, structured_ok, ocr_warnings) = extract_text_by_kind(capped_input, kind, streams.as_ref());
+    warnings.extend(ocr_warnings);
     if kind == "msoffice-ownerfile" {
         let normalized = normalize_ownerfile_doc_tail(&text);
         if !normalized.is_empty() && normalized.len() < text.len() {
@@ -171,20 +177,24 @@ fn detect_kind_from_streams(kind: &'static str, streams: &[OleStream]) -> &'stat
     kind
 }
 
-fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream>>) -> (String, bool) {
+fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream>>) -> (String, bool, Vec<String>) {
+    let doc_image_ocr = if kind == "doc" {
+        streams.map(|streams| extract_doc_image_ocr(streams)).unwrap_or_default()
+    } else {
+        DocImageOcrExtract::default()
+    };
     if kind == "doc"
         && let Some(streams) = streams
     {
         let mut text = extract_doc_text_structured(streams).unwrap_or_default();
-        let image_ocr = extract_doc_image_ocr_lines(streams);
-        if !image_ocr.is_empty() {
+        if !doc_image_ocr.lines.is_empty() {
             if !text.trim().is_empty() {
                 text.push('\n');
             }
-            text.push_str(&image_ocr.join("\n"));
+            text.push_str(&doc_image_ocr.lines.join("\n"));
         }
         if !text.trim().is_empty() {
-            return (text, true);
+            return (text, true, doc_image_ocr.warnings);
         }
     }
     if kind == "xls"
@@ -193,7 +203,7 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
         && !text.trim().is_empty()
         && is_high_confidence_text(&text, kind)
     {
-        return (text, true);
+        return (text, true, Vec::new());
     }
     if kind == "ppt"
         && let Some(streams) = streams
@@ -201,7 +211,7 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
         && !text.trim().is_empty()
         && is_high_confidence_text(&text, kind)
     {
-        return (text, true);
+        return (text, true, Vec::new());
     }
     let mut lines = Vec::new();
     let min_ascii = if kind == "xls" { 2 } else { 3 };
@@ -258,15 +268,10 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
     let mut cleaned = if kind == "doc" { out } else { trim_leading_noise(out) };
     cleaned = truncate_doc_tail_noise(cleaned, kind);
     cleaned = trim_trailing_noise(cleaned, kind);
-    if kind == "doc"
-        && let Some(streams) = streams
-    {
-        let image_ocr = extract_doc_image_ocr_lines(streams);
-        if !image_ocr.is_empty() {
-            cleaned.extend(image_ocr);
-        }
+    if kind == "doc" && !doc_image_ocr.lines.is_empty() {
+        cleaned.extend(doc_image_ocr.lines);
     }
-    (cleaned.join("\n"), false)
+    (cleaned.join("\n"), false, doc_image_ocr.warnings)
 }
 
 fn select_doc_scan_sources<'a>(input: &'a [u8], streams: Option<&'a Vec<OleStream>>) -> Vec<&'a [u8]> {
@@ -1905,53 +1910,102 @@ fn select_scan_bytes<'a>(input: &'a [u8], kind: &str, streams: Option<&'a Vec<Ol
     input
 }
 
-fn extract_doc_image_ocr_lines(streams: &[OleStream]) -> Vec<String> {
+#[derive(Debug, Default)]
+struct DocImageOcrExtract {
+    lines: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct DocImageOcrCandidateSummary {
+    candidates: Vec<Vec<u8>>,
+    warnings: Vec<String>,
+}
+
+fn extract_doc_image_ocr(streams: &[OleStream]) -> DocImageOcrExtract {
+    let summary = summarize_doc_image_ocr_candidates(streams);
+    if summary.candidates.is_empty() {
+        return DocImageOcrExtract {
+            lines: Vec::new(),
+            warnings: summary.warnings,
+        };
+    }
     let Some(engine) = ocr_engine() else {
-        return Vec::new();
+        let mut warnings = summary.warnings;
+        warnings.push("ole-image-ocr-model-unavailable".to_string());
+        return DocImageOcrExtract {
+            lines: Vec::new(),
+            warnings,
+        };
     };
     let cfg = OcrConfig::default();
     let mut lines = Vec::new();
-    let mut seen_keys = std::collections::HashSet::<String>::new();
-    let mut ocr_budget = 0usize;
-    for s in streams {
-        let mut candidates: Vec<&[u8]> = Vec::new();
-        if looks_like_image_stream_name(&s.name) && looks_like_image_bytes(&s.data) {
-            candidates.push(s.data.as_slice());
+    let mut warnings = summary.warnings;
+    let mut had_error = false;
+    for cand in &summary.candidates {
+        let Ok(out) = engine.infer(cand, &cfg) else {
+            had_error = true;
+            continue;
+        };
+        let text = normalize_line(&out.text);
+        if text.is_empty() {
+            continue;
         }
-        let carved = carve_embedded_images(&s.data);
-        for blob in &carved {
-            candidates.push(blob.as_slice());
-        }
-        let dib_wrapped = carve_dib_as_bmp_blobs(&s.data);
-        for blob in &dib_wrapped {
-            candidates.push(blob.as_slice());
-        }
-        for cand in candidates {
-            if ocr_budget >= 12 {
-                break;
-            }
-            if cand.len() < 128 || cand.len() > 8 * 1024 * 1024 {
+        lines.push(format!("ImageOCR: {text}"));
+    }
+    if lines.is_empty() && had_error {
+        warnings.push("ole-image-ocr-failed".to_string());
+    }
+    DocImageOcrExtract { lines, warnings }
+}
+
+fn summarize_doc_image_ocr_candidates(streams: &[OleStream]) -> DocImageOcrCandidateSummary {
+    let mut out = DocImageOcrCandidateSummary::default();
+    let mut seen_keys = std::collections::HashSet::<u64>::new();
+    let mut budget_hit = false;
+    for stream in streams {
+        for cand in collect_stream_image_candidates(stream) {
+            if !is_supported_ocr_image_bytes(&cand) {
                 continue;
             }
-            let key = format!("{}:{:02X}{:02X}{:02X}{:02X}", cand.len(), cand[0], cand[1], cand[2], cand[3]);
+            if cand.len() < MIN_OLE_IMAGE_OCR_BYTES || cand.len() > MAX_OLE_IMAGE_OCR_BYTES {
+                continue;
+            }
+            let key = image_candidate_key(&cand);
             if !seen_keys.insert(key) {
                 continue;
             }
-            let Ok(out) = engine.infer(cand, &cfg) else {
-                continue;
-            };
-            let text = normalize_line(&out.text);
-            if text.is_empty() {
+            if out.candidates.len() >= MAX_OLE_IMAGE_OCR_CANDIDATES {
+                budget_hit = true;
                 continue;
             }
-            lines.push(format!("ImageOCR: {text}"));
-            ocr_budget += 1;
-        }
-        if ocr_budget >= 12 {
-            break;
+            out.candidates.push(cand);
         }
     }
-    lines
+    if budget_hit {
+        out.warnings.push("ole-image-ocr-budget-hit".to_string());
+    }
+    out
+}
+
+fn collect_stream_image_candidates(stream: &OleStream) -> Vec<Vec<u8>> {
+    let mut candidates = Vec::new();
+    if looks_like_image_stream_name(&stream.name) && is_supported_ocr_image_bytes(&stream.data) {
+        candidates.push(stream.data.clone());
+    }
+    candidates.extend(carve_embedded_images(&stream.data));
+    candidates.extend(carve_dib_as_bmp_blobs(&stream.data));
+    candidates
+}
+
+fn image_candidate_key(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.len().hash(&mut hasher);
+    let head = data.len().min(64);
+    data[..head].hash(&mut hasher);
+    let tail_start = data.len().saturating_sub(64);
+    data[tail_start..].hash(&mut hasher);
+    hasher.finish()
 }
 
 fn carve_embedded_images(data: &[u8]) -> Vec<Vec<u8>> {
@@ -2110,6 +2164,15 @@ fn looks_like_image_bytes(data: &[u8]) -> bool {
         || data.starts_with(b"BM")
         || data.starts_with(b"II*\0")
         || data.starts_with(b"MM\0*")
+        || looks_like_webp_bytes(data)
+}
+
+fn is_supported_ocr_image_bytes(data: &[u8]) -> bool {
+    looks_like_image_bytes(data)
+}
+
+fn looks_like_webp_bytes(data: &[u8]) -> bool {
+    data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP"
 }
 
 fn ocr_engine() -> Option<&'static OrtOcrEngine> {
@@ -2653,8 +2716,9 @@ mod tests {
     use super::{
         ansi_piece_byte_len, build_text_blocks, clean_doc_text, decode_ansi_piece, decode_ppt_text_atom, detect_kind,
         decode_bytes_with_strategy, detect_kind_from_streams, extract_doc_text_from_table, extract_legacy_mso_text,
-        extract_ppt_text_structured, extract_xls_text_structured, format_excel_number, format_sheet_blocks,
-        carve_embedded_images, find_jpeg_end, find_png_end, group_ppt_slide_text, is_doc_mojibake_line, locate_clx,
+        extract_ppt_text_structured, extract_text_by_kind, extract_xls_text_structured, format_excel_number, format_sheet_blocks,
+        carve_embedded_images, find_jpeg_end, find_png_end, group_ppt_slide_text, image_candidate_key,
+        is_doc_mojibake_line, locate_clx, summarize_doc_image_ocr_candidates,
         locate_clx_in_window, looks_like_mojibake, normalize_ownerfile_doc_tail, parse_boundsheet_name,
         parse_clx_piece_table, parse_doc_fib, parse_doc_piece_table_window_from_office_core,
         parse_sst_strings_with_continue, postprocess_doc_structured_text, read_mini_chain,
@@ -3595,6 +3659,81 @@ mod tests {
         assert_eq!(blobs.len(), 2);
         assert!(blobs[0].starts_with(&[0xFF, 0xD8, 0xFF]));
         assert!(blobs[1].starts_with(b"\x89PNG\r\n\x1A\n"));
+    }
+
+    fn fake_jpeg(seed: u8) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        out.extend(std::iter::repeat_n(seed, 140));
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    fn fake_webp(seed: u8) -> Vec<u8> {
+        let payload_len = 140u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(payload_len + 4).to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend(std::iter::repeat_n(seed, payload_len as usize));
+        out
+    }
+
+    #[test]
+    fn summarizes_doc_image_ocr_candidates_dedups_and_accepts_webp() {
+        let jpg = fake_jpeg(0x11);
+        let webp = fake_webp(0x22);
+        let mut carved_payload = b"noise".to_vec();
+        carved_payload.extend_from_slice(&jpg);
+        carved_payload.extend_from_slice(b"tail");
+        let streams = vec![
+            OleStream {
+                name: "Picture 1.jpg".to_string(),
+                data: jpg.clone(),
+            },
+            OleStream {
+                name: "EmbeddedData".to_string(),
+                data: carved_payload,
+            },
+            OleStream {
+                name: "Picture 2.webp".to_string(),
+                data: webp,
+            },
+            OleStream {
+                name: "Picture 3.bin".to_string(),
+                data: vec![0u8; 256],
+            },
+        ];
+        let summary = summarize_doc_image_ocr_candidates(&streams);
+        assert_eq!(summary.candidates.len(), 2);
+        assert!(summary.warnings.is_empty());
+        assert_eq!(image_candidate_key(&summary.candidates[0]), image_candidate_key(&jpg));
+    }
+
+    #[test]
+    fn summarizes_doc_image_ocr_candidates_marks_budget_hit() {
+        let streams = (0u8..13)
+            .map(|i| OleStream {
+                name: format!("Picture {i}.jpg"),
+                data: fake_jpeg(i),
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_doc_image_ocr_candidates(&streams);
+        assert_eq!(summary.candidates.len(), crate::MAX_OLE_IMAGE_OCR_CANDIDATES);
+        assert!(summary.warnings.iter().any(|w| w == "ole-image-ocr-budget-hit"));
+    }
+
+    #[test]
+    fn extract_text_by_kind_propagates_doc_image_ocr_budget_warning() {
+        let streams = (0u8..13)
+            .map(|i| OleStream {
+                name: format!("Picture {i}.jpg"),
+                data: fake_jpeg(i),
+            })
+            .collect::<Vec<_>>();
+        let (text, structured_ok, warnings) = extract_text_by_kind(b"", "doc", Some(&streams));
+        assert!(text.is_empty());
+        assert!(!structured_ok);
+        assert!(warnings.iter().any(|w| w == "ole-image-ocr-budget-hit"));
     }
 
     #[test]
