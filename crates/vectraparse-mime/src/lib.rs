@@ -165,6 +165,48 @@ impl MagicMatcher {
                 mask: None,
             },
             MagicRule {
+                mime: "image/jpeg",
+                priority: 43,
+                offset: 0,
+                pattern: b"\xFF\xD8\xFF",
+                mask: None,
+            },
+            MagicRule {
+                mime: "image/tiff",
+                priority: 43,
+                offset: 0,
+                pattern: b"II*\0",
+                mask: None,
+            },
+            MagicRule {
+                mime: "image/tiff",
+                priority: 43,
+                offset: 0,
+                pattern: b"MM\0*",
+                mask: None,
+            },
+            MagicRule {
+                mime: "image/gif",
+                priority: 43,
+                offset: 0,
+                pattern: b"GIF87a",
+                mask: None,
+            },
+            MagicRule {
+                mime: "image/gif",
+                priority: 43,
+                offset: 0,
+                pattern: b"GIF89a",
+                mask: None,
+            },
+            MagicRule {
+                mime: "image/bmp",
+                priority: 43,
+                offset: 0,
+                pattern: b"BM",
+                mask: None,
+            },
+            MagicRule {
                 mime: "application/octet-stream",
                 priority: 1,
                 offset: 0,
@@ -275,6 +317,9 @@ pub fn detect_media_type_with_config(
     if magic == "application/x-bplist" {
         return "application/x-bplist".to_string();
     }
+    if input.len() > 12 && &input[0..4] == b"RIFF" && &input[8..12] == b"WEBP" {
+        return "image/webp".to_string();
+    }
     if magic == "application/octet-stream" {
         if let Some(plist) = detect_apple_xml_plist(input) {
             return plist.to_string();
@@ -351,6 +396,12 @@ fn media_type_from_resource_name(name: &str) -> Option<&'static str> {
         "xml" => Some("application/xml"),
         "csv" => Some("text/csv"),
         "json" => Some("application/json"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
         "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
@@ -771,6 +822,60 @@ mod tests {
                 }
             ),
             "application/pdf"
+        );
+    }
+
+    #[test]
+    fn detect_image_magic_and_resource_name_extensions() {
+        assert_eq!(
+            detect_media_type(b"\xFF\xD8\xFFrest", &DetectHints::default()),
+            "image/jpeg"
+        );
+        assert_eq!(
+            detect_media_type(b"II*\0rest", &DetectHints::default()),
+            "image/tiff"
+        );
+        assert_eq!(
+            detect_media_type(b"RIFFxxxxWEBPrest", &DetectHints::default()),
+            "image/webp"
+        );
+        assert_eq!(
+            detect_media_type(b"GIF89arest", &DetectHints::default()),
+            "image/gif"
+        );
+        assert_eq!(
+            detect_media_type(b"BMrest", &DetectHints::default()),
+            "image/bmp"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"not-magic",
+                &DetectHints {
+                    resource_name: Some("scan.JPG"),
+                    ..DetectHints::default()
+                }
+            ),
+            "image/jpeg"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"not-magic",
+                &DetectHints {
+                    resource_name: Some("diagram.tiff"),
+                    ..DetectHints::default()
+                }
+            ),
+            "image/tiff"
+        );
+        assert_eq!(
+            detect_media_type(
+                b"not-magic",
+                &DetectHints {
+                    resource_name: Some("capture.webp"),
+                    ..DetectHints::default()
+                }
+            ),
+            "image/webp"
         );
     }
 

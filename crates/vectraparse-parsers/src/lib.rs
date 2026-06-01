@@ -1155,6 +1155,8 @@ impl Parser for ImageMetadataParser {
             media_type,
             "image/jpeg"
                 | "image/tiff"
+                | "image/gif"
+                | "image/bmp"
                 | "image/bpg"
                 | "image/vnd.adobe.photoshop"
                 | "image/webp"
@@ -1176,6 +1178,10 @@ impl Parser for ImageMetadataParser {
             "jpeg"
         } else if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
             "tiff"
+        } else if input.starts_with(b"GIF87a") || input.starts_with(b"GIF89a") {
+            "gif"
+        } else if input.starts_with(b"BM") {
+            "bmp"
         } else if input.starts_with(b"BPG\xFB") {
             "bpg"
         } else if input.starts_with(b"8BPS") {
@@ -3314,6 +3320,42 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "image-corrupted-or-unknown"));
+    }
+
+    #[test]
+    fn image_metadata_parser_supports_gif_and_bmp_signatures() {
+        let p = ImageMetadataParser;
+        let gif = p.parse(b"GIF89a...", "image/gif").expect("gif");
+        assert_eq!(
+            gif.metadata
+                .values("image.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("gif")
+        );
+        assert_eq!(
+            gif.metadata
+                .values("image.mime")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("image/gif")
+        );
+
+        let bmp = p.parse(b"BM...", "image/bmp").expect("bmp");
+        assert_eq!(
+            bmp.metadata
+                .values("image.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("bmp")
+        );
+        assert_eq!(
+            bmp.metadata
+                .values("image.mime")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("image/bmp")
+        );
     }
 
     #[test]

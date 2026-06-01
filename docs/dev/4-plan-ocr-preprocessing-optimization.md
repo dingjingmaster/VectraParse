@@ -83,7 +83,7 @@
 | 步骤 | 修改内容 | 验证方式 | 状态 |
 |------|----------|----------|------|
 | 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 完成 |
-| 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 待开始 |
+| 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 完成 |
 | 3 | 增强 OCR 诊断：记录 OCR 是否启用、解码失败、det 框数、rec 空结果、fallback 命中、平均置信度和低置信度告警 | `cargo test -p vectraparse-parsers`; 用失败样本确认 warnings/metadata 能分桶 | 待开始 |
 | 4 | 增加轻量图像增强 fallback：灰度对比度拉伸、局部/全局阈值、白字黑底双路径、锐化或去噪的保守组合 | `cargo test -p vectraparse-ocr`; 低对比/暗色 UI fixture 输出非空且已知样本不回退 | 待开始 |
 | 5 | 增加多尺度与小字策略：对低分辨率或 det 空结果执行 1.5x/2x 上采样，限制最大像素和重试次数 | 定向 OCR 样本测试；记录耗时和内存上限，避免大图性能失控 | 待开始 |
@@ -120,6 +120,15 @@
   - `cargo test -p vectraparse-core structured_result_round_trip -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-parsers image_metadata_parser_records_decode_failure_bucket -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi parse_runtime_records_non_png_image_bucket_before_ocr -- --nocapture`
+- 已完成入口识别修复：
+  - `vectraparse-mime` 现已识别 `JPEG/TIFF/WebP/GIF/BMP` 的 magic，并支持常见图片扩展名回退。
+  - `vectraparse-parsers` 的 `ImageMetadataParser` 已补齐 `GIF/BMP` 支持和签名识别。
+  - `vectraparse-ffi` 的 `detect_file` 已使用文件名作为 `resource_name` hint，避免无 magic 时丢失扩展名信息。
+- 本轮验证命令：
+  - `cargo test -p vectraparse-mime detect_image_magic_and_resource_name_extensions -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-parsers image_metadata_parser_supports_gif_and_bmp_signatures -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi parse_runtime_routes_jpeg_bytes_into_image_parser -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi detect_file_uses_resource_name_extension_for_images -- --nocapture`
 
 ## 7. Plan 阶段审视
 
@@ -143,3 +152,4 @@
 |------|------|------|
 | 2026-06-01 | 创建 OCR 预处理与入口识别优化计划 | 用户要求将优化建议写成 plan |
 | 2026-06-01 | 完成执行计划步骤 1：补充最小复现分桶测试与结果解析辅助 | 为后续 OCR 入口识别和预处理优化提供稳定证据 |
+| 2026-06-01 | 完成执行计划步骤 2：补齐图片入口识别和 `GIF/BMP` 支持对齐 | 先消除“图片没进入 OCR”主路径问题 |

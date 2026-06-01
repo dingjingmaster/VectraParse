@@ -154,6 +154,10 @@ fn parse_json_runtime(bytes: &[u8], limit: usize) -> Result<String, String> {
     Ok(result.to_json())
 }
 
+fn resource_name_from_path(path: &str) -> Option<&str> {
+    std::path::Path::new(path).file_name()?.to_str()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vectraparse_create_handle(out: *mut *mut VectraParseHandle) -> VectraParseError {
     if out.is_null() {
@@ -267,7 +271,14 @@ pub extern "C" fn vectraparse_detect_file(
     let limit = resolve_limit(options);
     let run = catch_unwind(AssertUnwindSafe(|| {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        detect_json_runtime(&bytes, &DetectHints::default(), limit)
+        detect_json_runtime(
+            &bytes,
+            &DetectHints {
+                resource_name: resource_name_from_path(path),
+                ..DetectHints::default()
+            },
+            limit,
+        )
     }));
     match run {
         Ok(Ok(json)) => alloc_json_result(json, out),
@@ -331,7 +342,7 @@ pub extern "C" fn vectraparse_capabilities_json(out: *mut VectraParseResult) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_json_runtime,
+        parse_json_runtime, resource_name_from_path,
         vectraparse_capabilities_json, vectraparse_create_handle, vectraparse_destroy_handle,
         vectraparse_detect, vectraparse_detect_with_hints, vectraparse_parse, vectraparse_result_free,
         VectraParseError, VectraParseHandle, VectraParseOptions, VectraParseResult,
@@ -453,18 +464,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_runtime_records_non_png_image_bucket_before_ocr() {
+    fn parse_runtime_routes_jpeg_bytes_into_image_parser() {
         let out = parse_runtime_result(b"\xFF\xD8\xFFJFIF\x00rest-of-sample");
-        assert_eq!(out.mime_type, "application/octet-stream");
-        assert!(out.content.as_deref().is_some());
-        assert_eq!(out.warnings, Vec::<String>::new());
-        assert_eq!(out.parser_chain, vec!["StringsParser".to_string()]);
+        assert_eq!(out.mime_type, "image/jpeg");
+        assert_eq!(out.content, None);
+        assert_eq!(out.parser_chain, vec!["ImageMetadataParser".to_string()]);
+        assert!(out.warnings.iter().any(|w| {
+            w == "image-ocr-failed" || w == "image-ocr-model-unavailable"
+        }));
         assert_eq!(
             out.metadata
-                .values("strings.charset")
+                .values("image.format")
                 .and_then(|vals| vals.first())
                 .map(String::as_str),
-            Some("ascii+latin1")
+            Some("jpeg")
         );
+    }
+
+    #[test]
+    fn detect_file_uses_resource_name_extension_for_images() {
+        assert_eq!(resource_name_from_path("/tmp/example.JPG"), Some("example.JPG"));
     }
 }
