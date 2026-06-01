@@ -1,0 +1,2 @@
+# id	trace_json	expected_json
+sample_trace	tests/golden/ocr/trace/sample_trace.json	tests/golden/ocr/expected/sample_trace.expected.json

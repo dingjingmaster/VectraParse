@@ -542,6 +542,21 @@
   - 单测覆盖 trace line 的 bbox/source/crop_size 和 JSON 文本转义；parser metadata 覆盖 trace line count 与 trace JSON。
   - 验证已执行 `cargo test -p vectraparse-ocr`、`cargo test -p vectraparse-parsers ocr_success_metadata_records_fallback_and_low_confidence`、`cargo check -p vectraparse-ffi`、`rustfmt --check` 和 `git diff --check`。
 
+## 7.13 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮新增独立 OCR trace golden 校验脚本和合成 trace fixture，不触碰 OCR 模型、字典、ORT FFI、构建链接或动态库导出接口。
+  - golden 样例只使用合成文本 `Alpha/Beta` 和合成 bbox，不包含真实截图业务内容。
+- 高级产品：
+  - 本轮补齐第 2 步 golden 评估入口：可用 manifest 指向 trace JSON 和期望规则，校验行数、区域数、source、bbox、crop_size、confidence、must-have 和 must-not-have。
+  - 该入口先验证 trace 结构和规则机制；真实截图样本需要后续在外部明确授权后再加入 manifest。
+- 高级架构师：
+  - 未新增 Rust 依赖，脚本基于 Python 标准库解析 JSON；与现有 `scripts/golden_validate.sh` 并行存在，不改变现有 golden 主流程。
+  - 规则文件采用 JSON，便于后续扩展候选仲裁、回归阈值和样本分组。
+- 高级工程师：
+  - 验证已执行 `python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、`cargo test -p vectraparse-ocr`、`cargo check -p vectraparse-ffi` 和 `git diff --check`。
+  - 当前脚本不运行 OCR 模型，只比较已生成的 trace JSON；后续如要端到端生成 trace，需要单独接入 `extract-static` 或 Rust 测试入口。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -573,3 +588,4 @@
 | 2026-06-01 | 增加页面区域预切分补充识别 | 基于检测框横向分布对复杂截图做受限区域 det/rec，并清理测试中的真实样本文本以保持泛化约束 |
 | 2026-06-01 | 增加视觉布局页面区域候选 | 通过图像边缘/前景列投影生成多栏页面区域，降低初始 det 框漏检时的召回依赖 |
 | 2026-06-01 | 增加 OCR trace JSON | 输出行级 source/bbox/crop_size/confidence/text 诊断信息，为后续 golden 和候选仲裁提供依据 |
+| 2026-06-01 | 增加 OCR trace golden 入口 | 用 manifest + expected JSON 校验 trace 行级 source、bbox、crop_size、confidence 和 must-have/must-not-have 规则 |

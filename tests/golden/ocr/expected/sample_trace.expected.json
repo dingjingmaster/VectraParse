@@ -1,0 +1,28 @@
+{
+  "selected_source": "det",
+  "line_count": {
+    "eq": 2
+  },
+  "region_count": {
+    "eq": 1
+  },
+  "must_have": [
+    {
+      "text": "Alpha",
+      "source": "det",
+      "bbox": [10, 20, 90, 38],
+      "crop_size": [80, 18],
+      "min_confidence": 0.85
+    },
+    {
+      "contains": "Bet",
+      "source": "page-region:1",
+      "min_confidence": 0.75
+    }
+  ],
+  "must_not_have": [
+    {
+      "contains": "Noise"
+    }
+  ]
+}

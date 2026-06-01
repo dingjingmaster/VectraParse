@@ -1,0 +1,66 @@
+{
+  "image": {
+    "width": 320,
+    "height": 180,
+    "source_has_alpha": false
+  },
+  "summary": {
+    "det_box_count": 2,
+    "line_count": 2,
+    "region_count": 1,
+    "color_region_count": 0,
+    "det_pass_count": 1,
+    "fallback_attempt_count": 0,
+    "detect_used_whole_image_box": false,
+    "empty_result": false,
+    "confidence": 0.8400,
+    "selected_source": "det"
+  },
+  "regions": [
+    {
+      "index": 0,
+      "bbox": [10, 20, 180, 70],
+      "confidence": 0.8400,
+      "source": "det",
+      "text": "Alpha\nBeta",
+      "lines": [
+        {
+          "index": 0,
+          "bbox": [10, 20, 90, 38],
+          "crop_size": [80, 18],
+          "confidence": 0.8800,
+          "source": "det",
+          "text": "Alpha"
+        },
+        {
+          "index": 1,
+          "bbox": [12, 48, 180, 70],
+          "crop_size": [168, 22],
+          "confidence": 0.8000,
+          "source": "page-region:1",
+          "text": "Beta"
+        }
+      ]
+    }
+  ],
+  "lines": [
+    {
+      "region_index": 0,
+      "line_index": 0,
+      "bbox": [10, 20, 90, 38],
+      "crop_size": [80, 18],
+      "confidence": 0.8800,
+      "source": "det",
+      "text": "Alpha"
+    },
+    {
+      "region_index": 0,
+      "line_index": 1,
+      "bbox": [12, 48, 180, 70],
+      "crop_size": [168, 22],
+      "confidence": 0.8000,
+      "source": "page-region:1",
+      "text": "Beta"
+    }
+  ]
+}
