@@ -13,6 +13,7 @@ const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
 const MAX_COLOR_REGION_CANDIDATES: usize = 48;
+const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
@@ -241,7 +242,6 @@ impl OrtOcrEngine {
         let mut region_count = detected.recognized.region_count;
         let mut layout_applied = detected.recognized.layout_applied;
         let mut regions = detected.recognized.regions;
-        let mut color_region_count = 0usize;
         let mut fallback = None;
         let mut trace = OcrTrace {
             selected_source: if text.trim().is_empty() {
@@ -252,6 +252,30 @@ impl OrtOcrEngine {
             det_pass_count: 1,
             fallback_attempt_count: 0,
         };
+
+        let (candidate_count, candidate) = self.recognize_color_regions_limited(
+            img,
+            cfg,
+            MAX_EAGER_COLOR_REGION_RECOGNITIONS,
+            "color-region:eager",
+        );
+        let mut color_region_count = candidate_count;
+        let candidate = if text.trim().is_empty() {
+            candidate
+        } else {
+            filter_non_overlapping_recognized(&candidate, &regions)
+        };
+        maybe_adopt_recognized(
+            &mut text,
+            &mut confidence,
+            &mut line_count,
+            &mut region_count,
+            &mut layout_applied,
+            &mut regions,
+            &mut fallback,
+            "color-regions:eager".to_string(),
+            &candidate,
+        );
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
             self.apply_quality_fallbacks(
@@ -533,7 +557,7 @@ impl OrtOcrEngine {
 
         trace.fallback_attempt_count += 1;
         let (candidate_count, candidate) = self.recognize_color_regions(img, cfg);
-        *color_region_count = candidate_count;
+        *color_region_count = (*color_region_count).max(candidate_count);
         maybe_adopt_recognized(
             text,
             confidence,
@@ -744,9 +768,19 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
     ) -> (usize, RecognizedText) {
+        self.recognize_color_regions_limited(img, cfg, MAX_COLOR_REGION_CANDIDATES, "color-region")
+    }
+
+    fn recognize_color_regions_limited(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        recognition_limit: usize,
+        source: &str,
+    ) -> (usize, RecognizedText) {
         let boxes = color_region_boxes(img);
         let mut lines = Vec::new();
-        for b in boxes.iter() {
+        for b in boxes.iter().take(recognition_limit) {
             let Some(binary) = binarize_color_region_foreground(img, *b) else {
                 continue;
             };
@@ -757,7 +791,7 @@ impl OrtOcrEngine {
                     bbox: *b,
                     text: normalize_recognized_text(&candidate.text),
                     confidence: candidate.confidence,
-                    source: "color-region".to_string(),
+                    source: source.to_string(),
                 });
             }
         }
@@ -1308,7 +1342,7 @@ fn color_region_boxes_from_rgb(rgb: &image::RgbImage) -> Vec<BoxRect> {
 
     let total = w.saturating_mul(h);
     let mut keys = vec![0u16; total];
-    let mut counts = [0usize; 512];
+    let mut counts = [0usize; 4096];
     for y in 0..h {
         for x in 0..w {
             let key = quantized_color_key(rgb.get_pixel(x as u32, y as u32));
@@ -1417,10 +1451,10 @@ fn expand_color_region_box(
 }
 
 fn quantized_color_key(pixel: &image::Rgb<u8>) -> u16 {
-    let r = (pixel[0] >> 5) as u16;
-    let g = (pixel[1] >> 5) as u16;
-    let b = (pixel[2] >> 5) as u16;
-    (r << 6) | (g << 3) | b
+    let r = (pixel[0] >> 4) as u16;
+    let g = (pixel[1] >> 4) as u16;
+    let b = (pixel[2] >> 4) as u16;
+    (r << 8) | (g << 4) | b
 }
 
 fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<DynamicImage> {
@@ -1467,14 +1501,10 @@ fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<
 
 fn estimate_region_background_rgb(rgb: &image::RgbImage) -> [u8; 3] {
     let (w, h) = rgb.dimensions();
-    let mut counts = [0usize; 512];
-    let mut sums = [[0u64; 3]; 512];
+    let mut counts = [0usize; 4096];
+    let mut sums = [[0u64; 3]; 4096];
     for y in 0..h {
         for x in 0..w {
-            let border = x == 0 || y == 0 || x + 1 == w || y + 1 == h;
-            if !border {
-                continue;
-            }
             let p = rgb.get_pixel(x, y);
             let key = quantized_color_key(p) as usize;
             counts[key] += 1;
@@ -1642,6 +1672,68 @@ fn maybe_adopt_recognized(
     }
 
     false
+}
+
+fn filter_non_overlapping_recognized(
+    candidate: &RecognizedText,
+    existing_regions: &[OcrTextRegion],
+) -> RecognizedText {
+    let existing_boxes = collect_region_line_boxes(existing_regions);
+    if existing_boxes.is_empty() {
+        return candidate.clone();
+    }
+
+    let mut lines = Vec::new();
+    for region in &candidate.regions {
+        for line in &region.lines {
+            let bbox = box_from_array(line.bbox);
+            if existing_boxes
+                .iter()
+                .any(|existing| boxes_significantly_overlap(bbox, *existing))
+            {
+                continue;
+            }
+            lines.push(TextLine {
+                bbox,
+                text: line.text.clone(),
+                confidence: line.confidence,
+                source: line.source.clone(),
+            });
+        }
+    }
+
+    recognized_from_text_lines(&mut lines)
+}
+
+fn collect_region_line_boxes(regions: &[OcrTextRegion]) -> Vec<BoxRect> {
+    let mut boxes = Vec::new();
+    for region in regions {
+        if region.lines.is_empty() {
+            boxes.push(box_from_array(region.bbox));
+            continue;
+        }
+        for line in &region.lines {
+            boxes.push(box_from_array(line.bbox));
+        }
+    }
+    boxes
+}
+
+fn box_from_array(b: [u32; 4]) -> BoxRect {
+    (b[0], b[1], b[2], b[3])
+}
+
+fn boxes_significantly_overlap(a: BoxRect, b: BoxRect) -> bool {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = a.2.min(b.2);
+    let y1 = a.3.min(b.3);
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    let area = box_area((x0, y0, x1, y1));
+    let min_area = box_area(a).min(box_area(b)).max(1);
+    area as f32 / min_area as f32 >= 0.50
 }
 
 fn merge_confidence(
@@ -3462,6 +3554,33 @@ mod tests {
     }
 
     #[test]
+    fn eager_color_regions_skip_existing_text_boxes() {
+        let existing_regions = vec![OcrTextRegion {
+            bbox: [10, 10, 70, 26],
+            text: "Header".to_string(),
+            confidence: 0.78,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 70, 26],
+                text: "Header".to_string(),
+                confidence: 0.78,
+                source: "det".to_string(),
+            }],
+        }];
+        let mut candidate_lines = vec![
+            text_line((6, 6, 76, 30), "Header noise", 0.64),
+            text_line((120, 10, 180, 26), "New item", 0.66),
+        ];
+        let candidate = recognized_from_text_lines(&mut candidate_lines);
+        let filtered = filter_non_overlapping_recognized(&candidate, &existing_regions);
+
+        assert_eq!(filtered.text, "New item");
+        assert_eq!(filtered.line_count, 1);
+        assert_eq!(filtered.regions.len(), 1);
+        assert_eq!(filtered.regions[0].bbox, [120, 10, 180, 26]);
+    }
+
+    #[test]
     fn layout_regions_keep_columns_separate() {
         let mut lines = vec![
             text_line((0, 0, 90, 12), "Left A", 0.80),
@@ -3503,6 +3622,56 @@ mod tests {
         assert!(boxes.iter().any(|b| {
             b.0 <= 30 && b.1 <= 20 && b.2 >= 130 && b.3 >= 50 && box_area(*b) < 160 * 80
         }));
+    }
+
+    #[test]
+    fn color_region_boxes_detects_subtle_light_panel() {
+        let mut rgb = image::RgbImage::from_pixel(160, 80, image::Rgb([246, 247, 249]));
+        for y in 20..50 {
+            for x in 30..130 {
+                rgb.put_pixel(x, y, image::Rgb([228, 231, 235]));
+            }
+        }
+        for y in 31..37 {
+            for x in 48..112 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        let boxes = color_region_boxes(&DynamicImage::ImageRgb8(rgb));
+        assert!(boxes.iter().any(|b| {
+            b.0 <= 30 && b.1 <= 20 && b.2 >= 130 && b.3 >= 50 && box_area(*b) < 160 * 80
+        }));
+    }
+
+    #[test]
+    fn color_region_binarization_handles_padded_light_panel() {
+        let mut rgb = image::RgbImage::from_pixel(160, 80, image::Rgb([246, 247, 249]));
+        for y in 20..50 {
+            for x in 30..130 {
+                rgb.put_pixel(x, y, image::Rgb([228, 231, 235]));
+            }
+        }
+        for y in 31..37 {
+            for x in 48..112 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = color_region_boxes(&DynamicImage::ImageRgb8(rgb.clone()));
+        let panel = boxes
+            .into_iter()
+            .find(|b| b.0 <= 30 && b.1 <= 20 && b.2 >= 130 && b.3 >= 50)
+            .expect("light panel candidate");
+        let binary = binarize_color_region_foreground(&DynamicImage::ImageRgb8(rgb), panel)
+            .expect("binary region");
+        let gray = binary.to_luma8();
+        let panel_bg_x = 35u32.saturating_sub(panel.0);
+        let panel_bg_y = 24u32.saturating_sub(panel.1);
+        let text_x = 64u32.saturating_sub(panel.0);
+        let text_y = 33u32.saturating_sub(panel.1);
+
+        assert_eq!(gray.get_pixel(panel_bg_x, panel_bg_y)[0], 255);
+        assert_eq!(gray.get_pixel(text_x, text_y)[0], 0);
     }
 
     #[test]
