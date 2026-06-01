@@ -481,7 +481,7 @@ impl OrtOcrEngine {
         cfg: &OcrConfig,
         base_boxes: &[DetectionBox],
     ) -> Result<(usize, RecognizedText), String> {
-        let region_boxes = page_region_boxes_from_detection_boxes(base_boxes, img.dimensions());
+        let region_boxes = page_region_boxes(img, base_boxes);
         let trace_enabled = ocr_trace_enabled();
         if trace_enabled {
             eprintln!("[OCR_TRACE] page-regions candidates={}", region_boxes.len());
@@ -504,7 +504,7 @@ impl OrtOcrEngine {
                 );
             }
             let crop = crop_box(img, *region_box);
-            let source = format!("det-page-region:{}", idx + 1);
+            let source = format!("page-region:{}", idx + 1);
             let detected = self.recognize_detected_text(
                 &crop,
                 cfg,
@@ -2449,6 +2449,213 @@ fn raw_box_is_split_candidate(raw: BoxRect, merged: BoxRect) -> bool {
     box_width(raw) + 8 < box_width(merged)
 }
 
+fn page_region_boxes(image: &DynamicImage, detection_boxes: &[DetectionBox]) -> Vec<BoxRect> {
+    let mut boxes = visual_page_region_boxes(image);
+    let det_boxes = page_region_boxes_from_detection_boxes(detection_boxes, image.dimensions());
+    if boxes.is_empty() {
+        boxes = det_boxes;
+    } else {
+        for det_box in det_boxes {
+            if boxes.len() >= MAX_PAGE_REGION_DET_PASSES {
+                break;
+            }
+            if boxes
+                .iter()
+                .any(|existing| boxes_significantly_overlap(*existing, det_box))
+            {
+                continue;
+            }
+            boxes.push(det_box);
+        }
+        boxes.sort_by_key(|b| (b.0, b.1));
+    }
+    boxes.truncate(MAX_PAGE_REGION_DET_PASSES);
+    boxes
+}
+
+fn visual_page_region_boxes(image: &DynamicImage) -> Vec<BoxRect> {
+    let rgb = to_rgb_on_white(image);
+    let (src_w, src_h) = rgb.dimensions();
+    if src_w < 640 || src_h < 240 {
+        return Vec::new();
+    }
+
+    let pixels = (src_w as u64).saturating_mul(src_h as u64);
+    let (work, sx, sy) = if pixels > MAX_COLOR_REGION_PIXELS {
+        let scale = (MAX_COLOR_REGION_PIXELS as f64 / pixels as f64).sqrt() as f32;
+        let target_w = ((src_w as f32) * scale).round().max(1.0) as u32;
+        let target_h = ((src_h as f32) * scale).round().max(1.0) as u32;
+        let resized = image::imageops::resize(&rgb, target_w, target_h, FilterType::Triangle);
+        (
+            resized,
+            src_w as f32 / target_w.max(1) as f32,
+            src_h as f32 / target_h.max(1) as f32,
+        )
+    } else {
+        (rgb, 1.0, 1.0)
+    };
+
+    let (w, h) = work.dimensions();
+    let Some(mask) = visual_layout_edge_mask_from_rgb(&work) else {
+        return Vec::new();
+    };
+    visual_page_region_boxes_from_mask(&mask, w as usize, h as usize)
+        .into_iter()
+        .map(|b| {
+            let x0 = ((b.0 as f32) * sx).floor().max(0.0) as u32;
+            let y0 = ((b.1 as f32) * sy).floor().max(0.0) as u32;
+            let x1 = ((b.2 as f32) * sx).ceil().min(src_w as f32) as u32;
+            let y1 = ((b.3 as f32) * sy).ceil().min(src_h as f32) as u32;
+            clamp_box((x0, y0, x1, y1), src_w, src_h)
+        })
+        .collect()
+}
+
+fn visual_layout_edge_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    let (w_u32, h_u32) = rgb.dimensions();
+    let w = w_u32 as usize;
+    let h = h_u32 as usize;
+    if w < 8 || h < 8 {
+        return None;
+    }
+
+    let mut mask = vec![false; w.saturating_mul(h)];
+    let mut active = 0usize;
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let left = rgb.get_pixel((x - 1) as u32, y as u32);
+            let right = rgb.get_pixel((x + 1) as u32, y as u32);
+            let up = rgb.get_pixel(x as u32, (y - 1) as u32);
+            let down = rgb.get_pixel(x as u32, (y + 1) as u32);
+            let edge = color_distance_u8(left, [right[0], right[1], right[2]]) >= 24
+                || color_distance_u8(up, [down[0], down[1], down[2]]) >= 24
+                || luma_abs_diff(left, right) >= 18
+                || luma_abs_diff(up, down) >= 18;
+            if edge {
+                mask[y * w + x] = true;
+                active += 1;
+            }
+        }
+    }
+
+    let total = w.saturating_mul(h).max(1);
+    let ratio = active as f32 / total as f32;
+    if active < h.max(32) || !(0.0005..=0.28).contains(&ratio) {
+        return None;
+    }
+    Some(mask)
+}
+
+fn luma_abs_diff(a: &image::Rgb<u8>, b: &image::Rgb<u8>) -> u8 {
+    luma_u8(a).abs_diff(luma_u8(b))
+}
+
+fn luma_u8(pixel: &image::Rgb<u8>) -> u8 {
+    ((pixel[0] as u16 * 30 + pixel[1] as u16 * 59 + pixel[2] as u16 * 11) / 100) as u8
+}
+
+fn visual_page_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) -> Vec<BoxRect> {
+    if w < 80 || h < 80 || mask.len() != w.saturating_mul(h) {
+        return Vec::new();
+    }
+
+    let mut col_score = vec![0usize; w];
+    for x in 0..w {
+        let mut count = 0usize;
+        for y in 0..h {
+            if mask[y * w + x] {
+                count += 1;
+            }
+        }
+        col_score[x] = count;
+    }
+
+    let radius = (w / 320).clamp(2, 8);
+    let mut smooth = vec![0usize; w];
+    for (x, value) in smooth.iter_mut().enumerate() {
+        let x0 = x.saturating_sub(radius);
+        let x1 = (x + radius + 1).min(w);
+        *value = col_score[x0..x1].iter().sum::<usize>() / (x1 - x0).max(1);
+    }
+
+    let max_score = smooth.iter().copied().max().unwrap_or(0);
+    if max_score < 3 {
+        return Vec::new();
+    }
+    let active_threshold = ((max_score as f32) * 0.08)
+        .ceil()
+        .max((h as f32 / 700.0).ceil())
+        .max(2.0) as usize;
+    let bridge_gap = (w / 24).clamp(40, 110);
+    let min_band_width = (w / 18).clamp(80, 220);
+
+    let mut bands: Vec<(usize, usize, u64)> = Vec::new();
+    let mut x = 0usize;
+    while x < w {
+        if smooth[x] < active_threshold {
+            x += 1;
+            continue;
+        }
+
+        let start = x;
+        let mut end = x;
+        let mut gap = 0usize;
+        let mut score = 0u64;
+        while x < w {
+            if smooth[x] >= active_threshold {
+                end = x;
+                gap = 0;
+                score = score.saturating_add(smooth[x] as u64);
+            } else {
+                gap += 1;
+                if gap > bridge_gap {
+                    break;
+                }
+            }
+            x += 1;
+        }
+
+        if end.saturating_sub(start) + 1 >= min_band_width && score > 0 {
+            bands.push((start, end, score));
+        }
+    }
+
+    if bands.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for idx in 0..bands.len() {
+        let (band_x0, band_x1, score) = bands[idx];
+        let x0 = if idx == 0 {
+            0
+        } else {
+            (bands[idx - 1].1.saturating_add(band_x0)) / 2
+        };
+        let x1 = if idx + 1 == bands.len() {
+            w
+        } else {
+            (band_x1.saturating_add(bands[idx + 1].0)) / 2
+        };
+        let b = clamp_box((x0 as u32, 0, x1 as u32, h as u32), w as u32, h as u32);
+        let region_width = box_width(b);
+        if region_width < min_band_width as u32
+            || region_width.saturating_mul(100) > (w as u32).saturating_mul(92)
+        {
+            continue;
+        }
+        candidates.push((b, score));
+    }
+
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    candidates.sort_by_key(|(b, _)| (b.0, b.1));
+    candidates.into_iter().map(|(b, _)| b).collect()
+}
+
 fn page_region_boxes_from_detection_boxes(
     boxes: &[DetectionBox],
     dimensions: (u32, u32),
@@ -4064,6 +4271,42 @@ mod tests {
     }
 
     #[test]
+    fn visual_page_region_boxes_split_edge_rich_columns() {
+        let mut rgb = image::RgbImage::from_pixel(900, 240, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture(&mut rgb, 30, 220);
+        draw_synthetic_text_texture(&mut rgb, 330, 530);
+        draw_synthetic_text_texture(&mut rgb, 650, 840);
+
+        let regions = visual_page_region_boxes(&DynamicImage::ImageRgb8(rgb));
+
+        assert_eq!(regions.len(), 3);
+        assert!(regions[0].2 <= regions[1].0);
+        assert!(regions[1].2 <= regions[2].0);
+    }
+
+    #[test]
+    fn visual_page_region_boxes_skip_single_dense_column() {
+        let mut rgb = image::RgbImage::from_pixel(900, 240, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture(&mut rgb, 40, 860);
+
+        let regions = visual_page_region_boxes(&DynamicImage::ImageRgb8(rgb));
+
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn page_region_boxes_can_use_visual_candidates_without_detection_boxes() {
+        let mut rgb = image::RgbImage::from_pixel(900, 240, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture(&mut rgb, 30, 220);
+        draw_synthetic_text_texture(&mut rgb, 330, 530);
+        draw_synthetic_text_texture(&mut rgb, 650, 840);
+
+        let regions = page_region_boxes(&DynamicImage::ImageRgb8(rgb), &[]);
+
+        assert_eq!(regions.len(), 3);
+    }
+
+    #[test]
     fn page_region_boxes_skip_small_or_simple_images() {
         let boxes = vec![
             detection_box((28, 20, 150, 38)),
@@ -4652,6 +4895,22 @@ mod tests {
         DetectionBox {
             bbox,
             alternatives: Vec::new(),
+        }
+    }
+
+    fn draw_synthetic_text_texture(rgb: &mut image::RgbImage, x0: u32, x1: u32) {
+        let dark = image::Rgb([24, 24, 24]);
+        for row in 0..10u32 {
+            let y = 24 + row * 18;
+            let mut x = x0 + (row % 3) * 5;
+            while x + 16 < x1 {
+                for yy in y..(y + 5).min(rgb.height()) {
+                    for xx in x..(x + 16).min(rgb.width()) {
+                        rgb.put_pixel(xx, yy, dark);
+                    }
+                }
+                x += 28;
+            }
         }
     }
 }
