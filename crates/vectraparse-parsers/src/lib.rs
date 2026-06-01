@@ -3317,6 +3317,27 @@ mod tests {
     }
 
     #[test]
+    fn image_metadata_parser_records_decode_failure_bucket() {
+        let p = ImageMetadataParser;
+        let out = p.parse(b"not-an-image", "image/png").expect("image");
+        assert_eq!(out.content, None);
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w == "image-corrupted-or-unknown"));
+        assert!(out.warnings.iter().any(|w| {
+            w == "image-ocr-failed" || w == "image-ocr-model-unavailable"
+        }));
+        assert_eq!(
+            out.metadata
+                .values("image.mime")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("image/png")
+        );
+    }
+
+    #[test]
     fn audio_metadata_parser_extracts_mp3_tags() {
         let p = AudioMetadataParser;
         let out = p

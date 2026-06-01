@@ -82,7 +82,7 @@
 
 | 步骤 | 修改内容 | 验证方式 | 状态 |
 |------|----------|----------|------|
-| 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 待开始 |
+| 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 完成 |
 | 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 待开始 |
 | 3 | 增强 OCR 诊断：记录 OCR 是否启用、解码失败、det 框数、rec 空结果、fallback 命中、平均置信度和低置信度告警 | `cargo test -p vectraparse-parsers`; 用失败样本确认 warnings/metadata 能分桶 | 待开始 |
 | 4 | 增加轻量图像增强 fallback：灰度对比度拉伸、局部/全局阈值、白字黑底双路径、锐化或去噪的保守组合 | `cargo test -p vectraparse-ocr`; 低对比/暗色 UI fixture 输出非空且已知样本不回退 | 待开始 |
@@ -113,6 +113,14 @@
   - 预处理增强可能提升召回但带来误识别和重复文本，需要用置信度、字符集检查和 fallback 选择控制。
   - 不更换模型的前提下，极端模糊、严重透视、手写字或超低分辨率图片仍可能无法可靠提取。
 
+当前验证记录：
+- 已固化最小复现桶 1：JPEG 字节在当前 FFI `parse_json_runtime` 路径中被识别为 `application/octet-stream`，`parser_chain=["StringsParser"]`，证明“未进入 OCR”现象可稳定复现。
+- 已固化最小复现桶 2：损坏图片在 `ImageMetadataParser` 路径中返回 `image-corrupted-or-unknown`，并伴随 `image-ocr-failed` 或 `image-ocr-model-unavailable`，证明“图片解码失败/无法进入识别”现象可稳定复现。
+- 本轮验证命令：
+  - `cargo test -p vectraparse-core structured_result_round_trip -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-parsers image_metadata_parser_records_decode_failure_bucket -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi parse_runtime_records_non_png_image_bucket_before_ocr -- --nocapture`
+
 ## 7. Plan 阶段审视
 
 - 安全审查员：
@@ -134,3 +142,4 @@
 | 日期 | 变更 | 原因 |
 |------|------|------|
 | 2026-06-01 | 创建 OCR 预处理与入口识别优化计划 | 用户要求将优化建议写成 plan |
+| 2026-06-01 | 完成执行计划步骤 1：补充最小复现分桶测试与结果解析辅助 | 为后续 OCR 入口识别和预处理优化提供稳定证据 |

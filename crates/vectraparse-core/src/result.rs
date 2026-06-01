@@ -65,6 +65,8 @@ impl StructuredResult {
     pub fn from_json(input: &str) -> Option<Self> {
         let mime = extract_json_string(input, "mime_type")?;
         let content = extract_json_nullable_string(input, "content")?;
+        let metadata = extract_json_object(input, "metadata")
+            .and_then(|raw| Metadata::from_json(&raw).ok())?;
         let warnings = extract_json_string_array(input, "warnings")?;
         let errors = extract_json_string_array(input, "errors")?;
         let parser_chain = extract_json_string_array(input, "parser_chain")?;
@@ -73,7 +75,7 @@ impl StructuredResult {
         Some(Self {
             mime_type: mime,
             content,
-            metadata: Metadata::default(),
+            metadata,
             embedded: Vec::new(),
             warnings,
             errors,
@@ -134,6 +136,46 @@ fn extract_json_string_array(input: &str, key: &str) -> Option<Vec<String>> {
     )
 }
 
+fn extract_json_object(input: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let start = input.find(&needle)? + needle.len();
+    let rest = input[start..].trim_start();
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in rest.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(rest[..=idx].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_json_u32(input: &str, key: &str) -> Option<u32> {
     let needle = format!("\"{key}\":");
     let start = input.find(&needle)? + needle.len();
@@ -147,12 +189,18 @@ fn extract_json_u32(input: &str, key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{ParseTiming, StructuredResult};
+    use crate::metadata::Metadata;
 
     #[test]
     fn structured_result_round_trip() {
         let src = StructuredResult {
             mime_type: "text/plain".to_string(),
             content: Some("hello".to_string()),
+            metadata: {
+                let mut md = Metadata::default();
+                md.insert("k", "v");
+                md
+            },
             warnings: vec!["w1".to_string()],
             errors: vec![],
             parser_chain: vec!["TextParser".to_string()],
@@ -166,6 +214,14 @@ mod tests {
         let parsed = StructuredResult::from_json(&json).expect("parse");
         assert_eq!(parsed.mime_type, "text/plain");
         assert_eq!(parsed.content.as_deref(), Some("hello"));
+        assert_eq!(
+            parsed
+                .metadata
+                .values("k")
+                .and_then(|vals| vals.first())
+                .map(String::as_str),
+            Some("v")
+        );
         assert_eq!(parsed.warnings, vec!["w1"]);
         assert_eq!(parsed.parser_chain, vec!["TextParser"]);
         assert_eq!(parsed.timing.detect_ms, 1);

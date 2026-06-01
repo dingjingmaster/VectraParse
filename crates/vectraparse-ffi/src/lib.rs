@@ -331,12 +331,19 @@ pub extern "C" fn vectraparse_capabilities_json(out: *mut VectraParseResult) -> 
 #[cfg(test)]
 mod tests {
     use super::{
+        parse_json_runtime,
         vectraparse_capabilities_json, vectraparse_create_handle, vectraparse_destroy_handle,
         vectraparse_detect, vectraparse_detect_with_hints, vectraparse_parse, vectraparse_result_free,
         VectraParseError, VectraParseHandle, VectraParseOptions, VectraParseResult,
     };
     use std::ffi::CString;
     use std::ptr;
+    use vectraparse_core::result::StructuredResult;
+
+    fn parse_runtime_result(input: &[u8]) -> StructuredResult {
+        let json = parse_json_runtime(input, 8 * 1024 * 1024).expect("parse json");
+        StructuredResult::from_json(&json).expect("structured result")
+    }
 
     #[test]
     fn detect_respects_max_bytes_limit() {
@@ -443,5 +450,21 @@ mod tests {
             &mut out as *mut VectraParseResult,
         );
         assert!(matches!(rc, VectraParseError::NullPointer));
+    }
+
+    #[test]
+    fn parse_runtime_records_non_png_image_bucket_before_ocr() {
+        let out = parse_runtime_result(b"\xFF\xD8\xFFJFIF\x00rest-of-sample");
+        assert_eq!(out.mime_type, "application/octet-stream");
+        assert!(out.content.as_deref().is_some());
+        assert_eq!(out.warnings, Vec::<String>::new());
+        assert_eq!(out.parser_chain, vec!["StringsParser".to_string()]);
+        assert_eq!(
+            out.metadata
+                .values("strings.charset")
+                .and_then(|vals| vals.first())
+                .map(String::as_str),
+            Some("ascii+latin1")
+        );
     }
 }
