@@ -18,6 +18,7 @@ const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
+const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
 
@@ -134,6 +135,12 @@ struct RecognizedText {
 struct DetectedText {
     det_box_count: usize,
     recognized: RecognizedText,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DetectionBox {
+    bbox: BoxRect,
+    alternatives: Vec<BoxRect>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,7 +364,7 @@ impl OrtOcrEngine {
         source: &str,
         transform: BboxTransform,
     ) -> Result<DetectedText, String> {
-        let boxes = self.detect_text_boxes(img, cfg)?;
+        let boxes = self.detect_text_boxes(img, cfg, source == "det")?;
         let trace_enabled = ocr_trace_enabled();
         if trace_enabled {
             eprintln!(
@@ -387,14 +394,15 @@ impl OrtOcrEngine {
         } else {
             0
         };
-        for (idx, b) in boxes.iter().enumerate() {
+        for (idx, det_box) in boxes.iter().enumerate() {
+            let b = det_box.bbox;
             if trace_enabled {
                 eprintln!(
                     "[OCR_TRACE] det-pass-box source={} index={} bbox={}x{}@{},{}",
                     source,
                     idx + 1,
-                    box_width(*b),
-                    box_height(*b),
+                    box_width(b),
+                    box_height(b),
                     b.0,
                     b.1
                 );
@@ -402,7 +410,8 @@ impl OrtOcrEngine {
             self.push_recognized_box_lines(
                 img,
                 cfg,
-                *b,
+                b,
+                &det_box.alternatives,
                 allow_crop_enhancement,
                 source,
                 transform,
@@ -440,6 +449,7 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
         b: BoxRect,
+        alternative_boxes: &[BoxRect],
         allow_crop_enhancement: bool,
         source: &str,
         transform: BboxTransform,
@@ -447,16 +457,39 @@ impl OrtOcrEngine {
         split_line_rec_budget: &mut usize,
         lines: &mut Vec<TextLine>,
     ) {
-        let mut split_boxes = split_text_box_into_color_region_boxes(img, b);
-        if split_boxes.len() < 2 || split_boxes.len() > *split_line_rec_budget {
+        let using_alternatives =
+            alternative_boxes.len() >= 2 && alternative_boxes.len() <= *split_line_rec_budget;
+        let mut split_boxes = if using_alternatives {
+            alternative_boxes.to_vec()
+        } else {
+            split_text_box_into_color_region_boxes(img, b)
+        };
+        if !using_alternatives
+            && (split_boxes.len() < 2 || split_boxes.len() > *split_line_rec_budget)
+        {
             split_boxes = split_text_box_into_line_boxes(img, b);
         }
         if split_boxes.len() >= 2 && split_boxes.len() <= *split_line_rec_budget {
-            *split_line_rec_budget -= split_boxes.len();
             let split_lines =
                 self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
-            if should_use_split_lines(None, &split_lines) {
+            let direct_for_comparison = if using_alternatives {
+                let direct_crop = crop_box(img, b);
+                self.best_from_crop_direct(&direct_crop, cfg)
+            } else {
+                None
+            };
+            if should_use_split_lines(direct_for_comparison.as_ref(), &split_lines) {
+                *split_line_rec_budget -= split_boxes.len();
                 lines.extend(split_lines);
+                return;
+            }
+            if let Some(candidate) = direct_for_comparison {
+                lines.push(TextLine {
+                    bbox: transform.map_box(b),
+                    text: normalize_recognized_text(&candidate.text),
+                    confidence: candidate.confidence,
+                    source: source.to_string(),
+                });
                 return;
             }
         }
@@ -874,6 +907,8 @@ impl OrtOcrEngine {
         cfg: &OcrConfig,
         variant: RecVariant,
     ) -> Result<RecCandidate, String> {
+        let tight_crop = tight_rec_crop(image);
+        let image = tight_crop.as_ref().unwrap_or(image);
         let target_w = dynamic_rec_target_width(image, cfg.rec_img_h, cfg.rec_img_w);
         match self.recognize_candidate_at_width(session, alphabet, image, cfg, variant, target_w) {
             Ok(candidate) => Ok(candidate),
@@ -907,7 +942,8 @@ impl OrtOcrEngine {
 
 fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
     lines.sort_by(reading_line_order);
-    let mut regions = group_text_lines_into_regions(lines);
+    let deduped = dedupe_text_lines(lines);
+    let mut regions = group_text_lines_into_regions(&deduped);
     regions.sort_by(reading_region_order);
 
     let mut blocks = Vec::new();
@@ -1041,11 +1077,9 @@ fn merge_ocr_regions(current: &[OcrTextRegion], candidate: &[OcrTextRegion]) -> 
         if key.is_empty() {
             continue;
         }
-        let duplicate = seen.iter().any(|existing| {
-            existing == &key
-                || (existing.len().min(key.len()) >= 4
-                    && (existing.contains(&key) || key.contains(existing)))
-        });
+        let duplicate = seen
+            .iter()
+            .any(|existing| text_keys_are_duplicates(existing, &key));
         if duplicate {
             continue;
         }
@@ -1724,16 +1758,133 @@ fn box_from_array(b: [u32; 4]) -> BoxRect {
 }
 
 fn boxes_significantly_overlap(a: BoxRect, b: BoxRect) -> bool {
+    let area = box_intersection_area(a, b);
+    if area == 0 {
+        return false;
+    }
+    let min_area = box_area(a).min(box_area(b)).max(1);
+    area as f32 / min_area as f32 >= 0.50
+}
+
+fn box_intersection_area(a: BoxRect, b: BoxRect) -> u64 {
     let x0 = a.0.max(b.0);
     let y0 = a.1.max(b.1);
     let x1 = a.2.min(b.2);
     let y1 = a.3.min(b.3);
     if x1 <= x0 || y1 <= y0 {
-        return false;
+        return 0;
     }
-    let area = box_area((x0, y0, x1, y1));
-    let min_area = box_area(a).min(box_area(b)).max(1);
-    area as f32 / min_area as f32 >= 0.50
+    box_area((x0, y0, x1, y1))
+}
+
+fn dedupe_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
+    let mut kept: Vec<TextLine> = Vec::new();
+    'candidate: for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
+        for kept_line in &mut kept {
+            if !text_lines_are_near_duplicates(kept_line, line) {
+                continue;
+            }
+            if text_line_quality(line) > text_line_quality(kept_line) {
+                *kept_line = line.clone();
+            }
+            continue 'candidate;
+        }
+        kept.push(line.clone());
+    }
+    kept.sort_by(reading_line_order);
+    kept
+}
+
+fn text_lines_are_near_duplicates(a: &TextLine, b: &TextLine) -> bool {
+    let similarity = normalized_text_similarity(&a.text, &b.text);
+    if boxes_significantly_overlap(a.bbox, b.bbox) || box_iou(a.bbox, b.bbox) >= 0.35 {
+        return similarity >= 0.78;
+    }
+    long_texts_are_near_duplicates(&a.text, &b.text)
+        && boxes_are_near_same_column(a.bbox, b.bbox)
+        && similarity >= 0.88
+}
+
+fn text_line_quality(line: &TextLine) -> f32 {
+    let text = line.text.trim();
+    let chars = recognized_char_count(text) as f32;
+    line.confidence * 100.0 + readable_ratio(text) * 12.0 + chars.min(32.0) * 0.35
+        - punctuation_ratio(text) * 8.0
+        - dominant_char_ratio(text) * 4.0
+}
+
+fn normalized_text_similarity(a: &str, b: &str) -> f32 {
+    let a = normalize_ocr_line(a);
+    let b = normalize_ocr_line(b);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    let min_len = a.chars().count().min(b.chars().count());
+    let max_len = a.chars().count().max(b.chars().count()).max(1);
+    if min_len >= 4 && (a.contains(&b) || b.contains(&a)) {
+        return min_len as f32 / max_len as f32;
+    }
+    let distance = levenshtein_chars(&a, &b);
+    1.0 - distance as f32 / max_len as f32
+}
+
+fn text_keys_are_duplicates(existing: &str, key: &str) -> bool {
+    if existing == key {
+        return true;
+    }
+    let min_len = existing.chars().count().min(key.chars().count());
+    let max_len = existing.chars().count().max(key.chars().count()).max(1);
+    if min_len >= 4
+        && (existing.contains(key) || key.contains(existing))
+        && min_len as f32 / max_len as f32 >= 0.72
+    {
+        return true;
+    }
+    min_len >= 8 && normalized_text_similarity(existing, key) >= 0.88
+}
+
+fn long_texts_are_near_duplicates(a: &str, b: &str) -> bool {
+    normalize_ocr_line(a)
+        .chars()
+        .count()
+        .min(normalize_ocr_line(b).chars().count())
+        >= 8
+}
+
+fn boxes_are_near_same_column(a: BoxRect, b: BoxRect) -> bool {
+    let min_width = box_width(a).min(box_width(b)).max(1) as f32;
+    let overlap_ratio = horizontal_overlap(a, b) as f32 / min_width;
+    let center_close = (box_center_x(a) - box_center_x(b)).abs()
+        <= box_width(a).max(box_width(b)).max(1) as f32 * 0.45;
+    let max_h = box_height(a).max(box_height(b)).max(1);
+    let max_gap = (max_h * 10).clamp(80, 220);
+    (overlap_ratio >= 0.35 || center_close) && vertical_gap(a, b) <= max_gap
+}
+
+fn levenshtein_chars(a: &str, b: &str) -> usize {
+    let a = a.chars().collect::<Vec<_>>();
+    let b = b.chars().collect::<Vec<_>>();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+
+    let mut prev = (0..=b.len()).collect::<Vec<_>>();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 fn merge_confidence(
@@ -1769,11 +1920,9 @@ fn merge_unique_lines(primary: &str, fallback: &str) -> String {
         if key.is_empty() {
             continue;
         }
-        let duplicate = seen.iter().any(|existing| {
-            existing == &key
-                || (existing.len().min(key.len()) >= 4
-                    && (existing.contains(&key) || key.contains(existing)))
-        });
+        let duplicate = seen
+            .iter()
+            .any(|existing| text_keys_are_duplicates(existing, &key));
         if duplicate {
             continue;
         }
@@ -1912,7 +2061,8 @@ impl OrtOcrEngine {
         &self,
         img: &DynamicImage,
         cfg: &OcrConfig,
-    ) -> Result<Vec<BoxRect>, String> {
+        include_raw_split_candidates: bool,
+    ) -> Result<Vec<DetectionBox>, String> {
         let (det_input, det_shape, sx, sy, src_w, src_h) =
             preprocess_det_image(img, cfg.det_img_side)?;
         let (det_output, _det_shapes) = ort::run_session(&self.det, &[det_input], &[det_shape])?;
@@ -1949,33 +2099,84 @@ impl OrtOcrEngine {
             }
         }
 
-        let mut scaled = nms_boxes(scaled, 0.35);
-        scaled.sort_by(|a, b| {
-            let ya = a.1 as i32 / 8;
-            let yb = b.1 as i32 / 8;
-            ya.cmp(&yb).then_with(|| a.0.cmp(&b.0))
-        });
-        let mut merged: Vec<BoxRect> = Vec::new();
-        for b in scaled {
-            if let Some(last) = merged.last_mut() {
-                let y_overlap = last.1 < b.3 && b.1 < last.3;
-                let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
-                let line_h = (last.3 - last.1).min(b.3 - b.1);
-                let new_w = last.2.max(b.2) - last.0.min(b.0);
-                if y_overlap && x_gap <= (line_h * 3).max(20) && new_w <= 1200 {
-                    last.0 = last.0.min(b.0);
-                    last.1 = last.1.min(b.1);
-                    last.2 = last.2.max(b.2);
-                    last.3 = last.3.max(b.3);
-                    continue;
-                }
-            }
-            merged.push(b);
-        }
+        let scaled = nms_boxes(scaled, 0.35);
+        let mut merged = merge_nearby_detection_boxes(scaled.clone());
 
         merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
-        Ok(merged)
+        merged.sort_by(reading_box_order);
+        let boxes = merged
+            .into_iter()
+            .map(|bbox| DetectionBox {
+                alternatives: if include_raw_split_candidates {
+                    raw_split_detection_candidates(bbox, &scaled)
+                } else {
+                    Vec::new()
+                },
+                bbox,
+            })
+            .collect();
+        Ok(boxes)
     }
+}
+
+fn merge_nearby_detection_boxes(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
+    boxes.sort_by(reading_box_order);
+    let mut merged: Vec<BoxRect> = Vec::new();
+    for b in boxes {
+        if let Some(last) = merged.last_mut() {
+            let y_overlap = last.1 < b.3 && b.1 < last.3;
+            let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
+            let line_h = (last.3 - last.1).min(b.3 - b.1);
+            let new_w = last.2.max(b.2) - last.0.min(b.0);
+            if y_overlap && x_gap <= (line_h * 3).max(20) && new_w <= 1200 {
+                last.0 = last.0.min(b.0);
+                last.1 = last.1.min(b.1);
+                last.2 = last.2.max(b.2);
+                last.3 = last.3.max(b.3);
+                continue;
+            }
+        }
+        merged.push(b);
+    }
+    merged
+}
+
+fn raw_split_detection_candidates(merged: BoxRect, raw: &[BoxRect]) -> Vec<BoxRect> {
+    if box_width(merged) < 96 {
+        return Vec::new();
+    }
+    let mut contained = raw
+        .iter()
+        .copied()
+        .filter(|b| raw_box_is_split_candidate(*b, merged))
+        .take(MAX_RAW_DET_SPLIT_CANDIDATES)
+        .collect::<Vec<_>>();
+    if contained.len() < 2 {
+        return Vec::new();
+    }
+    contained.sort_by(reading_box_order);
+    contained
+}
+
+fn raw_box_is_split_candidate(raw: BoxRect, merged: BoxRect) -> bool {
+    let raw_area = box_area(raw).max(1);
+    let contained = box_intersection_area(raw, merged) as f32 / raw_area as f32;
+    if contained < 0.82 {
+        return false;
+    }
+    if box_iou(raw, merged) > 0.92 {
+        return false;
+    }
+    if box_area(raw).saturating_mul(100) >= box_area(merged).saturating_mul(78) {
+        return false;
+    }
+    box_width(raw) + 8 < box_width(merged)
+}
+
+fn reading_box_order(a: &BoxRect, b: &BoxRect) -> std::cmp::Ordering {
+    let ya = a.1 as i32 / 8;
+    let yb = b.1 as i32 / 8;
+    ya.cmp(&yb).then_with(|| a.0.cmp(&b.0))
 }
 
 fn load_model_bytes(path: Option<&str>, embedded: &[u8]) -> Vec<u8> {
@@ -2263,6 +2464,53 @@ fn crop_box(img: &DynamicImage, b: BoxRect) -> DynamicImage {
     let w = x1.saturating_sub(x0).max(1);
     let h = y1.saturating_sub(y0).max(1);
     img.crop_imm(x0, y0, w, h)
+}
+
+fn tight_rec_crop(image: &DynamicImage) -> Option<DynamicImage> {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    if w < 12 || h < 8 {
+        return None;
+    }
+    let mask = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))?;
+    let mut min_x = w as usize;
+    let mut min_y = h as usize;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut count = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if !mask[y * w as usize + x] {
+                continue;
+            }
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if count < 4 || max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    let fg_h = max_y.saturating_sub(min_y) + 1;
+    let pad_x = (fg_h / 2).clamp(2, 12);
+    let pad_y = (fg_h / 4).clamp(1, 6);
+    let b = (
+        min_x.saturating_sub(pad_x) as u32,
+        min_y.saturating_sub(pad_y) as u32,
+        (max_x + 1 + pad_x).min(w as usize) as u32,
+        (max_y + 1 + pad_y).min(h as usize) as u32,
+    );
+    if box_width(b) < 4 || box_height(b) < 4 {
+        return None;
+    }
+    let image_area = (w as u64).saturating_mul(h as u64);
+    if box_area(b).saturating_mul(100) >= image_area.saturating_mul(92) {
+        return None;
+    }
+    Some(crop_box(image, b))
 }
 
 fn preprocess_rec_image(
@@ -3422,6 +3670,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_split_detection_candidates_keep_merged_and_parts() {
+        let raw = vec![(0, 0, 40, 12), (70, 0, 120, 12)];
+        let boxes = merge_nearby_detection_boxes(raw.clone());
+        assert_eq!(boxes, vec![(0, 0, 120, 12)]);
+
+        let alternatives = raw_split_detection_candidates(boxes[0], &raw);
+
+        assert_eq!(alternatives.len(), 2);
+        assert!(alternatives.contains(&(0, 0, 40, 12)));
+        assert!(alternatives.contains(&(70, 0, 120, 12)));
+    }
+
+    #[test]
     fn expand_box_uses_capped_unclip_margin() {
         assert_eq!(expand_box(20, 20, 79, 79, 100, 100), (12, 12, 88, 88));
     }
@@ -3432,6 +3693,22 @@ mod tests {
         assert_eq!(dynamic_rec_target_width(&long, 48, 320), 640);
         let narrow = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 48, Luma([128])));
         assert_eq!(dynamic_rec_target_width(&narrow, 48, 320), 320);
+    }
+
+    #[test]
+    fn tight_rec_crop_removes_blank_margin() {
+        let mut rgb = image::RgbImage::from_pixel(200, 48, image::Rgb([255, 255, 255]));
+        for y in 20..26 {
+            for x in 80..120 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let cropped = tight_rec_crop(&DynamicImage::ImageRgb8(rgb)).expect("tight crop");
+        let (w, h) = cropped.dimensions();
+
+        assert!(w < 70);
+        assert!(h < 20);
     }
 
     #[test]
@@ -3551,6 +3828,34 @@ mod tests {
         assert!(!layout_applied);
         assert_eq!(regions.len(), 1);
         assert_eq!(fallback.as_deref(), Some("merged:det-enhanced:contrast"));
+    }
+
+    #[test]
+    fn recognized_from_text_lines_dedupes_overlapping_similar_lines() {
+        let mut lines = vec![
+            text_line((10, 10, 120, 26), "通讯录胡成：昨天", 0.62),
+            text_line((12, 11, 122, 27), "通迅录胡成：昨天", 0.70),
+            text_line((10, 90, 120, 106), "通讯录胡成：昨天", 0.63),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 2);
+        assert!(recognized.text.contains("通迅录胡成：昨天"));
+        assert!(recognized.text.contains("通讯录胡成：昨天"));
+    }
+
+    #[test]
+    fn recognized_from_text_lines_dedupes_nearby_long_text_variants() {
+        let mut lines = vec![
+            text_line((320, 10, 470, 26), "赵剑超@安得和众3084", 0.70),
+            text_line((322, 54, 468, 70), "赵剑超@安和众3084", 0.74),
+            text_line((320, 300, 470, 316), "赵剑超@安得和众3084", 0.68),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 2);
     }
 
     #[test]
