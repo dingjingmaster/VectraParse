@@ -85,7 +85,7 @@
 | 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 完成 |
 | 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 完成 |
 | 3 | 增强 OCR 诊断：记录 OCR 是否启用、解码失败、det 框数、rec 空结果、fallback 命中、平均置信度和低置信度告警 | `cargo test -p vectraparse-parsers`; 用失败样本确认 warnings/metadata 能分桶 | 完成 |
-| 4 | 增加轻量图像增强 fallback：灰度对比度拉伸、局部/全局阈值、白字黑底双路径、锐化或去噪的保守组合 | `cargo test -p vectraparse-ocr`; 低对比/暗色 UI fixture 输出非空且已知样本不回退 | 待开始 |
+| 4 | 增加轻量图像增强 fallback：灰度对比度拉伸、局部/全局阈值、白字黑底双路径、锐化或去噪的保守组合 | `cargo test -p vectraparse-ocr`; 低对比/暗色 UI fixture 输出非空且已知样本不回退 | 完成 |
 | 5 | 增加多尺度与小字策略：对低分辨率或 det 空结果执行 1.5x/2x 上采样，限制最大像素和重试次数 | 定向 OCR 样本测试；记录耗时和内存上限，避免大图性能失控 | 待开始 |
 | 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/扩边，减少碎框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 待开始 |
 | 7 | 处理长行与英文行：长 crop 分段或动态 rec 宽度；每个 crop 可按置信度/字符集选择中文或英文模型 | 长英文行、混合中英文截图 fixture；确认没有大量乱码输出 | 待开始 |
@@ -139,6 +139,15 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-parsers ocr_success_metadata_records_empty_result_warning -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-parsers image_metadata_parser_records_decode_failure_bucket -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi parse_runtime_routes_jpeg_bytes_into_image_parser -- --nocapture`
+- 已完成轻量图像增强 fallback：
+  - `vectraparse-ocr` 在整图和整图英文 fallback 失败后，会继续尝试 `contrast`、`binary`、`binary-invert` 三种保守增强图再做识别。
+  - 当前实现覆盖低对比和白字黑底双路径；锐化/去噪仍未单独加入，保留到后续如样本证明有必要时再扩展。
+  - 成功命中时会在 diagnostics.fallback 中记录为 `enhanced:<mode>` 或 `enhanced:<mode>:alt`。
+- 本轮验证命令：
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr enhancement_variants_include_expected_modes -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr contrast_stretch_expands_low_contrast_range -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr adaptive_binary_can_flip_for_light_foreground -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
 
 ## 7. Plan 阶段审视
 
@@ -164,3 +173,4 @@
 | 2026-06-01 | 完成执行计划步骤 1：补充最小复现分桶测试与结果解析辅助 | 为后续 OCR 入口识别和预处理优化提供稳定证据 |
 | 2026-06-01 | 完成执行计划步骤 2：补齐图片入口识别和 `GIF/BMP` 支持对齐 | 先消除“图片没进入 OCR”主路径问题 |
 | 2026-06-01 | 完成执行计划步骤 3：增强 OCR 诊断 metadata/warnings | 让失败样本能稳定分桶到 decode / fallback / empty / low-confidence 等阶段 |
+| 2026-06-01 | 完成执行计划步骤 4：增加轻量图像增强 fallback | 为低对比和白字黑底场景增加整图增强识别兜底 |

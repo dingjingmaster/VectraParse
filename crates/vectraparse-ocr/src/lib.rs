@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use image::imageops::FilterType;
-use image::DynamicImage;
+use image::{DynamicImage, GrayImage, Luma};
 
 mod ort;
 
@@ -170,6 +170,36 @@ impl OrtOcrEngine {
                 text = alt_text;
                 confidence = alt_confidence;
                 fallback = Some("whole-image-alt".to_string());
+            }
+
+            if text.trim().is_empty() {
+                for (name, enhanced) in enhancement_variants(img) {
+                    let (rec_input, rec_shape) = preprocess_rec_image(&enhanced, cfg.rec_img_h, cfg.rec_img_w)?;
+                    let (enh_output, enh_shapes) =
+                        ort::run_session(&self.rec, &[rec_input.clone()], &[rec_shape.clone()])
+                        .map_err(|e| format!("recognize: {e}"))?;
+                    let logits = &enh_output[0];
+                    let (enh_text, enh_confidence) = ctc_greedy_decode(logits, &enh_shapes[0], &self.alphabet);
+                    if !enh_text.trim().is_empty() {
+                        text = enh_text;
+                        confidence = enh_confidence;
+                        fallback = Some(format!("enhanced:{name}"));
+                        break;
+                    }
+                    if let Some(rec_alt) = &self.rec_alt {
+                        let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
+                            .map_err(|e| format!("recognize-alt: {e}"))?;
+                        let logits = &alt_output[0];
+                        let (alt_text, alt_confidence) =
+                            ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
+                        if !alt_text.trim().is_empty() {
+                            text = alt_text;
+                            confidence = alt_confidence;
+                            fallback = Some(format!("enhanced:{name}:alt"));
+                            break;
+                        }
+                    }
+                }
             }
 
             if text.trim().is_empty() {
@@ -488,6 +518,62 @@ fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
     out
 }
 
+fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    let gray = image.to_luma8();
+    let stretched = contrast_stretch_luma(&gray);
+    let binary = adaptive_binary_luma(&stretched, false);
+    let binary_invert = adaptive_binary_luma(&stretched, true);
+    vec![
+        ("contrast".to_string(), DynamicImage::ImageLuma8(stretched)),
+        ("binary".to_string(), DynamicImage::ImageLuma8(binary)),
+        ("binary-invert".to_string(), DynamicImage::ImageLuma8(binary_invert)),
+    ]
+}
+
+fn contrast_stretch_luma(gray: &GrayImage) -> GrayImage {
+    let mut min_v = u8::MAX;
+    let mut max_v = u8::MIN;
+    for pixel in gray.pixels() {
+        min_v = min_v.min(pixel[0]);
+        max_v = max_v.max(pixel[0]);
+    }
+    if max_v <= min_v.saturating_add(8) {
+        return gray.clone();
+    }
+    let range = (max_v - min_v) as u16;
+    let mut out = GrayImage::new(gray.width(), gray.height());
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        let raw = pixel[0].saturating_sub(min_v) as u16;
+        let stretched = ((raw * 255) / range) as u8;
+        out.put_pixel(x, y, Luma([stretched]));
+    }
+    out
+}
+
+fn adaptive_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
+    let mut sum = 0u64;
+    for pixel in gray.pixels() {
+        sum += pixel[0] as u64;
+    }
+    let avg = if gray.pixels().len() == 0 {
+        127
+    } else {
+        (sum / gray.pixels().len() as u64) as i16
+    };
+    let threshold = (avg + if invert { 12 } else { -12 }).clamp(32, 223) as u8;
+    let mut out = GrayImage::new(gray.width(), gray.height());
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        let is_fg = if invert {
+            pixel[0] >= threshold
+        } else {
+            pixel[0] <= threshold
+        };
+        let value = if is_fg { 0 } else { 255 };
+        out.put_pixel(x, y, Luma([value]));
+    }
+    out
+}
+
 fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
     let rgb = to_rgb_on_white(image);
     let (w, h) = rgb.dimensions();
@@ -627,5 +713,46 @@ mod tests {
         let cfg = OcrConfig::default();
         assert!(cfg.det_model_path.is_none());
         assert!(cfg.rec_model_path.is_none());
+    }
+
+    #[test]
+    fn enhancement_variants_include_expected_modes() {
+        let mut gray = GrayImage::new(4, 2);
+        gray.put_pixel(0, 0, Luma([96]));
+        gray.put_pixel(1, 0, Luma([112]));
+        gray.put_pixel(2, 0, Luma([144]));
+        gray.put_pixel(3, 0, Luma([160]));
+        gray.put_pixel(0, 1, Luma([100]));
+        gray.put_pixel(1, 1, Luma([118]));
+        gray.put_pixel(2, 1, Luma([146]));
+        gray.put_pixel(3, 1, Luma([164]));
+        let variants = enhancement_variants(&DynamicImage::ImageLuma8(gray));
+        let names = variants.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["contrast", "binary", "binary-invert"]);
+    }
+
+    #[test]
+    fn contrast_stretch_expands_low_contrast_range() {
+        let mut gray = GrayImage::new(2, 2);
+        gray.put_pixel(0, 0, Luma([110]));
+        gray.put_pixel(1, 0, Luma([115]));
+        gray.put_pixel(0, 1, Luma([120]));
+        gray.put_pixel(1, 1, Luma([125]));
+        let stretched = contrast_stretch_luma(&gray);
+        let values = stretched.pixels().map(|p| p[0]).collect::<Vec<_>>();
+        assert_eq!(values.iter().min().copied(), Some(0));
+        assert_eq!(values.iter().max().copied(), Some(255));
+    }
+
+    #[test]
+    fn adaptive_binary_can_flip_for_light_foreground() {
+        let mut gray = GrayImage::new(3, 1);
+        gray.put_pixel(0, 0, Luma([20]));
+        gray.put_pixel(1, 0, Luma([240]));
+        gray.put_pixel(2, 0, Luma([25]));
+        let normal = adaptive_binary_luma(&gray, false);
+        let inverted = adaptive_binary_luma(&gray, true);
+        assert_eq!(normal.get_pixel(1, 0)[0], 255);
+        assert_eq!(inverted.get_pixel(1, 0)[0], 0);
     }
 }
