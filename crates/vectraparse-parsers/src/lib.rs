@@ -1290,6 +1290,10 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
         "image.ocr.layout_applied",
         ocr.diagnostics.layout_applied.to_string(),
     );
+    metadata.insert(
+        "image.ocr.color_region_count",
+        ocr.diagnostics.color_region_count.to_string(),
+    );
     metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
     metadata.insert(
         "image.ocr.source_has_alpha",
@@ -3484,6 +3488,7 @@ mod tests {
                 line_count: 1,
                 region_count: 1,
                 layout_applied: false,
+                color_region_count: 2,
                 fallback: Some("whole-image".to_string()),
                 empty_result: false,
                 source_has_alpha: true,
@@ -3518,6 +3523,13 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("false")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.color_region_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
         );
         assert_eq!(
             metadata
@@ -3564,6 +3576,7 @@ mod tests {
                 line_count: 0,
                 region_count: 0,
                 layout_applied: false,
+                color_region_count: 0,
                 fallback: Some("line-crops".to_string()),
                 empty_result: true,
                 source_has_alpha: false,

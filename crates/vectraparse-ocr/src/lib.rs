@@ -11,6 +11,8 @@ const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx"
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
+const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
+const MAX_COLOR_REGION_CANDIDATES: usize = 48;
 const MAX_REC_IMG_W: usize = 960;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
@@ -60,6 +62,7 @@ pub struct OcrDiagnostics {
     pub line_count: usize,
     pub region_count: usize,
     pub layout_applied: bool,
+    pub color_region_count: usize,
     pub fallback: Option<String>,
     pub empty_result: bool,
     pub source_has_alpha: bool,
@@ -178,6 +181,7 @@ impl OrtOcrEngine {
         let mut line_count = detected.recognized.line_count;
         let mut region_count = detected.recognized.region_count;
         let mut layout_applied = detected.recognized.layout_applied;
+        let mut color_region_count = 0usize;
         let mut fallback = None;
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
@@ -190,6 +194,7 @@ impl OrtOcrEngine {
                 &mut line_count,
                 &mut region_count,
                 &mut layout_applied,
+                &mut color_region_count,
                 &mut fallback,
             )?;
         }
@@ -204,7 +209,7 @@ impl OrtOcrEngine {
         if std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1") {
             let (w, h) = img.dimensions();
             eprintln!(
-                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} whole_image_box={} fallback={} empty={}",
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} whole_image_box={} fallback={} empty={}",
                 w,
                 h,
                 source_has_alpha,
@@ -212,6 +217,7 @@ impl OrtOcrEngine {
                 line_count,
                 region_count,
                 layout_applied,
+                color_region_count,
                 detect_used_whole_image_box,
                 fallback.as_deref().unwrap_or("-"),
                 empty_result
@@ -227,6 +233,7 @@ impl OrtOcrEngine {
                 line_count,
                 region_count,
                 layout_applied,
+                color_region_count,
                 fallback,
                 empty_result,
                 source_has_alpha,
@@ -275,6 +282,7 @@ impl OrtOcrEngine {
         line_count: &mut usize,
         region_count: &mut usize,
         layout_applied: &mut bool,
+        color_region_count: &mut usize,
         fallback: &mut Option<String>,
     ) -> Result<(), String> {
         match self.recognize_best(img, cfg) {
@@ -296,6 +304,22 @@ impl OrtOcrEngine {
             _ => {}
         }
 
+        if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
+            return Ok(());
+        }
+
+        let (candidate_count, candidate) = self.recognize_color_regions(img, cfg);
+        *color_region_count = candidate_count;
+        maybe_adopt_recognized(
+            text,
+            confidence,
+            line_count,
+            region_count,
+            layout_applied,
+            fallback,
+            "color-regions".to_string(),
+            &candidate,
+        );
         if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
             return Ok(());
         }
@@ -430,6 +454,30 @@ impl OrtOcrEngine {
         );
 
         Ok(())
+    }
+
+    fn recognize_color_regions(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+    ) -> (usize, RecognizedText) {
+        let boxes = color_region_boxes(img);
+        let mut lines = Vec::new();
+        for b in boxes.iter() {
+            let Some(binary) = binarize_color_region_foreground(img, *b) else {
+                continue;
+            };
+            if let Ok(candidate) = self.recognize_best(&binary, cfg)
+                && is_usable_recognition(&candidate)
+            {
+                lines.push(TextLine {
+                    bbox: *b,
+                    text: candidate.text,
+                    confidence: candidate.confidence,
+                });
+            }
+        }
+        (boxes.len(), recognized_from_text_lines(&mut lines))
     }
 
     fn recognize_line_crops(&self, img: &DynamicImage, cfg: &OcrConfig) -> RecognizedText {
@@ -768,6 +816,296 @@ fn region_average_line_height(region: &LayoutRegion) -> f32 {
         .map(|line| box_height(line.bbox).max(1) as f32)
         .sum::<f32>()
         / region.lines.len() as f32
+}
+
+fn color_region_boxes(image: &DynamicImage) -> Vec<BoxRect> {
+    let rgb = to_rgb_on_white(image);
+    let (src_w, src_h) = rgb.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return Vec::new();
+    }
+
+    let pixels = (src_w as u64).saturating_mul(src_h as u64);
+    let (work, sx, sy) = if pixels > MAX_COLOR_REGION_PIXELS {
+        let scale = (MAX_COLOR_REGION_PIXELS as f64 / pixels as f64).sqrt() as f32;
+        let target_w = ((src_w as f32) * scale).round().max(1.0) as u32;
+        let target_h = ((src_h as f32) * scale).round().max(1.0) as u32;
+        let resized = image::imageops::resize(&rgb, target_w, target_h, FilterType::Triangle);
+        (
+            resized,
+            src_w as f32 / target_w.max(1) as f32,
+            src_h as f32 / target_h.max(1) as f32,
+        )
+    } else {
+        (rgb, 1.0, 1.0)
+    };
+
+    let mut boxes = color_region_boxes_from_rgb(&work)
+        .into_iter()
+        .map(|b| {
+            let x0 = ((b.0 as f32) * sx).floor().max(0.0) as u32;
+            let y0 = ((b.1 as f32) * sy).floor().max(0.0) as u32;
+            let x1 = ((b.2 as f32) * sx).ceil().min(src_w as f32) as u32;
+            let y1 = ((b.3 as f32) * sy).ceil().min(src_h as f32) as u32;
+            (x0, y0, x1.max(x0 + 1).min(src_w), y1.max(y0 + 1).min(src_h))
+        })
+        .collect::<Vec<_>>();
+    boxes = nms_boxes(boxes, 0.70);
+    boxes.truncate(MAX_COLOR_REGION_CANDIDATES);
+    boxes
+}
+
+fn color_region_boxes_from_rgb(rgb: &image::RgbImage) -> Vec<BoxRect> {
+    let (w_u32, h_u32) = rgb.dimensions();
+    let w = w_u32 as usize;
+    let h = h_u32 as usize;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    let total = w.saturating_mul(h);
+    let mut keys = vec![0u16; total];
+    let mut counts = [0usize; 512];
+    for y in 0..h {
+        for x in 0..w {
+            let key = quantized_color_key(rgb.get_pixel(x as u32, y as u32));
+            keys[y * w + x] = key;
+            counts[key as usize] += 1;
+        }
+    }
+    let dominant_key = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .map(|(key, _)| key as u16)
+        .unwrap_or(0);
+
+    let min_area = (total / 5000).clamp(24, 800);
+    let mut visited = vec![false; total];
+    let mut boxes = Vec::new();
+    for idx in 0..total {
+        if visited[idx] {
+            continue;
+        }
+        let key = keys[idx];
+        let mut stack = vec![idx];
+        visited[idx] = true;
+        let mut area = 0usize;
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+
+        while let Some(cur) = stack.pop() {
+            let x = cur % w;
+            let y = cur / w;
+            area += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+
+            if x > 0 {
+                push_same_color_neighbor(cur - 1, key, &keys, &mut visited, &mut stack);
+            }
+            if x + 1 < w {
+                push_same_color_neighbor(cur + 1, key, &keys, &mut visited, &mut stack);
+            }
+            if y > 0 {
+                push_same_color_neighbor(cur - w, key, &keys, &mut visited, &mut stack);
+            }
+            if y + 1 < h {
+                push_same_color_neighbor(cur + w, key, &keys, &mut visited, &mut stack);
+            }
+        }
+
+        let rect_w = max_x.saturating_sub(min_x) + 1;
+        let rect_h = max_y.saturating_sub(min_y) + 1;
+        let bbox_area = rect_w.saturating_mul(rect_h);
+        if area < min_area || rect_w < 24 || rect_h < 12 || bbox_area == 0 {
+            continue;
+        }
+        if key == dominant_key && area.saturating_mul(100) > total.saturating_mul(15) {
+            continue;
+        }
+        if bbox_area.saturating_mul(100) > total.saturating_mul(92) {
+            continue;
+        }
+        let fill = area as f32 / bbox_area as f32;
+        if fill < 0.55 {
+            continue;
+        }
+
+        boxes.push(expand_color_region_box(min_x, min_y, max_x, max_y, w, h));
+    }
+
+    boxes.sort_by_key(|b| (b.1, b.0));
+    boxes
+}
+
+fn push_same_color_neighbor(
+    idx: usize,
+    key: u16,
+    keys: &[u16],
+    visited: &mut [bool],
+    stack: &mut Vec<usize>,
+) {
+    if !visited[idx] && keys[idx] == key {
+        visited[idx] = true;
+        stack.push(idx);
+    }
+}
+
+fn expand_color_region_box(
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    w: usize,
+    h: usize,
+) -> BoxRect {
+    let pad = 2usize;
+    (
+        min_x.saturating_sub(pad) as u32,
+        min_y.saturating_sub(pad) as u32,
+        (max_x + 1 + pad).min(w) as u32,
+        (max_y + 1 + pad).min(h) as u32,
+    )
+}
+
+fn quantized_color_key(pixel: &image::Rgb<u8>) -> u16 {
+    let r = (pixel[0] >> 5) as u16;
+    let g = (pixel[1] >> 5) as u16;
+    let b = (pixel[2] >> 5) as u16;
+    (r << 6) | (g << 3) | b
+}
+
+fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<DynamicImage> {
+    let crop = crop_box(image, b);
+    let rgb = to_rgb_on_white(&crop);
+    let (w, h) = rgb.dimensions();
+    if w < 8 || h < 6 {
+        return None;
+    }
+
+    let bg = estimate_region_background_rgb(&rgb);
+    let mut distances = Vec::with_capacity((w as usize).saturating_mul(h as usize));
+    let mut max_distance = 0u8;
+    for pixel in rgb.pixels() {
+        let distance = color_distance_u8(pixel, bg);
+        max_distance = max_distance.max(distance);
+        distances.push(distance);
+    }
+    if max_distance < 18 {
+        return None;
+    }
+
+    let threshold = otsu_threshold_values(&distances).clamp(18, 96);
+    let mut foreground_count = 0usize;
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y as usize) * w as usize + x as usize;
+            let foreground = distances[idx] >= threshold;
+            if foreground {
+                foreground_count += 1;
+            }
+            out.put_pixel(x, y, Luma([if foreground { 0 } else { 255 }]));
+        }
+    }
+
+    let total = (w as usize).saturating_mul(h as usize).max(1);
+    let foreground_ratio = foreground_count as f32 / total as f32;
+    if foreground_count < 4 || !(0.002..=0.45).contains(&foreground_ratio) {
+        return None;
+    }
+    Some(DynamicImage::ImageLuma8(out))
+}
+
+fn estimate_region_background_rgb(rgb: &image::RgbImage) -> [u8; 3] {
+    let (w, h) = rgb.dimensions();
+    let mut counts = [0usize; 512];
+    let mut sums = [[0u64; 3]; 512];
+    for y in 0..h {
+        for x in 0..w {
+            let border = x == 0 || y == 0 || x + 1 == w || y + 1 == h;
+            if !border {
+                continue;
+            }
+            let p = rgb.get_pixel(x, y);
+            let key = quantized_color_key(p) as usize;
+            counts[key] += 1;
+            sums[key][0] += p[0] as u64;
+            sums[key][1] += p[1] as u64;
+            sums[key][2] += p[2] as u64;
+        }
+    }
+
+    let key = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .map(|(key, _)| key)
+        .unwrap_or(0);
+    let count = counts[key].max(1) as u64;
+    [
+        (sums[key][0] / count) as u8,
+        (sums[key][1] / count) as u8,
+        (sums[key][2] / count) as u8,
+    ]
+}
+
+fn color_distance_u8(pixel: &image::Rgb<u8>, bg: [u8; 3]) -> u8 {
+    let dr = pixel[0].abs_diff(bg[0]);
+    let dg = pixel[1].abs_diff(bg[1]);
+    let db = pixel[2].abs_diff(bg[2]);
+    dr.max(dg).max(db)
+}
+
+fn otsu_threshold_values(values: &[u8]) -> u8 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut hist = [0u64; 256];
+    for value in values {
+        hist[*value as usize] += 1;
+    }
+    otsu_threshold_histogram(&hist, values.len() as u64)
+}
+
+fn otsu_threshold_histogram(hist: &[u64; 256], total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    let mut sum_total = 0u64;
+    for (value, count) in hist.iter().enumerate() {
+        sum_total += value as u64 * count;
+    }
+
+    let mut weight_bg = 0u64;
+    let mut sum_bg = 0u64;
+    let mut best_threshold = 0u8;
+    let mut best_variance = -1.0f64;
+    for (threshold, count) in hist.iter().enumerate() {
+        weight_bg += count;
+        if weight_bg == 0 {
+            continue;
+        }
+        let weight_fg = total.saturating_sub(weight_bg);
+        if weight_fg == 0 {
+            break;
+        }
+        sum_bg += threshold as u64 * count;
+        let mean_bg = sum_bg as f64 / weight_bg as f64;
+        let mean_fg = (sum_total - sum_bg) as f64 / weight_fg as f64;
+        let diff = mean_bg - mean_fg;
+        let variance = weight_bg as f64 * weight_fg as f64 * diff * diff;
+        if variance > best_variance {
+            best_variance = variance;
+            best_threshold = threshold as u8;
+        }
+    }
+    best_threshold
 }
 
 fn recognition_fallback_label(base: &str, variant: RecVariant) -> String {
@@ -2215,6 +2553,36 @@ mod tests {
         assert_eq!(recognized.text, "Header\n\nMenu\n\nContent");
         assert_eq!(recognized.region_count, 3);
         assert!(recognized.layout_applied);
+    }
+
+    #[test]
+    fn color_region_boxes_detects_contrasting_panel() {
+        let mut rgb = image::RgbImage::from_pixel(160, 80, image::Rgb([248, 248, 248]));
+        for y in 20..50 {
+            for x in 30..130 {
+                rgb.put_pixel(x, y, image::Rgb([32, 88, 180]));
+            }
+        }
+        let boxes = color_region_boxes(&DynamicImage::ImageRgb8(rgb));
+        assert!(boxes.iter().any(|b| {
+            b.0 <= 30 && b.1 <= 20 && b.2 >= 130 && b.3 >= 50 && box_area(*b) < 160 * 80
+        }));
+    }
+
+    #[test]
+    fn color_region_binarization_extracts_foreground_from_panel() {
+        let mut rgb = image::RgbImage::from_pixel(64, 24, image::Rgb([32, 88, 180]));
+        for y in 8..14 {
+            for x in 18..46 {
+                rgb.put_pixel(x, y, image::Rgb([246, 246, 246]));
+            }
+        }
+        let binary =
+            binarize_color_region_foreground(&DynamicImage::ImageRgb8(rgb), (0, 0, 64, 24))
+                .expect("binary region");
+        let gray = binary.to_luma8();
+        assert_eq!(gray.get_pixel(2, 2)[0], 255);
+        assert_eq!(gray.get_pixel(24, 10)[0], 0);
     }
 
     #[test]
