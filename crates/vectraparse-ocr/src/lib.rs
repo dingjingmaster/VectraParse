@@ -409,26 +409,35 @@ fn preprocess_rec_image(
     target_h: usize,
     target_w: usize,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let rgb = to_rgb_on_white(image);
-    let (src_w, src_h) = rgb.dimensions();
+    let gray = image.to_luma8();
+    let (src_w, src_h) = gray.dimensions();
     let ratio = src_w as f32 / src_h as f32;
     let mut resized_w = (ratio * target_h as f32).ceil() as usize;
     resized_w = resized_w.clamp(1, target_w);
     let resized = image::imageops::resize(
-        &rgb,
+        &gray,
         resized_w as u32,
         target_h as u32,
         FilterType::Triangle,
     );
 
+    let mut sum: u64 = 0;
+    for pixel in resized.pixels() {
+        sum += pixel[0] as u64;
+    }
+    let avg = sum / resized.pixels().len() as u64;
+    let invert = avg < 128;
+
     let mut data = vec![0f32; 1 * 3 * target_h * target_w];
     for y in 0..target_h {
         for x in 0..resized_w {
             let px = resized.get_pixel(x as u32, y as u32);
+            let raw = px[0] as f32 / 255.0;
+            let v = if invert { 1.0 - raw } else { raw };
+            let norm = (v - 0.5) / 0.5;
             for c in 0..3 {
-                let v = (px[2 - c] as f32 / 255.0 - 0.5) / 0.5;
                 let idx = c * target_h * target_w + y * target_w + x;
-                data[idx] = v;
+                data[idx] = norm;
             }
         }
     }
