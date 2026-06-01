@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.6
+> - 文档版本：v1.0.7
 > - 最后更新：2026-06-01
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出和 trace metadata。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata 和 det 框内部多行切分。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -18,7 +18,7 @@
 - 成功标准：
   - 常见图片格式能稳定进入 `ImageMetadataParser` 的 OCR 路径。
   - 失败样本可按原因分桶，并在 metadata 或 warnings 中体现。
-  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、结构化区域/行输出和 OLE 图片候选处理。
+  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、结构化区域/行输出、det 框内部多行切分和 OLE 图片候选处理。
   - 当前 golden 仅覆盖 `image/png` parser 叶子行为和 `image.format` 基础元数据；尚未落地真实 OCR 文本 fixture。
   - 当前验证主要证明入口、诊断和辅助算法行为；尚未用真实失败样本系统证明 OCR 文本质量提升。
 - 前置条件：
@@ -44,8 +44,8 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、区域级布局聚类、颜色背景区域候选 fallback、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
-  - OCR 核心未实现：长 crop 分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、聊天 UI 中间时间标记断行后处理、区域级布局聚类、颜色背景区域候选 fallback、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心未实现：长文本横向分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
   - P0 入口与诊断先行；否则无法判断后续预处理是否真正生效。
@@ -73,11 +73,13 @@
   - 非 PNG 图片入口已补齐到 JPEG/TIFF/WebP/BMP/GIF magic 和常见扩展名回退。
   - 预处理 fallback 已不再只是灰度缩放和平均亮度反色；当前包含 luma/HSL/max-channel 三类灰度源、对比度拉伸、Otsu 全局二值化、反色二值化、局部均值二值化，并在透明图上额外生成黑底增强变体；仍未实现锐化或去噪。
   - det 后处理已从原始连通域扩展为 1 像素 dilation、component score 过滤、轻量 unclip 扩边和 NMS；仍缺少旋转框和更接近 PaddleOCR 的多边形后处理。
-  - 中英文 rec 已在逐 crop 和各类 fallback 中统一比较；当前已将动态 rec 宽度上限提升到 `MAX_REC_IMG_W=960`，并保留固定宽度失败回退，避免模型不接受宽输入时整条识别失败。
-  - fallback 已从“仅空结果触发”扩展为“空结果、低置信、det 框多但识别行少、有效字符过少或可读比例偏低”触发；补跑候选会按行去重后合并，或在明显更长/更高置信时替换原结果。
+  - 中英文 rec 已在逐 crop 和各类 fallback 中统一比较；当前动态 rec 宽度上限为 `MAX_REC_IMG_W=640`，并保留固定宽度失败回退，避免模型不接受宽输入时整条识别失败；此前 960 上限在复杂整页截图上成本过高，已收紧。
+  - fallback 已从“仅空结果触发”扩展为“空结果、低置信、det 框多但识别行少、有效字符过少或可读比例偏低”触发；其中“det 框多但识别行少”会跳过高置信、可读且已有足够文本的结果，避免复杂截图无谓进入重 fallback；补跑候选会按行去重后合并，或在明显更长/更高置信时替换原结果。
   - 检测框识别结果已不再只按全局 y/x 排序；当前会按 bbox 水平重叠、纵向距离、宽度差异将行聚类为区域，区域之间用空行分隔，并在 metadata 中记录 `image.ocr.region_count` 和 `image.ocr.layout_applied`。
   - 颜色背景区域 fallback 会在低质量路径中按粗量化颜色连通域提取明显色块，跳过整页背景和低填充率噪声区域；候选区域内会根据边框背景色做前景色差二值化，再执行 rec，并在 metadata 中记录 `image.ocr.color_region_count`。
   - `OcrResult` 已输出结构化 `regions: Vec<OcrTextRegion>`，每个 region 包含 bbox、文本、置信度、来源和行级 `OcrTextLine`；trace 当前记录最终选中来源、det pass 次数和 fallback 尝试次数，并通过 metadata 写出。
+  - 原图 det 框识别前会优先尝试明显背景色块切分，再对包含多行文字的 crop 做前景行投影切分，并对同一行内存在水平大空隙的宽 crop 做列段切分；只有拆出至少两条有效子段且子段识别未明显丢内容/置信度时，才用子段结果替代整框 rec，避免相邻消息或左右区域被 rec 模型粘成一行；每次 det pass 额外子行 rec 和逐 crop 增强都有固定预算，子段只做 direct rec，增强/旋转 det 不再叠加拆行成本。
+  - 针对聊天截图里“发送者：预览文本 + 刚刚/昨天/星期X + 另一侧内容”被 rec 串成一行的情况，识别后会在中间时间标记前断行；该规则要求前缀包含发送者分隔符且前后都有足够文本，避免普通句子误切。
   - 当前新增行级质量过滤会拒绝低置信、重复字符占比过高和标点占比过高的候选，可能降低垃圾输出，也可能丢弃少量真实低置信文本，需要真实样本评估。
 - 最小修复点：
   - 先补入口识别和诊断，再引入可回退的预处理增强，不一次性重写 OCR 管线。
@@ -95,13 +97,15 @@
 | 4 | 增加轻量图像增强 fallback：luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、反色二值化、局部均值二值化和透明图黑底增强变体 | `cargo test -p vectraparse-ocr`; 覆盖增强变体、对比度拉伸、Otsu、局部二值化和 alpha 黑底辅助函数 | 完成 |
 | 5 | 增加多尺度与小字策略：对小图执行 1.5x/2x 上采样，并在 fallback 中先重新 det+逐框 rec，再保留整图识别兜底，限制最大像素 | 定向 OCR 辅助函数测试；当前未覆盖真实小字 OCR 文本 fixture | 完成 |
 | 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/轻量 unclip 扩边/NMS，减少碎框、重复框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 完成 |
-| 7 | 处理长行与英文行：每个 crop 可按置信度/字符集选择中文或英文模型；动态 rec 宽度上限提升到 `960` 并保留固定宽度失败回退；长 crop 分段未实现 | 当前测试覆盖中英文结果选择和 960 宽度行为；长英文真实 OCR fixture 未落地 | 部分完成 |
+| 7 | 处理长行与英文行：每个 crop 可按置信度/字符集选择中文或英文模型；动态 rec 宽度上限当前为 `640` 并保留固定宽度失败回退；长文本横向分段未实现 | 当前测试覆盖中英文结果选择和 640 宽度行为；长英文真实 OCR fixture 未落地 | 部分完成 |
 | 8 | 增加旋转保守兜底：支持 90/180/270 度旋转图重新 det+逐框 rec，并保留整图识别重试；未实现小角度 deskew | 当前测试覆盖旋转变体生成；未覆盖旋转真实 OCR 文本 fixture | 完成 |
 | 9 | 增强 OLE 嵌入图片 OCR 候选处理：仅 `.doc` 路径做图片候选汇总、格式过滤、去重 key 和预算命中诊断，嵌入图失败不影响主文本 | `cargo test -p vectraparse-mso-binary`; 当前 WebP 支持直接流，payload 切片未实现 | 完成 |
 | 10 | 收口 golden/文档：当前仅将 `image/png` stub 纳入 parser 提取矩阵；真实 OCR 文本样本尚未进入 golden | 定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 部分完成 |
 | 11 | 增加区域级布局聚类：逐框识别后按 bbox 聚类为区域，区域内按行排序，区域间用空行分隔，并输出区域诊断 metadata | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 | 12 | 增加颜色背景区域 fallback：按近似背景色连通域提取 UI 色块，在候选区域内做背景色差二值化后识别，并输出颜色区域候选数 metadata | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 | 13 | 增加结构化区域/行输出和 trace metadata：暴露 OCR region/line bbox、source、confidence，并记录选中来源、det pass 和 fallback 尝试数 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
+| 14 | 增加 det 框内部多行/多段切分：对原图单个检测框内的背景色块、前景行投影和行内水平大空隙做保守切分，拆分结果通过内容量和置信度门禁后作为多条 TextLine 输出，并限制额外子行 rec 和逐 crop 增强预算 | `cargo test -p vectraparse-ocr`; `rustfmt --edition 2024 --config skip_children=true --check crates/vectraparse-ocr/src/lib.rs` | 完成 |
+| 15 | 增加聊天 UI 时间标记断行后处理：对发送者前缀后串入 `刚刚/昨天/星期X` 的合并行插入换行 | `cargo test -p vectraparse-ocr`; 真实截图 `/home/dingjing/files/b.png` 实测 | 完成 |
 
 ## 6. 验证计划
 
@@ -127,6 +131,7 @@
   - 区域级布局聚类仍是几何启发式，不理解页面语义；复杂表格、嵌套卡片、瀑布流、多弹窗叠加或跨区域标题仍可能排序不符合人工阅读顺序。
   - 颜色背景区域 fallback 使用粗颜色量化和边框背景估计；渐变、阴影、图片背景、透明叠层或彩色插图可能产生候选过多或候选缺失，当前只在低质量 fallback 路径触发并限制最大候选数。
   - 结构化 bbox 对原图 det、增强图 det、上采样和旋转 det 做了坐标回映；复杂旋转/裁剪组合仍需真实截图验证坐标是否足够准确。
+  - det 框内部多行/多段切分依赖背景色块、前景/背景估计、行投影和列投影，能覆盖相邻消息被同一检测框包住、或同一 y 行跨左右区域串读的场景；如果行距/列距极小、背景复杂、前景比例异常，或额外子行 rec 超出预算，仍可能退回整框识别。
   - 不更换模型的前提下，极端模糊、严重透视、手写字或超低分辨率图片仍可能无法可靠提取。
 
 当前验证记录：
@@ -185,7 +190,7 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr enhancement_variants_include_expected_modes -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
 - 已部分完成长行与英文行处理：
-  - `vectraparse-ocr` 当前有 `dynamic_rec_target_width` 入口，`MAX_REC_IMG_W` 已提升到 `960`，默认配置下长行 crop 可使用更宽的 rec 输入。
+  - `vectraparse-ocr` 当前有 `dynamic_rec_target_width` 入口，`MAX_REC_IMG_W` 当前为 `640`，默认配置下长行 crop 可使用比固定 320 更宽的 rec 输入。
   - `recognize_candidate` 保留固定宽度回退：如果动态宽度推理失败，会再用 `cfg.rec_img_w` 执行一次，降低模型动态 shape 不兼容导致整条失败的风险。
   - 检测框裁剪、整图 fallback、增强图 fallback、上采样 fallback、旋转 fallback 和行切分 fallback 现在都会比较中英文两个识别结果。
   - 结果选择优先级基于空结果、ASCII 字符比例和置信度差值，英文行不再只在“中文完全为空”时才有机会走英文模型。
@@ -196,7 +201,7 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr extract_boxes_from_map_merges_nearby_fragments_after_dilation -- --nocapture`
 - 已完成本轮识别质量优化：
-  - 将 `MAX_REC_IMG_W` 从 `320` 提升到 `960`，长行 crop 可获得更宽 rec 输入；动态宽度推理失败时自动回退到固定宽度。
+  - 将 `MAX_REC_IMG_W` 从最初固定 `320` 放宽到当前 `640`，长行 crop 可获得更宽 rec 输入；动态宽度推理失败时自动回退到固定宽度。
   - 将全局均值二值化替换为 Otsu 阈值，并新增积分图局部均值二值化增强变体。
   - 增加行级可用性过滤：拒绝低置信、重复字符占比过高、标点占比过高或可读字符比例过低的候选。
 - 本轮验证命令：
@@ -243,10 +248,26 @@
   - `OcrResult` 新增 `regions: Vec<OcrTextRegion>` 和 `trace: OcrTrace`；每个 region/line 包含 bbox、text、confidence 和 source。
   - 原图 det、增强图 det、上采样 det、旋转 det、颜色区域和行切分 fallback 会标记来源；上采样和旋转 det 的 bbox 会回映到原图坐标。
   - trace 记录最终选中来源、det pass 次数和 fallback 尝试次数；`ImageMetadataParser` 同步写入 `image.ocr.selected_source`、`image.ocr.det_pass_count`、`image.ocr.fallback_attempt_count`。
-  - `VECTRAPARSE_OCR_TRACE=1` 输出同步增加 selected source、det pass 和 fallback attempt，方便复杂截图排查。
+  - `VECTRAPARSE_OCR_TRACE=1` 输出同步增加 start、det pass 进度、selected source、det pass 和 fallback attempt，方便复杂截图排查耗时和路径。
 - 本轮验证命令：
   - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
   - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers ocr_success_metadata`
+- 已完成 det 框内部多行/多段切分：
+  - `recognize_detected_text` 在原图 det bbox 内先尝试背景色块切分，再尝试前景行投影切分；若单行宽 crop 中存在明显水平大空隙，会继续切成多个列段；切分候选会独立 rec，并以 `det:split` source 标记。
+  - 为避免复杂截图和 fallback 变体放大耗时，框内拆行只在原图 `det` pass 启用，并限制每次 det pass 最多额外识别 6 条子行；拆出的子段先做 direct rec，失败时只对该子段做背景色二值化 rec，若子段可用则直接采用，不再先跑整框 rec 做比较；每次 det pass 最多允许 4 个中小弱 crop 进入增强识别，大 crop 和其余弱框保留 direct 结果；质量 fallback 对“det 框多但识别行少”的情况增加强文本豁免，减少高置信结果继续跑完整增强链路。
+  - `VECTRAPARSE_OCR_TRACE=1` 现在会输出 det pass 开始、每 16 个 bbox 的处理进度和 pass 完成信息，用于定位复杂截图耗时阶段。
+  - 若拆分结果少于两条、有效字符太少、相比整框识别明显丢内容或置信度下降过多，则保留原整框识别结果。
+  - `line-crops` fallback 现在也复用真实行 bbox，不再用行序号估算 y 坐标。
+- 本轮验证命令：
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers ocr_success_metadata`
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/vectraparse-ocr/src/lib.rs`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo build --release -p vectraparse-ffi`
+  - `gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a -L/tmp/onnxruntime-linux-x64-1.26.0/lib -lonnxruntime -ldl -lpthread -lm -Wl,-rpath,/tmp/onnxruntime-linux-x64-1.26.0/lib -o target/extract-static`
+  - `timeout 180s env ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ./target/extract-static /home/dingjing/files/b.png`
+- 真实截图验证结果：
+  - `/home/dingjing/files/b.png` 的合并行已拆成 `陈晗：mac是用内核导的` 与 `刚刚网关说不支持邮件` 两行。
+  - 本地完整运行约 102 秒，说明 1920x1032 复杂截图仍有明显耗时，后续需要继续做 det/rec 预算和布局裁剪优化。
 - 已完成 OLE 嵌入图片 OCR 候选处理增强：
   - `vectraparse-mso-binary` 现会在 `.doc` 路径先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
   - 去重 key 从“长度 + 前 4 字节”提升为“长度 + 前后 64 字节哈希”，降低同源嵌入图被重复 OCR 的概率。
@@ -300,7 +321,7 @@
   - 性能风险主要来自增强变体增加到每个灰度源 5 个；只在 fallback 或 crop 增强路径触发，仍受现有上采样像素和候选数量限制。
 - 高级工程师：
   - 变更保持在现有 pipeline 内：rec 宽度、二值化变体、候选质量过滤均为局部函数改动。
-  - 单测覆盖新增 Otsu、局部二值化、960 动态宽度和候选过滤；仍缺真实 OCR 文本 fixture。
+  - 单测覆盖新增 Otsu、局部二值化、640 动态宽度和候选过滤；仍缺真实 OCR 文本 fixture。
 
 ## 7.2 本轮 Code 阶段审视
 
@@ -363,6 +384,22 @@
   - 单测覆盖结构化 region/line 的 bbox 和 source；parser metadata 覆盖 selected source、det pass 和 fallback attempt。
   - 仍需真实复杂截图验证旋转 det bbox 回映和区域 source 对齐是否满足调试需求。
 
+## 7.6 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只修改 OCR crate 内部 crop 切分和当前任务文档，未触碰 `crates/vectraparse-ocr/src/ort.rs`、模型、字典、构建链接或 C ABI。
+  - 拆分结果有内容量、置信度和额外 rec 预算门禁；不满足条件时回退到原整框识别；满足条件时不再额外跑整框 rec 比较，避免宽 crop 识别拖慢复杂截图；质量 fallback 也增加强文本豁免，降低误切分或无谓补跑导致丢文本/耗时放大的风险。
+- 高级产品：
+  - 本轮直接针对“两个视觉消息/区域被合并成一条文本”的用户样本现象：当 det 把不同背景色块、多行或同一 y 行的左右区域包进同一框时，输出可恢复为多条文本。
+  - 仍需用户用真实截图验证阈值；复杂背景、行距过小或透明叠层可能仍需要后续调参。
+- 高级架构师：
+  - 未新增依赖，复用现有颜色距离、Otsu 阈值和 bbox 布局聚类；切分结果仍进入原 `TextLine` 管线，不新增外部 API 负担。
+  - 拆行限制在原图 det pass，避免与增强、上采样和旋转 fallback 组合成乘法级成本。
+  - 这属于 OCR rec 前的局部 crop 预处理，不改变模型输入输出协议。
+- 高级工程师：
+  - 单测覆盖两行前景切分、宽行按大空隙切分、相邻背景色块切分和单行不切分；OCR crate 全量测试通过。
+  - 当前没有真实截图 golden，无法自动证明用户样本已拆开，需要用户运行 `extract-static` 回测。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -385,3 +422,6 @@
 | 2026-06-01 | 完成区域级布局聚类 | 将复杂截图 OCR 输出从全局 y/x 排序升级为区域聚类输出，并增加区域诊断 metadata |
 | 2026-06-01 | 完成颜色背景区域 fallback | 针对明显背景色块上的文字增加色块候选、区域二值化识别和颜色区域诊断 metadata |
 | 2026-06-01 | 完成结构化 OCR regions/lines 和 trace metadata | 让复杂截图 OCR 结果可按区域、行、来源和 fallback 路径调试 |
+| 2026-06-01 | 完成 det 框内部多行/多段切分 | 避免单个检测框覆盖相邻消息行或跨左右区域时被 rec 模型粘成一条文本 |
+| 2026-06-01 | 收紧复杂截图 OCR 成本 | 将动态 rec 宽度上限调整为 640，并限制大 crop 增强、子段识别和 trace 进度输出 |
+| 2026-06-01 | 增加聊天 UI 时间标记断行 | 覆盖左侧会话预览时间与右侧气泡内容被同一 OCR 行串读的样本 |

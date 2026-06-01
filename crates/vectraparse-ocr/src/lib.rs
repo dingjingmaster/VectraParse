@@ -13,7 +13,10 @@ const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
 const MAX_COLOR_REGION_CANDIDATES: usize = 48;
-const MAX_REC_IMG_W: usize = 960;
+const MAX_REC_IMG_W: usize = 640;
+const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
+const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
+const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
 
@@ -221,7 +224,12 @@ impl OrtOcrEngine {
     }
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
+        let trace_enabled = ocr_trace_enabled();
         let source_has_alpha = has_non_opaque_alpha(img);
+        if trace_enabled {
+            let (w, h) = img.dimensions();
+            eprintln!("[OCR_TRACE] start dims={w}x{h} alpha={source_has_alpha}");
+        }
         let detected = self
             .recognize_detected_text(img, cfg, true, "det", BboxTransform::Identity)
             .map_err(|e| format!("detect: {e}"))?;
@@ -276,7 +284,7 @@ impl OrtOcrEngine {
             }
         });
 
-        if std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1") {
+        if trace_enabled {
             let (w, h) = img.dimensions();
             eprintln!(
                 "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} source={} whole_image_box={} fallback={} empty={}",
@@ -326,28 +334,160 @@ impl OrtOcrEngine {
         transform: BboxTransform,
     ) -> Result<DetectedText, String> {
         let boxes = self.detect_text_boxes(img, cfg)?;
+        let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!(
+                "[OCR_TRACE] det-pass source={} boxes={} crop_enhance_budget={} split_budget={}",
+                source,
+                boxes.len(),
+                if allow_crop_enhancement {
+                    MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS
+                } else {
+                    0
+                },
+                if source == "det" {
+                    MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+                } else {
+                    0
+                }
+            );
+        }
         let mut lines = Vec::new();
-        for b in boxes.iter() {
-            let crop = crop_box(img, *b);
-            let candidate = if allow_crop_enhancement {
-                self.best_from_crop(&crop, cfg)
-            } else {
-                self.best_from_crop_direct(&crop, cfg)
-            };
-            if let Some(candidate) = candidate {
-                lines.push(TextLine {
-                    bbox: transform.map_box(*b),
-                    text: candidate.text,
-                    confidence: candidate.confidence,
-                    source: source.to_string(),
-                });
+        let mut crop_enhancement_budget = if allow_crop_enhancement {
+            MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS
+        } else {
+            0
+        };
+        let mut split_line_rec_budget = if source == "det" {
+            MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        } else {
+            0
+        };
+        for (idx, b) in boxes.iter().enumerate() {
+            if trace_enabled {
+                eprintln!(
+                    "[OCR_TRACE] det-pass-box source={} index={} bbox={}x{}@{},{}",
+                    source,
+                    idx + 1,
+                    box_width(*b),
+                    box_height(*b),
+                    b.0,
+                    b.1
+                );
             }
+            self.push_recognized_box_lines(
+                img,
+                cfg,
+                *b,
+                allow_crop_enhancement,
+                source,
+                transform,
+                &mut crop_enhancement_budget,
+                &mut split_line_rec_budget,
+                &mut lines,
+            );
+            if trace_enabled && (idx + 1) % 16 == 0 {
+                eprintln!(
+                    "[OCR_TRACE] det-pass-progress source={} processed={}/{} lines={}",
+                    source,
+                    idx + 1,
+                    boxes.len(),
+                    lines.len()
+                );
+            }
+        }
+        if trace_enabled {
+            eprintln!(
+                "[OCR_TRACE] det-pass-done source={} boxes={} lines={}",
+                source,
+                boxes.len(),
+                lines.len()
+            );
         }
 
         Ok(DetectedText {
             det_box_count: boxes.len(),
             recognized: recognized_from_text_lines(&mut lines),
         })
+    }
+
+    fn push_recognized_box_lines(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        b: BoxRect,
+        allow_crop_enhancement: bool,
+        source: &str,
+        transform: BboxTransform,
+        crop_enhancement_budget: &mut usize,
+        split_line_rec_budget: &mut usize,
+        lines: &mut Vec<TextLine>,
+    ) {
+        let mut split_boxes = split_text_box_into_color_region_boxes(img, b);
+        if split_boxes.len() < 2 || split_boxes.len() > *split_line_rec_budget {
+            split_boxes = split_text_box_into_line_boxes(img, b);
+        }
+        if split_boxes.len() >= 2 && split_boxes.len() <= *split_line_rec_budget {
+            *split_line_rec_budget -= split_boxes.len();
+            let split_lines =
+                self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
+            if should_use_split_lines(None, &split_lines) {
+                lines.extend(split_lines);
+                return;
+            }
+        }
+
+        let direct_crop = crop_box(img, b);
+        let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
+        let direct_is_strong = direct
+            .as_ref()
+            .is_some_and(|candidate| candidate.confidence >= MIN_STRONG_REC_CONFIDENCE);
+        if allow_crop_enhancement
+            && !direct_is_strong
+            && *crop_enhancement_budget > 0
+            && should_enhance_crop(b)
+        {
+            *crop_enhancement_budget -= 1;
+            direct = self.best_from_crop(&direct_crop, cfg).or(direct);
+        };
+
+        if let Some(candidate) = direct {
+            lines.push(TextLine {
+                bbox: transform.map_box(b),
+                text: normalize_recognized_text(&candidate.text),
+                confidence: candidate.confidence,
+                source: source.to_string(),
+            });
+        }
+    }
+
+    fn recognize_split_line_boxes(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        split_boxes: &[BoxRect],
+        source: &str,
+        transform: BboxTransform,
+    ) -> Vec<TextLine> {
+        let mut lines = Vec::new();
+        for split_box in split_boxes {
+            let crop = crop_box(img, *split_box);
+            let candidate = self.best_from_crop_direct(&crop, cfg).or_else(|| {
+                let binary = binarize_color_region_foreground(img, *split_box)?;
+                self.recognize_best(&binary, cfg)
+                    .ok()
+                    .filter(is_usable_recognition)
+            });
+            if let Some(candidate) = candidate {
+                lines.push(TextLine {
+                    bbox: transform.map_box(*split_box),
+                    text: normalize_recognized_text(&candidate.text),
+                    confidence: candidate.confidence,
+                    source: format!("{source}:split"),
+                });
+            }
+        }
+        lines
     }
 
     fn apply_quality_fallbacks(
@@ -615,7 +755,7 @@ impl OrtOcrEngine {
             {
                 lines.push(TextLine {
                     bbox: *b,
-                    text: candidate.text,
+                    text: normalize_recognized_text(&candidate.text),
                     confidence: candidate.confidence,
                     source: "color-region".to_string(),
                 });
@@ -626,15 +766,14 @@ impl OrtOcrEngine {
 
     fn recognize_line_crops(&self, img: &DynamicImage, cfg: &OcrConfig) -> RecognizedText {
         let mut lines = Vec::new();
-        for (idx, line) in fallback_line_crops(img).into_iter().enumerate() {
+        for line_box in fallback_line_boxes(img) {
+            let line = crop_box(img, line_box);
             if let Ok(candidate) = self.recognize_best(&line, cfg)
                 && is_usable_recognition(&candidate)
             {
-                let (_, line_h) = line.dimensions();
-                let y0 = (idx as u32).saturating_mul(line_h.max(1) + 4);
                 lines.push(TextLine {
-                    bbox: (0, y0, line.width(), y0 + line_h.max(1)),
-                    text: candidate.text,
+                    bbox: line_box,
+                    text: normalize_recognized_text(&candidate.text),
                     confidence: candidate.confidence,
                     source: "line-crops".to_string(),
                 });
@@ -784,26 +923,27 @@ fn recognized_from_candidate(
     bbox: BoxRect,
     source: &str,
 ) -> RecognizedText {
-    let line_count = text_line_count(&candidate.text);
-    let regions = if candidate.text.trim().is_empty() {
+    let text = normalize_recognized_text(&candidate.text);
+    let line_count = text_line_count(&text);
+    let regions = if text.trim().is_empty() {
         Vec::new()
     } else {
         let line = OcrTextLine {
             bbox: box_to_array(bbox),
-            text: candidate.text.clone(),
+            text: text.clone(),
             confidence: candidate.confidence,
             source: source.to_string(),
         };
         vec![OcrTextRegion {
             bbox: box_to_array(bbox),
-            text: candidate.text.clone(),
+            text: text.clone(),
             confidence: candidate.confidence,
             source: source.to_string(),
             lines: vec![line],
         }]
     };
     RecognizedText {
-        text: candidate.text,
+        text,
         confidence: candidate.confidence,
         line_count,
         region_count: if line_count == 0 { 0 } else { 1 },
@@ -1552,6 +1692,80 @@ fn merge_unique_lines(primary: &str, fallback: &str) -> String {
     lines.join("\n")
 }
 
+fn normalize_recognized_text(text: &str) -> String {
+    split_joined_chat_time_markers(text)
+}
+
+fn split_joined_chat_time_markers(text: &str) -> String {
+    if text.contains('\n') {
+        return text.to_string();
+    }
+    let markers = [
+        "刚刚",
+        "昨天",
+        "星期一",
+        "星期二",
+        "星期三",
+        "星期四",
+        "星期五",
+        "星期六",
+        "星期日",
+        "星期天",
+    ];
+    for marker in markers {
+        let Some(idx) = text.find(marker) else {
+            continue;
+        };
+        if idx == 0 {
+            continue;
+        }
+        let before = &text[..idx];
+        let after = &text[idx..];
+        let before_chars = recognized_char_count(before);
+        let after_chars = recognized_char_count(after);
+        let has_sender_prefix = before.contains('：') || before.contains(':');
+        if has_sender_prefix && before_chars >= 6 && after_chars >= 4 {
+            return format!("{}\n{}", before.trim(), after.trim());
+        }
+    }
+    text.to_string()
+}
+
+fn should_use_split_lines(direct: Option<&RecCandidate>, split_lines: &[TextLine]) -> bool {
+    if split_lines.len() < 2 {
+        return false;
+    }
+
+    let split_text = split_lines
+        .iter()
+        .map(|line| line.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let split_chars = recognized_char_count(&split_text);
+    if split_chars < 4 {
+        return false;
+    }
+
+    let split_confidence = split_lines.iter().map(|line| line.confidence).sum::<f32>()
+        / split_lines.len().max(1) as f32;
+
+    let Some(direct) = direct else {
+        return true;
+    };
+
+    let direct_chars = recognized_char_count(&direct.text);
+    if direct_chars == 0 {
+        return true;
+    }
+
+    let keeps_most_content =
+        split_chars + 2 >= direct_chars || split_chars as f32 >= direct_chars as f32 * 0.72;
+    let confidence_is_close = split_confidence + 0.15 >= direct.confidence
+        || split_confidence >= MIN_STRONG_REC_CONFIDENCE;
+    keeps_most_content && confidence_is_close
+}
+
 fn normalize_ocr_line(line: &str) -> String {
     line.chars()
         .filter(|ch| !ch.is_whitespace())
@@ -1573,7 +1787,10 @@ fn needs_quality_fallback(
         return true;
     }
     if det_box_count >= 4 && line_count * 2 <= det_box_count {
-        return true;
+        let text_is_strong = confidence >= MIN_STRONG_REC_CONFIDENCE
+            && char_count >= 8
+            && readable_ratio(text) >= 0.70;
+        return !text_is_strong;
     }
     if char_count < 4 && det_box_count >= 2 {
         return true;
@@ -1582,6 +1799,10 @@ fn needs_quality_fallback(
         return true;
     }
     false
+}
+
+fn should_enhance_crop(b: BoxRect) -> bool {
+    box_width(b) <= 480 && box_height(b) <= 96 && box_area(b) <= 48_000
 }
 
 fn recognized_char_count(text: &str) -> usize {
@@ -2030,6 +2251,10 @@ fn has_non_opaque_alpha(image: &DynamicImage) -> bool {
     rgba.pixels().any(|p| p[3] < 255)
 }
 
+fn ocr_trace_enabled() -> bool {
+    std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1")
+}
+
 fn to_hsl_lightness(image: &DynamicImage) -> GrayImage {
     to_hsl_lightness_on_background(image, 255)
 }
@@ -2274,64 +2499,442 @@ fn local_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
     out
 }
 
-fn fallback_line_crops(image: &DynamicImage) -> Vec<DynamicImage> {
+fn fallback_line_boxes(image: &DynamicImage) -> Vec<BoxRect> {
+    let (w, h) = image.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    foreground_line_boxes(image, 48)
+}
+
+fn split_text_box_into_line_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRect> {
+    if box_height(bbox) < 18 || box_width(bbox) < 16 {
+        return Vec::new();
+    }
+
+    let crop = crop_box(image, bbox);
+    let local_boxes = foreground_line_boxes(&crop, 8);
+    if local_boxes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut split_boxes = Vec::new();
+    for line_box in local_boxes {
+        let segments = split_line_box_horizontally(&crop, line_box);
+        if segments.len() > 1 {
+            split_boxes.extend(segments);
+        } else {
+            split_boxes.push(line_box);
+        }
+    }
+    if split_boxes.len() < 2 {
+        return Vec::new();
+    }
+
+    let (img_w, img_h) = image.dimensions();
+    split_boxes
+        .into_iter()
+        .map(|b| {
+            clamp_box(
+                (
+                    bbox.0.saturating_add(b.0),
+                    bbox.1.saturating_add(b.1),
+                    bbox.0.saturating_add(b.2),
+                    bbox.1.saturating_add(b.3),
+                ),
+                img_w,
+                img_h,
+            )
+        })
+        .collect()
+}
+
+fn split_text_box_into_color_region_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRect> {
+    if box_width(bbox) < 96 || box_height(bbox) < 24 {
+        return Vec::new();
+    }
+
+    let crop = crop_box(image, bbox);
+    let crop_area = box_area(image_box(&crop));
+    let mut local_boxes = color_region_boxes(&crop)
+        .into_iter()
+        .filter(|b| box_width(*b) >= 24 && box_height(*b) >= 12)
+        .filter(|b| box_area(*b).saturating_mul(100) < crop_area.saturating_mul(88))
+        .collect::<Vec<_>>();
+    if local_boxes.len() == 1
+        && let Some(foreground_box) = foreground_box_outside_boxes(&crop, &local_boxes)
+    {
+        local_boxes.push(foreground_box);
+    }
+
+    let mut boxes = local_boxes
+        .into_iter()
+        .map(|b| {
+            clamp_box(
+                (
+                    bbox.0.saturating_add(b.0),
+                    bbox.1.saturating_add(b.1),
+                    bbox.0.saturating_add(b.2),
+                    bbox.1.saturating_add(b.3),
+                ),
+                image.width(),
+                image.height(),
+            )
+        })
+        .collect::<Vec<_>>();
+    boxes.sort_by_key(|b| (b.1 / 8, b.0));
+    boxes.truncate(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS);
+    if boxes.len() < 2 {
+        return Vec::new();
+    }
+    boxes
+}
+
+fn foreground_box_outside_boxes(image: &DynamicImage, excluded: &[BoxRect]) -> Option<BoxRect> {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    let mask = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))?;
+
+    let mut min_x = w as usize;
+    let mut min_y = h as usize;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut count = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if !mask[y * w as usize + x]
+                || excluded
+                    .iter()
+                    .any(|b| point_in_box(x as u32, y as u32, *b))
+            {
+                continue;
+            }
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if count < 4 || max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    let b = (
+        min_x.saturating_sub(2) as u32,
+        min_y.saturating_sub(2) as u32,
+        (max_x + 3).min(w as usize) as u32,
+        (max_y + 3).min(h as usize) as u32,
+    );
+    if box_width(b) < 24 || box_height(b) < 8 {
+        return None;
+    }
+    Some(b)
+}
+
+fn point_in_box(x: u32, y: u32, b: BoxRect) -> bool {
+    x >= b.0 && x < b.2 && y >= b.1 && y < b.3
+}
+
+fn split_line_box_horizontally(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRect> {
+    if box_width(bbox) < 64 || box_height(bbox) < 6 {
+        return vec![bbox];
+    }
+
+    let crop = crop_box(image, bbox);
+    let rgb = to_rgb_on_white(&crop);
+    let (w, h) = rgb.dimensions();
+    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
+    else {
+        return vec![bbox];
+    };
+    let local_segments = column_boxes_from_foreground_mask(
+        &mask,
+        w as usize,
+        h as usize,
+        MAX_HORIZONTAL_SEGMENTS_PER_LINE,
+    );
+    if local_segments.len() < 2 {
+        return vec![bbox];
+    }
+
+    local_segments
+        .into_iter()
+        .map(|b| {
+            clamp_box(
+                (
+                    bbox.0.saturating_add(b.0),
+                    bbox.1.saturating_add(b.1),
+                    bbox.0.saturating_add(b.2),
+                    bbox.1.saturating_add(b.3),
+                ),
+                image.width(),
+                image.height(),
+            )
+        })
+        .collect()
+}
+
+fn foreground_line_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect> {
     let rgb = to_rgb_on_white(image);
     let (w, h) = rgb.dimensions();
     if w == 0 || h == 0 {
         return Vec::new();
     }
-    let mut row_score = vec![0usize; h as usize];
+    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
+    else {
+        return Vec::new();
+    };
+    line_boxes_from_foreground_mask(&mask, w as usize, h as usize, max_boxes)
+}
+
+fn foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let bg = estimate_region_background_rgb(rgb);
+    let mut distances = Vec::with_capacity((w as usize).saturating_mul(h as usize));
+    let mut max_distance = 0u8;
+    for pixel in rgb.pixels() {
+        let distance = color_distance_u8(pixel, bg);
+        max_distance = max_distance.max(distance);
+        distances.push(distance);
+    }
+    if max_distance < 14 {
+        return None;
+    }
+
+    let threshold = otsu_threshold_values(&distances).clamp(12, 96);
+    let mut foreground_count = 0usize;
+    let mask = distances
+        .into_iter()
+        .map(|distance| {
+            let foreground = distance >= threshold;
+            if foreground {
+                foreground_count += 1;
+            }
+            foreground
+        })
+        .collect::<Vec<_>>();
+
+    let total = (w as usize).saturating_mul(h as usize).max(1);
+    let foreground_ratio = foreground_count as f32 / total as f32;
+    if foreground_count < 4 || !(0.001..=0.50).contains(&foreground_ratio) {
+        return None;
+    }
+    Some(mask)
+}
+
+fn dark_luma_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let mut foreground_count = 0usize;
+    let mut mask = Vec::with_capacity((w as usize).saturating_mul(h as usize));
+    for pixel in rgb.pixels() {
+        let lum = (pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3;
+        let foreground = lum < 230;
+        if foreground {
+            foreground_count += 1;
+        }
+        mask.push(foreground);
+    }
+
+    let total = (w as usize).saturating_mul(h as usize).max(1);
+    let foreground_ratio = foreground_count as f32 / total as f32;
+    if foreground_count < 4 || !(0.001..=0.65).contains(&foreground_ratio) {
+        return None;
+    }
+    Some(mask)
+}
+
+fn line_boxes_from_foreground_mask(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
+    if w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return Vec::new();
+    }
+
+    let mut row_score = vec![0usize; h];
     for y in 0..h {
-        let mut c = 0usize;
+        let mut count = 0usize;
         for x in 0..w {
-            let p = rgb.get_pixel(x, y);
-            let lum = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
-            if lum < 230 {
-                c += 1;
+            if mask[y * w + x] {
+                count += 1;
             }
         }
-        row_score[y as usize] = c;
+        row_score[y] = count;
     }
-    let threshold = (w as usize / 80).max(12);
+
+    let max_row_score = row_score.iter().copied().max().unwrap_or(0);
+    if max_row_score < 2 {
+        return Vec::new();
+    }
+    let active_threshold = ((max_row_score as f32) * 0.10).ceil() as usize;
+    let active_threshold = active_threshold.max((w / 180).max(2));
+    let bridge_threshold = (active_threshold / 2).max(1);
+    let gap_tolerance = (h / 80).clamp(1, 3);
+    let min_band_height = (h / 120).clamp(3, 8);
+
     let mut bands = Vec::new();
     let mut y = 0usize;
-    while y < h as usize {
-        if row_score[y] < threshold {
+    while y < h {
+        if row_score[y] < active_threshold {
             y += 1;
             continue;
         }
         let start = y;
         let mut end = y;
-        while end + 1 < h as usize && row_score[end + 1] >= threshold / 2 {
-            end += 1;
+        let mut gap = 0usize;
+        y += 1;
+        while y < h {
+            if row_score[y] >= bridge_threshold {
+                end = y;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > gap_tolerance {
+                    break;
+                }
+            }
+            y += 1;
         }
-        y = end + 1;
         let height = end - start + 1;
-        if !(10..=96).contains(&height) {
+        if height < min_band_height {
             continue;
         }
+        bands.push((start, end));
+    }
+
+    let mut boxes = Vec::new();
+    for (start, end) in bands {
         let mut min_x = w;
-        let mut max_x = 0u32;
-        for yy in start as u32..=end as u32 {
+        let mut max_x = 0usize;
+        let mut foreground_count = 0usize;
+        for yy in start..=end {
             for xx in 0..w {
-                let p = rgb.get_pixel(xx, yy);
-                let lum = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
-                if lum < 230 {
+                if mask[yy * w + xx] {
+                    foreground_count += 1;
                     min_x = min_x.min(xx);
                     max_x = max_x.max(xx);
                 }
             }
         }
-        if max_x > min_x && (max_x - min_x) >= 24 {
-            bands.push((min_x, start as u32, max_x + 1, end as u32 + 1));
+        if max_x <= min_x || foreground_count < 4 || max_x - min_x + 1 < 8 {
+            continue;
+        }
+        let band_h = end - start + 1;
+        let x_pad = (band_h / 2).clamp(2, 8);
+        let y_pad = (band_h / 4).clamp(1, 3);
+        boxes.push((
+            min_x.saturating_sub(x_pad) as u32,
+            start.saturating_sub(y_pad) as u32,
+            (max_x + 1 + x_pad).min(w) as u32,
+            (end + 1 + y_pad).min(h) as u32,
+        ));
+    }
+
+    boxes.sort_by_key(|b| (b.1, b.0));
+    boxes.truncate(max_boxes);
+    boxes
+}
+
+fn column_boxes_from_foreground_mask(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
+    if w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return Vec::new();
+    }
+
+    let mut col_score = vec![0usize; w];
+    for x in 0..w {
+        let mut count = 0usize;
+        for y in 0..h {
+            if mask[y * w + x] {
+                count += 1;
+            }
+        }
+        col_score[x] = count;
+    }
+
+    let max_col_score = col_score.iter().copied().max().unwrap_or(0);
+    if max_col_score < 2 {
+        return Vec::new();
+    }
+    let active_threshold = ((max_col_score as f32) * 0.08).ceil().max(1.0) as usize;
+    let bridge_threshold = (active_threshold / 2).max(1);
+    let gap_tolerance = h.clamp(12, 32);
+    let min_segment_width = h.clamp(8, 24);
+
+    let mut bands = Vec::new();
+    let mut x = 0usize;
+    while x < w {
+        if col_score[x] < active_threshold {
+            x += 1;
+            continue;
+        }
+        let start = x;
+        let mut end = x;
+        let mut gap = 0usize;
+        x += 1;
+        while x < w {
+            if col_score[x] >= bridge_threshold {
+                end = x;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > gap_tolerance {
+                    break;
+                }
+            }
+            x += 1;
+        }
+        if end.saturating_sub(start) + 1 >= min_segment_width {
+            bands.push((start, end));
         }
     }
-    bands.sort_by_key(|(_, y0, _, _)| *y0);
-    bands
-        .into_iter()
-        .take(48)
-        .map(|(x0, y0, x1, y1)| image.crop_imm(x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)))
-        .collect()
+    if bands.len() < 2 || bands.len() > max_boxes {
+        return Vec::new();
+    }
+
+    let mut boxes = Vec::new();
+    for (start, end) in bands {
+        let mut min_y = h;
+        let mut max_y = 0usize;
+        let mut foreground_count = 0usize;
+        for yy in 0..h {
+            for xx in start..=end {
+                if mask[yy * w + xx] {
+                    foreground_count += 1;
+                    min_y = min_y.min(yy);
+                    max_y = max_y.max(yy);
+                }
+            }
+        }
+        if max_y <= min_y || foreground_count < 4 {
+            continue;
+        }
+        let y_pad = ((max_y - min_y + 1) / 4).clamp(1, 3);
+        let x_pad = h.clamp(2, 8) / 2;
+        boxes.push((
+            start.saturating_sub(x_pad) as u32,
+            min_y.saturating_sub(y_pad) as u32,
+            (end + 1 + x_pad).min(w) as u32,
+            (max_y + 1 + y_pad).min(h) as u32,
+        ));
+    }
+
+    boxes.sort_by_key(|b| (b.0, b.1));
+    boxes
 }
 
 fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -> (String, f32) {
@@ -2734,7 +3337,7 @@ mod tests {
     #[test]
     fn dynamic_rec_target_width_grows_for_long_lines() {
         let long = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
-        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 960);
+        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 640);
         let narrow = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 48, Luma([128])));
         assert_eq!(dynamic_rec_target_width(&narrow, 48, 320), 320);
     }
@@ -2800,7 +3403,20 @@ mod tests {
         assert!(needs_quality_fallback("AB", 0.62, 3, 1));
         assert!(needs_quality_fallback("Invoice", 0.22, 1, 1));
         assert!(needs_quality_fallback("One line", 0.62, 6, 2));
+        assert!(!needs_quality_fallback("Readable line", 0.62, 6, 1));
         assert!(!needs_quality_fallback("Invoice 42", 0.62, 2, 2));
+    }
+
+    #[test]
+    fn normalize_recognized_text_splits_joined_chat_time_marker() {
+        assert_eq!(
+            normalize_recognized_text("陈晗：mac是用内核导的刚刚网关说不支持邮件"),
+            "陈晗：mac是用内核导的\n刚刚网关说不支持邮件"
+        );
+        assert_eq!(
+            normalize_recognized_text("那可能邮件这块的时间有点兜不住"),
+            "那可能邮件这块的时间有点兜不住"
+        );
     }
 
     #[test]
@@ -2903,6 +3519,81 @@ mod tests {
         let gray = binary.to_luma8();
         assert_eq!(gray.get_pixel(2, 2)[0], 255);
         assert_eq!(gray.get_pixel(24, 10)[0], 0);
+    }
+
+    #[test]
+    fn split_text_box_into_line_boxes_splits_two_rows() {
+        let mut rgb = image::RgbImage::from_pixel(96, 48, image::Rgb([255, 255, 255]));
+        for y in 8..14 {
+            for x in 12..70 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        for y in 30..36 {
+            for x in 10..84 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = split_text_box_into_line_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 96, 48));
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[0].1 <= 8 && boxes[0].3 >= 14);
+        assert!(boxes[1].1 <= 30 && boxes[1].3 >= 36);
+    }
+
+    #[test]
+    fn split_text_box_into_line_boxes_ignores_single_row() {
+        let mut rgb = image::RgbImage::from_pixel(96, 32, image::Rgb([255, 255, 255]));
+        for y in 12..18 {
+            for x in 12..84 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = split_text_box_into_line_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 96, 32));
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn split_text_box_into_line_boxes_splits_wide_row_on_large_gap() {
+        let mut rgb = image::RgbImage::from_pixel(180, 32, image::Rgb([255, 255, 255]));
+        for y in 12..18 {
+            for x in 12..62 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+            for x in 112..166 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = split_text_box_into_line_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 180, 32));
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[0].2 < boxes[1].0);
+    }
+
+    #[test]
+    fn split_text_box_into_color_region_boxes_splits_adjacent_panels() {
+        let mut rgb = image::RgbImage::from_pixel(180, 48, image::Rgb([245, 247, 250]));
+        for y in 6..42 {
+            for x in 8..82 {
+                rgb.put_pixel(x, y, image::Rgb([50, 130, 238]));
+            }
+        }
+        for y in 10..38 {
+            for x in 96..170 {
+                rgb.put_pixel(x, y, image::Rgb([230, 232, 236]));
+            }
+        }
+        for y in 20..25 {
+            for x in 110..154 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes =
+            split_text_box_into_color_region_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 180, 48));
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[0].2 <= boxes[1].0);
     }
 
     #[test]
