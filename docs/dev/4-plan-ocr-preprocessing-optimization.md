@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.0
+> - 文档版本：v1.0.1
 > - 最后更新：2026-06-01
-> - 关联需求：分析并规划 OCR 预处理优化，解决部分图片无法提取文字的问题。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -18,8 +18,9 @@
 - 成功标准：
   - 常见图片格式能稳定进入 `ImageMetadataParser` 的 OCR 路径。
   - 失败样本可按原因分桶，并在 metadata 或 warnings 中体现。
-  - 新增 OCR golden/fixtures 覆盖至少：PNG、JPEG、小字截图、低对比图、白字黑底、长英文行、旋转图。
-  - 定向测试通过，并能用失败样本证明优化前后的差异。
+  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体和 OLE 图片候选处理。
+  - 当前 golden 仅覆盖 `image/png` parser 叶子行为和 `image.format` 基础元数据；尚未落地真实 OCR 文本 fixture。
+  - 当前验证主要证明入口、诊断和辅助算法行为；尚未用真实失败样本系统证明 OCR 文本质量提升。
 - 前置条件：
   - 收集 5-10 张当前无法提取文字的真实失败样本，或构造等价最小样本。
   - 明确是否允许新增纯 Rust 图像处理依赖；默认优先使用现有 `image` crate 能力。
@@ -43,8 +44,9 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：增加图像增强、多尺度、长行处理、语言模型选择和诊断。
-  - OLE 嵌入图：增强候选图片过滤、去重和 OCR 失败诊断。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、整图 fallback、luma/HSL/max-channel 的对比度拉伸与全局二值化 fallback、小图 1.5x/2x 上采样整图 fallback、90/180/270 度整图 fallback、行切分 fallback、中英文 rec 结果选择和诊断。
+  - OCR 核心未实现：rec 输入宽度超过 `320` 的有效长行识别、小角度 deskew、旋转/增强/上采样后的重新 det、局部阈值、锐化/去噪、真实 OCR 文本 golden。
+  - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
   - P0 入口与诊断先行；否则无法判断后续预处理是否真正生效。
   - P1 预处理增强依赖可观测指标和失败样本分桶。
@@ -67,11 +69,12 @@
   - 使用当前失败图片通过 FFI/示例工具解析，记录 MIME、parser_chain、warnings、metadata、content。
   - 将失败样本分为：未进入 OCR、图片解码失败、det 无框、rec 空结果、输出乱码/低置信度。
 - 证据等级：E1。已有现象描述和代码根因线索，但尚缺稳定失败样本与自动化复现。
-- 根因假设：
-  - 非 PNG 图片可能未被 MIME 识别为图片，直接绕过 OCR。
-  - 预处理仅灰度缩放和平均亮度反色，无法覆盖低对比、小字、暗色 UI、长行、倾斜/旋转等场景。
-  - det 后处理使用简化连通域矩形，缺少 dilation/unclip/box score/旋转框，易漏框或裁剪不完整。
-  - 英文模型只在整图识别为空时兜底，混合中英文或英文行可能被中文模型误识别后不再重试。
+- 当前代码事实与残余短板：
+  - 非 PNG 图片入口已补齐到 JPEG/TIFF/WebP/BMP/GIF magic 和常见扩展名回退。
+  - 预处理 fallback 已不再只是灰度缩放和平均亮度反色；当前包含 luma/HSL/max-channel 三类灰度源、对比度拉伸、全局均值二值化和反色二值化，但未实现局部阈值、锐化或去噪。
+  - det 后处理已从原始连通域扩展为 1 像素 dilation、component score 过滤和轻量扩边；仍缺少 unclip、旋转框、NMS 和更接近 PaddleOCR 的多边形后处理。
+  - 中英文 rec 已在逐 crop 和各类 fallback 中统一比较；但长行 rec 宽度当前仍被 `MAX_REC_IMG_W=320` 限制，未达到计划中“最长 960”的效果。
+  - fallback 只在已识别文本为空时触发；对“部分识别但漏主体内容”的场景没有低质量成功判定和补跑策略。
 - 最小修复点：
   - 先补入口识别和诊断，再引入可回退的预处理增强，不一次性重写 OCR 管线。
 - 回归/相关验证：
@@ -85,13 +88,13 @@
 | 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 完成 |
 | 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 完成 |
 | 3 | 增强 OCR 诊断：记录 OCR 是否启用、解码失败、det 框数、rec 空结果、fallback 命中、平均置信度和低置信度告警 | `cargo test -p vectraparse-parsers`; 用失败样本确认 warnings/metadata 能分桶 | 完成 |
-| 4 | 增加轻量图像增强 fallback：灰度对比度拉伸、局部/全局阈值、白字黑底双路径、锐化或去噪的保守组合 | `cargo test -p vectraparse-ocr`; 低对比/暗色 UI fixture 输出非空且已知样本不回退 | 完成 |
-| 5 | 增加多尺度与小字策略：对低分辨率或 det 空结果执行 1.5x/2x 上采样，限制最大像素和重试次数 | 定向 OCR 样本测试；记录耗时和内存上限，避免大图性能失控 | 完成 |
+| 4 | 增加轻量图像增强 fallback：luma/HSL/max-channel 的对比度拉伸、全局均值二值化和反色二值化 | `cargo test -p vectraparse-ocr`; 覆盖增强变体、对比度拉伸和反色二值化辅助函数 | 完成 |
+| 5 | 增加多尺度与小字策略：在整图和增强整图识别为空后，对小图执行 1.5x/2x 上采样整图识别，限制最大像素 | 定向 OCR 辅助函数测试；当前未覆盖真实小字 OCR 文本 fixture | 完成 |
 | 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/扩边，减少碎框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 完成 |
-| 7 | 处理长行与英文行：长 crop 分段或动态 rec 宽度；每个 crop 可按置信度/字符集选择中文或英文模型 | 长英文行、混合中英文截图 fixture；确认没有大量乱码输出 | 完成 |
-| 8 | 增加旋转/倾斜保守兜底：先支持 90/180/270 度方向重试；小角度 deskew 视样本收益决定是否落地 | 旋转 fixture；验证正常方向图片不会额外引入重复文本 | 完成 |
-| 9 | 增强 OLE 嵌入图片 OCR 候选处理：格式过滤、去重 key、预算命中诊断，确保嵌入图失败不影响主文本 | `cargo test -p vectraparse-mso-binary`; OLE 样本保持可提取 | 完成 |
-| 10 | 收口 golden/文档：补 OCR golden 样本、更新验证说明，记录未覆盖场景和后续边界 | `cargo test --workspace` 或定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 完成 |
+| 7 | 处理长行与英文行：每个 crop 可按置信度/字符集选择中文或英文模型；长 crop 分段未实现，动态 rec 宽度当前仍被 `320` 上限限制 | 当前测试覆盖中英文结果选择；长英文真实 OCR fixture 和 960 宽度行为未落地 | 部分完成 |
+| 8 | 增加旋转保守兜底：支持 90/180/270 度整图识别重试；未对旋转图重新 det，未实现小角度 deskew | 当前测试覆盖旋转变体生成；未覆盖旋转真实 OCR 文本 fixture | 部分完成 |
+| 9 | 增强 OLE 嵌入图片 OCR 候选处理：仅 `.doc` 路径做图片候选汇总、格式过滤、去重 key 和预算命中诊断，嵌入图失败不影响主文本 | `cargo test -p vectraparse-mso-binary`; 当前 WebP 支持直接流，payload 切片未实现 | 完成 |
+| 10 | 收口 golden/文档：当前仅将 `image/png` stub 纳入 parser 提取矩阵；真实 OCR 文本样本尚未进入 golden | 定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 部分完成 |
 
 ## 6. 验证计划
 
@@ -108,9 +111,11 @@
 - 验证环境：
   - 本地 Rust workspace，使用内嵌 `data/det.onnx`、`data/chinese/rec.onnx`、`data/english/rec.onnx` 和字典。
 - 不可执行验证项：
-  - 没有真实失败样本前，只能用构造样本覆盖典型场景，不能证明所有生产失败图已修复。
+  - 没有真实失败样本前，只能用构造样本和辅助函数测试覆盖典型路径，不能证明生产 OCR 文本质量已系统提升。
+  - 当前没有真实 OCR 文本 golden，无法自动发现长行、小字、旋转、低对比场景的识别质量回退。
 - 残余风险：
-  - 预处理增强可能提升召回但带来误识别和重复文本，需要用置信度、字符集检查和 fallback 选择控制。
+  - 预处理增强可能提升召回但带来误识别和重复文本；当前只有行级置信度和中英文选择，缺少更严格的乱码/重复字符过滤。
+  - fallback 仅在输出为空时触发，对部分漏识别场景仍可能直接返回不完整结果。
   - 不更换模型的前提下，极端模糊、严重透视、手写字或超低分辨率图片仍可能无法可靠提取。
 
 当前验证记录：
@@ -141,7 +146,8 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ffi parse_runtime_routes_jpeg_bytes_into_image_parser -- --nocapture`
 - 已完成轻量图像增强 fallback：
   - `vectraparse-ocr` 在整图和整图英文 fallback 失败后，会继续尝试 `contrast`、`binary`、`binary-invert` 三种保守增强图再做识别。
-  - 当前实现覆盖低对比和白字黑底双路径；锐化/去噪仍未单独加入，保留到后续如样本证明有必要时再扩展。
+  - 当前实现实际包含 luma、HSL lightness、max-channel 三类灰度源，每类都生成 `contrast`、`binary`、`binary-invert`；二值化为全局均值阈值，不是局部阈值。
+  - 锐化/去噪仍未单独加入，保留到后续如样本证明有必要时再扩展。
   - 成功命中时会在 diagnostics.fallback 中记录为 `enhanced:<mode>` 或 `enhanced:<mode>:alt`。
 - 本轮验证命令：
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr enhancement_variants_include_expected_modes -- --nocapture`
@@ -167,9 +173,9 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr extract_boxes_from_map_adds_small_crop_margin -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr enhancement_variants_include_expected_modes -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
-- 已完成长行与英文行处理：
-  - `vectraparse-ocr` 现按 crop 长宽比动态放大 `rec` 输入宽度，最长可到 `960`，避免长行被固定压缩到 `320`。
-  - 检测框裁剪、整图 fallback、增强图 fallback、上采样 fallback 和行切分 fallback 现在都会比较中英文两个识别结果。
+- 已部分完成长行与英文行处理：
+  - `vectraparse-ocr` 当前有 `dynamic_rec_target_width` 入口，但 `MAX_REC_IMG_W=320`，默认配置下不会把 `rec` 输入宽度放大到 960；长行仍可能被压缩到 320。
+  - 检测框裁剪、整图 fallback、增强图 fallback、上采样 fallback、旋转 fallback 和行切分 fallback 现在都会比较中英文两个识别结果。
   - 结果选择优先级基于空结果、ASCII 字符比例和置信度差值，英文行不再只在“中文完全为空”时才有机会走英文模型。
 - 本轮验证命令：
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr dynamic_rec_target_width_grows_for_long_lines -- --nocapture`
@@ -177,27 +183,29 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr select_recognition_prefers_primary_when_alt_is_not_clear_win -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr extract_boxes_from_map_merges_nearby_fragments_after_dilation -- --nocapture`
-- 已完成旋转保守兜底：
+- 已部分完成旋转保守兜底：
   - `vectraparse-ocr` 在整图、增强图和上采样 fallback 仍为空后，会继续尝试 `90/180/270` 三个方向的整图识别。
-  - 旋转路径同样会走逐 crop 的中英文结果选择逻辑；命中时 diagnostics.fallback 记为 `rotated:<angle>` 或 `rotated:<angle>:alt`。
+  - 旋转路径只做整图识别，不会对旋转后的图片重新跑 det 和逐框 rec；命中时 diagnostics.fallback 记为 `rotated:<angle>` 或 `rotated:<angle>:alt`。
   - 当前未实现小角度 deskew，仍保持在计划边界外，后续是否需要取决于真实失败样本收益。
 - 本轮验证命令：
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr rotation_variants_include_expected_angles -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr select_recognition_can_choose_alt_for_ascii_line -- --nocapture`
 - 已完成 OLE 嵌入图片 OCR 候选处理增强：
-  - `vectraparse-mso-binary` 现会先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
+  - `vectraparse-mso-binary` 现会在 `.doc` 路径先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
   - 去重 key 从“长度 + 前 4 字节”提升为“长度 + 前后 64 字节哈希”，降低同源嵌入图被重复 OCR 的概率。
   - OLE 图片 OCR 现在会向上层回传 `ole-image-ocr-budget-hit`、`ole-image-ocr-model-unavailable`、`ole-image-ocr-failed` 等 warning；图片 OCR 失败不会覆盖或中断主文本提取。
+  - 复合 payload 切片当前支持 PNG/JPEG/GIF/BMP/DIB；未实现 WebP payload 切片。
 - 本轮验证命令：
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-mso-binary summarizes_doc_image_ocr_candidates_dedups_and_accepts_webp -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-mso-binary summarizes_doc_image_ocr_candidates_marks_budget_hit -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-mso-binary extract_text_by_kind_propagates_doc_image_ocr_budget_warning -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-mso-binary carves_embedded_images_from_stream_payload -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-mso-binary asserts_empty_content_for_non_text_ole_payload -- --nocapture`
-- 已完成收口 golden/文档：
+- 已部分完成收口 golden/文档：
   - 将 OCR 相关的稳定样本并入现有提取矩阵：`vectraparse-parsers::extraction_golden_matrix_matches` 现覆盖 `image/png`，用于验证图片 parser 叶子行为和 `image.format` 基础元数据。
   - 同步修复 `ImageMetadataParser` 对 `png` 的格式识别遗漏，并补充显式回归测试。
+  - 当前没有纳入真实 OCR 文本 fixture；`image/png` 覆盖的是格式元数据，不证明 OCR 文本识别质量。
   - 收口验证采用分组定向全量测试替代 `cargo test --workspace`：基础 crate 跑 `vectraparse-core`、`vectraparse-mime`；OCR 相关 crate 跑 `vectraparse-ocr`、`vectraparse-parsers`、`vectraparse-ffi`、`vectraparse-mso-binary`。
 - 本轮验证命令：
   - `cargo test -p vectraparse-core -p vectraparse-mime`
@@ -233,8 +241,9 @@
 | 2026-06-01 | 完成执行计划步骤 4：增加轻量图像增强 fallback | 为低对比和白字黑底场景增加整图增强识别兜底 |
 | 2026-06-01 | 完成执行计划步骤 5：增加多尺度与小字策略 | 为小图和小字号场景增加受限上采样整图识别兜底 |
 | 2026-06-01 | 完成执行计划步骤 6：改进文本框后处理 | 通过膨胀合并碎框、component score 过滤和旧逻辑回退提升 det 框稳定性 |
-| 2026-06-01 | 完成执行计划步骤 7：处理长行与英文行 | 通过动态 rec 宽度和逐 crop 中英文结果选择提升长英文行识别稳定性 |
-| 2026-06-01 | 完成执行计划步骤 8：增加旋转保守兜底 | 通过 90/180/270 度整图重试覆盖横竖方向错误场景 |
-| 2026-06-01 | 完成执行计划步骤 9：增强 OLE 嵌入图片 OCR 候选处理 | 通过候选去重、预算告警和失败诊断降低嵌入图 OCR 对主提取链路的干扰 |
-| 2026-06-01 | 完成执行计划步骤 10：收口 golden/文档 | 通过稳定图片样本并入提取矩阵、分组全量测试和边界记录完成本轮 OCR 优化闭环 |
+| 2026-06-01 | 部分完成执行计划步骤 7：处理长行与英文行 | 已完成逐 crop 中英文结果选择；长行动态宽度实际仍受 `320` 上限限制 |
+| 2026-06-01 | 部分完成执行计划步骤 8：增加旋转保守兜底 | 已完成 90/180/270 度整图识别重试；未对旋转图重新 det，未实现小角度 deskew |
+| 2026-06-01 | 完成执行计划步骤 9：增强 OLE 嵌入图片 OCR 候选处理 | 通过 `.doc` 候选去重、预算告警和失败诊断降低嵌入图 OCR 对主提取链路的干扰 |
+| 2026-06-01 | 部分完成执行计划步骤 10：收口 golden/文档 | 已覆盖 `image/png` parser 元数据；真实 OCR 文本 golden 尚未落地 |
 | 2026-06-01 | 修复 PNG OCR 回归：统一 rec 白底预处理并移除 det 无框伪整图框 | 针对普通 RGBA PNG 无法识别的回归，恢复 det/rec 图像前处理一致性并让整图 fallback 只在真实 fallback 阶段触发 |
+| 2026-06-01 | 按当前代码实现校准 OCR 计划文档 | 移除与代码不一致的 960 rec 宽度、真实 OCR golden、旋转逐框识别等完成表述 |
