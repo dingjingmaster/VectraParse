@@ -11,6 +11,7 @@ const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx"
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
+const MAX_REC_IMG_W: usize = 960;
 
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
@@ -65,6 +66,19 @@ pub struct OrtOcrEngine {
     rec_alt: Option<OrtSession>,
     alphabet: Vec<String>,
     alphabet_alt: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecVariant {
+    Primary,
+    Alt,
+}
+
+#[derive(Debug, Clone)]
+struct RecCandidate {
+    text: String,
+    confidence: f32,
+    variant: RecVariant,
 }
 
 struct OrtSession {
@@ -127,13 +141,11 @@ impl OrtOcrEngine {
         let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
         for b in boxes.iter() {
             let crop = crop_box(img, *b);
-            let (rec_input, rec_shape) = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
-            let (output, out_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])
+            let candidate = self
+                .recognize_best(&crop, cfg)
                 .map_err(|e| format!("recognize: {e}"))?;
-            let logits = &output[0];
-            let (text, confidence) = ctc_greedy_decode(logits, &out_shapes[0], &self.alphabet);
-            if !text.trim().is_empty() {
-                lines.push((b.1, b.0, text, confidence));
+            if !candidate.text.trim().is_empty() {
+                lines.push((b.1, b.0, candidate.text, candidate.confidence));
             }
         }
 
@@ -151,84 +163,46 @@ impl OrtOcrEngine {
         let mut fallback = None;
 
         if text.trim().is_empty() {
-            let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-            let (rec_output, rec_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])
+            let candidate = self
+                .recognize_best(img, cfg)
                 .map_err(|e| format!("recognize: {e}"))?;
-            let logits = &rec_output[0];
-            let (fallback_text, fallback_confidence) = ctc_greedy_decode(logits, &rec_shapes[0], &self.alphabet);
-            text = fallback_text;
-            confidence = fallback_confidence;
-            fallback = Some("whole-image".to_string());
-
-            if text.trim().is_empty()
-                && let Some(rec_alt) = &self.rec_alt
-            {
-                let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-                let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
-                    .map_err(|e| format!("recognize-alt: {e}"))?;
-                let logits = &alt_output[0];
-                let (alt_text, alt_confidence) = ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
-                text = alt_text;
-                confidence = alt_confidence;
-                fallback = Some("whole-image-alt".to_string());
-            }
+            text = candidate.text;
+            confidence = candidate.confidence;
+            fallback = Some(match candidate.variant {
+                RecVariant::Primary => "whole-image".to_string(),
+                RecVariant::Alt => "whole-image-alt".to_string(),
+            });
 
             if text.trim().is_empty() {
                 for (name, enhanced) in enhancement_variants(img) {
-                    let (rec_input, rec_shape) = preprocess_rec_image(&enhanced, cfg.rec_img_h, cfg.rec_img_w)?;
-                    let (enh_output, enh_shapes) =
-                        ort::run_session(&self.rec, &[rec_input.clone()], &[rec_shape.clone()])
+                    let candidate = self
+                        .recognize_best(&enhanced, cfg)
                         .map_err(|e| format!("recognize: {e}"))?;
-                    let logits = &enh_output[0];
-                    let (enh_text, enh_confidence) = ctc_greedy_decode(logits, &enh_shapes[0], &self.alphabet);
-                    if !enh_text.trim().is_empty() {
-                        text = enh_text;
-                        confidence = enh_confidence;
-                        fallback = Some(format!("enhanced:{name}"));
+                    if !candidate.text.trim().is_empty() {
+                        text = candidate.text;
+                        confidence = candidate.confidence;
+                        fallback = Some(match candidate.variant {
+                            RecVariant::Primary => format!("enhanced:{name}"),
+                            RecVariant::Alt => format!("enhanced:{name}:alt"),
+                        });
                         break;
-                    }
-                    if let Some(rec_alt) = &self.rec_alt {
-                        let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
-                            .map_err(|e| format!("recognize-alt: {e}"))?;
-                        let logits = &alt_output[0];
-                        let (alt_text, alt_confidence) =
-                            ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
-                        if !alt_text.trim().is_empty() {
-                            text = alt_text;
-                            confidence = alt_confidence;
-                            fallback = Some(format!("enhanced:{name}:alt"));
-                            break;
-                        }
                     }
                 }
             }
 
             if text.trim().is_empty() {
                 for (name, upscaled) in upscale_variants(img) {
-                    let (rec_input, rec_shape) = preprocess_rec_image(&upscaled, cfg.rec_img_h, cfg.rec_img_w)?;
-                    let (up_output, up_shapes) =
-                        ort::run_session(&self.rec, &[rec_input.clone()], &[rec_shape.clone()])
-                            .map_err(|e| format!("recognize: {e}"))?;
-                    let logits = &up_output[0];
-                    let (up_text, up_confidence) = ctc_greedy_decode(logits, &up_shapes[0], &self.alphabet);
-                    if !up_text.trim().is_empty() {
-                        text = up_text;
-                        confidence = up_confidence;
-                        fallback = Some(format!("upscaled:{name}"));
+                    let candidate = self
+                        .recognize_best(&upscaled, cfg)
+                        .map_err(|e| format!("recognize: {e}"))?;
+                    if !candidate.text.trim().is_empty() {
+                        text = candidate.text;
+                        confidence = candidate.confidence;
+                        fallback = Some(match candidate.variant {
+                            RecVariant::Primary => format!("upscaled:{name}"),
+                            RecVariant::Alt => format!("upscaled:{name}:alt"),
+                        });
                         break;
-                    }
-                    if let Some(rec_alt) = &self.rec_alt {
-                        let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
-                            .map_err(|e| format!("recognize-alt: {e}"))?;
-                        let logits = &alt_output[0];
-                        let (alt_text, alt_confidence) =
-                            ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
-                        if !alt_text.trim().is_empty() {
-                            text = alt_text;
-                            confidence = alt_confidence;
-                            fallback = Some(format!("upscaled:{name}:alt"));
-                            break;
-                        }
                     }
                 }
             }
@@ -237,14 +211,11 @@ impl OrtOcrEngine {
                 let mut line_texts = Vec::new();
                 let mut confs = Vec::new();
                 for line in fallback_line_crops(img) {
-                    let (rec_input, rec_shape) = preprocess_rec_image(&line, cfg.rec_img_h, cfg.rec_img_w)?;
-                    if let Ok((ln_output, ln_shapes)) = ort::run_session(&self.rec, &[rec_input], &[rec_shape]) {
-                        let logits = &ln_output[0];
-                        let (t, c) = ctc_greedy_decode(logits, &ln_shapes[0], &self.alphabet);
-                        if !t.trim().is_empty() {
-                            line_texts.push(t);
-                            confs.push(c);
-                        }
+                    if let Ok(candidate) = self.recognize_best(&line, cfg)
+                        && !candidate.text.trim().is_empty()
+                    {
+                        line_texts.push(candidate.text);
+                        confs.push(candidate.confidence);
                     }
                 }
                 if !line_texts.is_empty() {
@@ -272,6 +243,42 @@ impl OrtOcrEngine {
                 fallback,
                 empty_result,
             },
+        })
+    }
+
+    fn recognize_best(&self, image: &DynamicImage, cfg: &OcrConfig) -> Result<RecCandidate, String> {
+        let primary = self.recognize_candidate(&self.rec, &self.alphabet, image, cfg, RecVariant::Primary)?;
+        let alt = if let Some(rec_alt) = &self.rec_alt {
+            Some(self.recognize_candidate(
+                rec_alt,
+                &self.alphabet_alt,
+                image,
+                cfg,
+                RecVariant::Alt,
+            )?)
+        } else {
+            None
+        };
+        Ok(select_recognition(primary, alt))
+    }
+
+    fn recognize_candidate(
+        &self,
+        session: &OrtSession,
+        alphabet: &[String],
+        image: &DynamicImage,
+        cfg: &OcrConfig,
+        variant: RecVariant,
+    ) -> Result<RecCandidate, String> {
+        let target_w = dynamic_rec_target_width(image, cfg.rec_img_h, cfg.rec_img_w);
+        let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
+        let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
+        let logits = &output[0];
+        let (text, confidence) = ctc_greedy_decode(logits, &out_shapes[0], alphabet);
+        Ok(RecCandidate {
+            text,
+            confidence,
+            variant,
         })
     }
 }
@@ -632,6 +639,17 @@ fn preprocess_rec_image(
     Ok((data, shape))
 }
 
+fn dynamic_rec_target_width(image: &DynamicImage, target_h: usize, base_w: usize) -> usize {
+    let gray = image.to_luma8();
+    let (src_w, src_h) = gray.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return base_w.max(1);
+    }
+    let ratio = src_w as f32 / src_h as f32;
+    let raw = (ratio * target_h as f32).ceil() as usize;
+    raw.max(base_w).clamp(1, MAX_REC_IMG_W.max(base_w))
+}
+
 fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
     let rgba = image.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -840,6 +858,49 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
     (text, confidence)
 }
 
+fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCandidate {
+    let Some(alt) = alt else {
+        return primary;
+    };
+    let primary_empty = primary.text.trim().is_empty();
+    let alt_empty = alt.text.trim().is_empty();
+    if primary_empty && !alt_empty {
+        return alt;
+    }
+    if alt_empty {
+        return primary;
+    }
+
+    let primary_ascii = ascii_ratio(&primary.text);
+    let alt_ascii = ascii_ratio(&alt.text);
+    if alt_ascii >= 0.75 && primary_ascii <= 0.5 && alt.confidence + 0.02 >= primary.confidence {
+        return alt;
+    }
+    if alt.confidence > primary.confidence + 0.08 {
+        return alt;
+    }
+    primary
+}
+
+fn ascii_ratio(text: &str) -> f32 {
+    let mut total = 0usize;
+    let mut ascii = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation() {
+            ascii += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        ascii as f32 / total as f32
+    }
+}
+
 fn g_outer_shape(data: &[f32], output_shape: &[usize]) -> Vec<usize> {
     let total = data.len();
     let mut shape = output_shape.to_vec();
@@ -965,5 +1026,45 @@ mod tests {
         }
         let boxes = extract_boxes_from_map(&data, 0.5, 1, map_w, map_h);
         assert_eq!(boxes, vec![(1, 1, 5, 5)]);
+    }
+
+    #[test]
+    fn dynamic_rec_target_width_grows_for_long_lines() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
+        assert_eq!(dynamic_rec_target_width(&img, 48, 320), 960);
+    }
+
+    #[test]
+    fn select_recognition_can_choose_alt_for_ascii_line() {
+        let primary = RecCandidate {
+            text: "川川川".to_string(),
+            confidence: 0.61,
+            variant: RecVariant::Primary,
+        };
+        let alt = RecCandidate {
+            text: "Invoice 42".to_string(),
+            confidence: 0.60,
+            variant: RecVariant::Alt,
+        };
+        let chosen = select_recognition(primary, Some(alt));
+        assert_eq!(chosen.variant, RecVariant::Alt);
+        assert_eq!(chosen.text, "Invoice 42");
+    }
+
+    #[test]
+    fn select_recognition_prefers_primary_when_alt_is_not_clear_win() {
+        let primary = RecCandidate {
+            text: "测试文本".to_string(),
+            confidence: 0.68,
+            variant: RecVariant::Primary,
+        };
+        let alt = RecCandidate {
+            text: "Test Text".to_string(),
+            confidence: 0.60,
+            variant: RecVariant::Alt,
+        };
+        let chosen = select_recognition(primary.clone(), Some(alt));
+        assert_eq!(chosen.variant, primary.variant);
+        assert_eq!(chosen.text, primary.text);
     }
 }
