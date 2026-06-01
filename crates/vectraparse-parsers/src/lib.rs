@@ -1283,6 +1283,14 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
     metadata.insert("image.ocr.box_count", ocr.diagnostics.det_box_count.to_string());
     metadata.insert("image.ocr.line_count", ocr.diagnostics.line_count.to_string());
     metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
+    metadata.insert(
+        "image.ocr.source_has_alpha",
+        ocr.diagnostics.source_has_alpha.to_string(),
+    );
+    metadata.insert(
+        "image.ocr.detect_used_whole_image_box",
+        ocr.diagnostics.detect_used_whole_image_box.to_string(),
+    );
     if let Some(fallback) = &ocr.diagnostics.fallback {
         metadata.insert("image.ocr.fallback", fallback.clone());
     }
@@ -3468,6 +3476,8 @@ mod tests {
                 line_count: 1,
                 fallback: Some("whole-image".to_string()),
                 empty_result: false,
+                source_has_alpha: true,
+                detect_used_whole_image_box: false,
             },
         };
         apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
@@ -3499,6 +3509,20 @@ mod tests {
                 .map(String::as_str),
             Some("false")
         );
+        assert_eq!(
+            metadata
+                .values("image.ocr.source_has_alpha")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.detect_used_whole_image_box")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("false")
+        );
         assert!(warnings.iter().any(|w| w == "ocr-dictionary-missing"));
         assert!(warnings.iter().any(|w| w == "image-ocr-low-confidence"));
     }
@@ -3516,12 +3540,21 @@ mod tests {
                 line_count: 0,
                 fallback: Some("line-crops".to_string()),
                 empty_result: true,
+                source_has_alpha: false,
+                detect_used_whole_image_box: true,
             },
         };
         apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
         assert_eq!(
             metadata
                 .values("image.ocr.empty_result")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.detect_used_whole_image_box")
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("true")

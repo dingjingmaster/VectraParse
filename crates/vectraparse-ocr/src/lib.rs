@@ -58,6 +58,8 @@ pub struct OcrDiagnostics {
     pub line_count: usize,
     pub fallback: Option<String>,
     pub empty_result: bool,
+    pub source_has_alpha: bool,
+    pub detect_used_whole_image_box: bool,
 }
 
 pub struct OrtOcrEngine {
@@ -133,10 +135,10 @@ impl OrtOcrEngine {
     }
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
-        let boxes = self
-            .detect_text_boxes(img, cfg)
-            .map_err(|e| format!("detect: {e}"))?;
+        let source_has_alpha = has_non_opaque_alpha(img);
+        let boxes = self.detect_text_boxes(img, cfg).map_err(|e| format!("detect: {e}"))?;
         let det_box_count = boxes.len();
+        let detect_used_whole_image_box = det_box_count == 0;
 
         let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
         for b in boxes.iter() {
@@ -250,6 +252,21 @@ impl OrtOcrEngine {
         };
         let empty_result = text.trim().is_empty();
 
+        if std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1") {
+            let (w, h) = img.dimensions();
+            eprintln!(
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} whole_image_box={} fallback={} empty={}",
+                w,
+                h,
+                source_has_alpha,
+                det_box_count,
+                lines.len(),
+                detect_used_whole_image_box,
+                fallback.as_deref().unwrap_or("-"),
+                empty_result
+            );
+        }
+
         Ok(OcrResult {
             text,
             confidence,
@@ -259,6 +276,8 @@ impl OrtOcrEngine {
                 line_count: lines.len(),
                 fallback,
                 empty_result,
+                source_has_alpha,
+                detect_used_whole_image_box,
             },
         })
     }
@@ -366,9 +385,6 @@ impl OrtOcrEngine {
         }
 
         merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
-        if merged.is_empty() {
-            merged.push((0, 0, src_w, src_h));
-        }
         Ok(merged)
     }
 }
@@ -620,7 +636,7 @@ fn preprocess_rec_image(
     target_h: usize,
     target_w: usize,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let gray = image.to_luma8();
+    let gray = to_luma_on_white(image);
     let (src_w, src_h) = gray.dimensions();
     let ratio = src_w as f32 / src_h as f32;
     let mut resized_w = (ratio * target_h as f32).ceil() as usize;
@@ -657,7 +673,7 @@ fn preprocess_rec_image(
 }
 
 fn dynamic_rec_target_width(image: &DynamicImage, target_h: usize, base_w: usize) -> usize {
-    let gray = image.to_luma8();
+    let gray = to_luma_on_white(image);
     let (src_w, src_h) = gray.dimensions();
     if src_w == 0 || src_h == 0 {
         return base_w.max(1);
@@ -682,6 +698,15 @@ fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
         }
     }
     out
+}
+
+fn to_luma_on_white(image: &DynamicImage) -> GrayImage {
+    DynamicImage::ImageRgb8(to_rgb_on_white(image)).to_luma8()
+}
+
+fn has_non_opaque_alpha(image: &DynamicImage) -> bool {
+    let rgba = image.to_rgba8();
+    rgba.pixels().any(|p| p[3] < 255)
 }
 
 fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
@@ -1102,5 +1127,21 @@ mod tests {
         assert_eq!(variants[0].1.dimensions(), (8, 12));
         assert_eq!(variants[1].1.dimensions(), (12, 8));
         assert_eq!(variants[2].1.dimensions(), (8, 12));
+    }
+
+    #[test]
+    fn detects_non_opaque_alpha_pixels() {
+        let mut rgba = image::RgbaImage::new(2, 1);
+        rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        rgba.put_pixel(1, 0, image::Rgba([0, 0, 0, 32]));
+        assert!(has_non_opaque_alpha(&DynamicImage::ImageRgba8(rgba)));
+    }
+
+    #[test]
+    fn rec_luma_blends_transparent_pixels_onto_white() {
+        let mut rgba = image::RgbaImage::new(1, 1);
+        rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+        let gray = to_luma_on_white(&DynamicImage::ImageRgba8(rgba));
+        assert_eq!(gray.get_pixel(0, 0)[0], 255);
     }
 }
