@@ -1185,9 +1185,6 @@ fn parse_doc_piece_table_plcf(word: &[u8], plcf: &[u8], ccp_text: usize, fib: Do
             }
             text.push_str(&clean_doc_text(&String::from_utf16_lossy(&units)));
         }
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
     }
     Some(clean_doc_text(&text))
 }

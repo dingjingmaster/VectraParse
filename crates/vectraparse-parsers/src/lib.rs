@@ -1176,6 +1176,8 @@ impl Parser for ImageMetadataParser {
         metadata.insert("image.mime", media_type);
         let format = if input.starts_with(&[0xFF, 0xD8, 0xFF]) {
             "jpeg"
+        } else if input.starts_with(b"\x89PNG\r\n\x1A\n") {
+            "png"
         } else if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
             "tiff"
         } else if input.starts_with(b"GIF87a") || input.starts_with(b"GIF89a") {
@@ -3393,6 +3395,15 @@ mod tests {
                 .map(String::as_str),
             Some("image/bmp")
         );
+
+        let png = p.parse(b"\x89PNG\r\n\x1A\nstub", "image/png").expect("png");
+        assert_eq!(
+            png.metadata
+                .values("image.format")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("png")
+        );
     }
 
     #[test]
@@ -4022,12 +4033,20 @@ mod tests {
                 true,
                 "html.title",
             ),
+            (
+                "image/png",
+                b"\x89PNG\r\n\x1A\nstub".as_slice(),
+                "ImageMetadataParser",
+                false,
+                "image.format",
+            ),
         ];
         let mut mismatches = Vec::new();
         for (mime, input, parser_name, expect_content, key) in cases {
             let out = match parser_name {
                 "TxtParser" => TxtParser.parse(input, mime),
                 "TextAndCsvParser" => TextAndCsvParser.parse(input, mime),
+                "ImageMetadataParser" => ImageMetadataParser.parse(input, mime),
                 _ => HtmlParser.parse(input, mime),
             }
             .expect("parse outcome");
