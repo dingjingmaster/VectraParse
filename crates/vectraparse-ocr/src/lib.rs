@@ -437,12 +437,52 @@ fn extract_boxes_from_map(
             mask[y * w + x] = data[y * w + x] >= thresh;
         }
     }
+    let dilated = dilate_mask(&mask, w, h);
+    let mut boxes = collect_boxes_from_mask(data, &mask, &dilated, thresh, min_area, w, h);
+    if boxes.is_empty() {
+        boxes = collect_boxes_from_mask(data, &mask, &mask, thresh, min_area, w, h);
+    }
+    boxes
+}
+
+fn dilate_mask(mask: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let mut out = vec![false; mask.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut active = false;
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(h.saturating_sub(1));
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(w.saturating_sub(1));
+            'scan: for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    if mask[ny * w + nx] {
+                        active = true;
+                        break 'scan;
+                    }
+                }
+            }
+            out[y * w + x] = active;
+        }
+    }
+    out
+}
+
+fn collect_boxes_from_mask(
+    data: &[f32],
+    raw_mask: &[bool],
+    component_mask: &[bool],
+    thresh: f32,
+    min_area: usize,
+    w: usize,
+    h: usize,
+) -> Vec<BoxRect> {
     let mut visited = vec![false; h * w];
     let mut boxes = Vec::new();
     for y in 0..h {
         for x in 0..w {
             let idx = y * w + x;
-            if visited[idx] || !mask[idx] {
+            if visited[idx] || !component_mask[idx] {
                 continue;
             }
             let mut queue = vec![(x, y)];
@@ -451,9 +491,7 @@ fn extract_boxes_from_map(
             let mut min_y = y;
             let mut max_x = x;
             let mut max_y = y;
-            let mut area = 0usize;
             while let Some((cx, cy)) = queue.pop() {
-                area += 1;
                 min_x = min_x.min(cx);
                 min_y = min_y.min(cy);
                 max_x = max_x.max(cx);
@@ -469,19 +507,81 @@ fn extract_boxes_from_map(
                         continue;
                     }
                     let nidx = ny * w + nx;
-                    if visited[nidx] || !mask[nidx] {
+                    if visited[nidx] || !component_mask[nidx] {
                         continue;
                     }
                     visited[nidx] = true;
                     queue.push((nx, ny));
                 }
             }
-            if area >= min_area {
-                boxes.push((min_x as u32, min_y as u32, (max_x + 1) as u32, (max_y + 1) as u32));
+
+            let positive_area = count_mask_area(raw_mask, min_x, min_y, max_x, max_y, w);
+            if positive_area < min_area {
+                continue;
             }
+
+            let score = average_component_score(data, component_mask, min_x, min_y, max_x, max_y, w);
+            if score < (thresh * 0.3) {
+                continue;
+            }
+
+            boxes.push(expand_box(min_x, min_y, max_x, max_y, w, h));
         }
     }
     boxes
+}
+
+fn count_mask_area(mask: &[bool], min_x: usize, min_y: usize, max_x: usize, max_y: usize, w: usize) -> usize {
+    let mut area = 0usize;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            if mask[y * w + x] {
+                area += 1;
+            }
+        }
+    }
+    area
+}
+
+fn average_component_score(
+    data: &[f32],
+    component_mask: &[bool],
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    w: usize,
+) -> f32 {
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            if component_mask[y * w + x] {
+                sum += data[y * w + x].max(0.0);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f32
+    }
+}
+
+fn expand_box(min_x: usize, min_y: usize, max_x: usize, max_y: usize, w: usize, h: usize) -> BoxRect {
+    let rect_w = max_x.saturating_sub(min_x) + 1;
+    let rect_h = max_y.saturating_sub(min_y) + 1;
+    let pad = if rect_w.min(rect_h) > 4 {
+        (rect_w.min(rect_h) / 8).max(1)
+    } else {
+        0
+    };
+    let x0 = min_x.saturating_sub(pad);
+    let y0 = min_y.saturating_sub(pad);
+    let x1 = (max_x + 1 + pad).min(w);
+    let y1 = (max_y + 1 + pad).min(h);
+    (x0 as u32, y0 as u32, x1 as u32, y1 as u32)
 }
 
 fn crop_box(img: &DynamicImage, b: BoxRect) -> DynamicImage {
@@ -829,5 +929,41 @@ mod tests {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["1.5x".to_string()]);
+    }
+
+    #[test]
+    fn extract_boxes_from_map_merges_nearby_fragments_after_dilation() {
+        let map_w = 8;
+        let map_h = 4;
+        let mut data = vec![0.0f32; (map_w * map_h) as usize];
+        for x in [1usize, 2, 4, 5] {
+            data[map_w as usize + x] = 0.9;
+        }
+        let boxes = extract_boxes_from_map(&data, 0.5, 1, map_w, map_h);
+        assert_eq!(boxes.len(), 1);
+    }
+
+    #[test]
+    fn extract_boxes_from_map_keeps_raw_fallback_for_tiny_high_score_blob() {
+        let map_w = 6;
+        let map_h = 6;
+        let mut data = vec![0.0f32; (map_w * map_h) as usize];
+        data[2 * map_w as usize + 2] = 0.95;
+        let boxes = extract_boxes_from_map(&data, 0.5, 1, map_w, map_h);
+        assert_eq!(boxes.len(), 1);
+    }
+
+    #[test]
+    fn extract_boxes_from_map_adds_small_crop_margin() {
+        let map_w = 6;
+        let map_h = 6;
+        let mut data = vec![0.0f32; (map_w * map_h) as usize];
+        for y in 2usize..=3 {
+            for x in 2usize..=3 {
+                data[y * map_w as usize + x] = 0.9;
+            }
+        }
+        let boxes = extract_boxes_from_map(&data, 0.5, 1, map_w, map_h);
+        assert_eq!(boxes, vec![(1, 1, 5, 5)]);
     }
 }
