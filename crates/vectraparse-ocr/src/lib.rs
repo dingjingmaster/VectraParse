@@ -11,7 +11,9 @@ const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx"
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
-const MAX_REC_IMG_W: usize = 320;
+const MAX_REC_IMG_W: usize = 960;
+const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
+const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
 
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
@@ -136,7 +138,9 @@ impl OrtOcrEngine {
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
         let source_has_alpha = has_non_opaque_alpha(img);
-        let boxes = self.detect_text_boxes(img, cfg).map_err(|e| format!("detect: {e}"))?;
+        let boxes = self
+            .detect_text_boxes(img, cfg)
+            .map_err(|e| format!("detect: {e}"))?;
         let det_box_count = boxes.len();
         let detect_used_whole_image_box = det_box_count == 0;
 
@@ -166,19 +170,21 @@ impl OrtOcrEngine {
             let candidate = self
                 .recognize_best(img, cfg)
                 .map_err(|e| format!("recognize: {e}"))?;
-            text = candidate.text;
             confidence = candidate.confidence;
-            fallback = Some(match candidate.variant {
-                RecVariant::Primary => "whole-image".to_string(),
-                RecVariant::Alt => "whole-image-alt".to_string(),
-            });
+            if is_usable_recognition(&candidate) {
+                text = candidate.text;
+                fallback = Some(match candidate.variant {
+                    RecVariant::Primary => "whole-image".to_string(),
+                    RecVariant::Alt => "whole-image-alt".to_string(),
+                });
+            }
 
             if text.trim().is_empty() {
                 for (name, enhanced) in enhancement_variants(img) {
                     let candidate = self
                         .recognize_best(&enhanced, cfg)
                         .map_err(|e| format!("recognize: {e}"))?;
-                    if !candidate.text.trim().is_empty() {
+                    if is_usable_recognition(&candidate) {
                         text = candidate.text;
                         confidence = candidate.confidence;
                         fallback = Some(match candidate.variant {
@@ -195,7 +201,7 @@ impl OrtOcrEngine {
                     let candidate = self
                         .recognize_best(&upscaled, cfg)
                         .map_err(|e| format!("recognize: {e}"))?;
-                    if !candidate.text.trim().is_empty() {
+                    if is_usable_recognition(&candidate) {
                         text = candidate.text;
                         confidence = candidate.confidence;
                         fallback = Some(match candidate.variant {
@@ -212,7 +218,7 @@ impl OrtOcrEngine {
                     let candidate = self
                         .recognize_best(&rotated, cfg)
                         .map_err(|e| format!("recognize: {e}"))?;
-                    if !candidate.text.trim().is_empty() {
+                    if is_usable_recognition(&candidate) {
                         text = candidate.text;
                         confidence = candidate.confidence;
                         fallback = Some(match candidate.variant {
@@ -229,7 +235,7 @@ impl OrtOcrEngine {
                 let mut confs = Vec::new();
                 for line in fallback_line_crops(img) {
                     if let Ok(candidate) = self.recognize_best(&line, cfg)
-                        && !candidate.text.trim().is_empty()
+                        && is_usable_recognition(&candidate)
                     {
                         line_texts.push(candidate.text);
                         confs.push(candidate.confidence);
@@ -280,8 +286,13 @@ impl OrtOcrEngine {
         })
     }
 
-    fn recognize_best(&self, image: &DynamicImage, cfg: &OcrConfig) -> Result<RecCandidate, String> {
-        let primary = self.recognize_candidate(&self.rec, &self.alphabet, image, cfg, RecVariant::Primary)?;
+    fn recognize_best(
+        &self,
+        image: &DynamicImage,
+        cfg: &OcrConfig,
+    ) -> Result<RecCandidate, String> {
+        let primary =
+            self.recognize_candidate(&self.rec, &self.alphabet, image, cfg, RecVariant::Primary)?;
         let alt = if let Some(rec_alt) = &self.rec_alt {
             Some(self.recognize_candidate(
                 rec_alt,
@@ -299,15 +310,18 @@ impl OrtOcrEngine {
     fn best_from_crop(&self, image: &DynamicImage, cfg: &OcrConfig) -> Option<RecCandidate> {
         let direct = self.recognize_best(image, cfg).ok();
         if let Some(candidate) = &direct {
-            if !candidate.text.trim().is_empty() && candidate.confidence >= 0.55 {
+            if is_usable_recognition(candidate) && candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
+            {
                 return Some(candidate.clone());
             }
         }
-        let mut best = direct.filter(|c| !c.text.trim().is_empty());
+        let mut best = direct.filter(is_usable_recognition);
         for (_name, enhanced) in enhancement_variants(image) {
             if let Ok(candidate) = self.recognize_best(&enhanced, cfg) {
-                if !candidate.text.trim().is_empty()
-                    && best.as_ref().map_or(true, |b| candidate.confidence > b.confidence)
+                if is_usable_recognition(&candidate)
+                    && best
+                        .as_ref()
+                        .map_or(true, |b| candidate.confidence > b.confidence)
                 {
                     best = Some(candidate);
                 }
@@ -325,6 +339,24 @@ impl OrtOcrEngine {
         variant: RecVariant,
     ) -> Result<RecCandidate, String> {
         let target_w = dynamic_rec_target_width(image, cfg.rec_img_h, cfg.rec_img_w);
+        match self.recognize_candidate_at_width(session, alphabet, image, cfg, variant, target_w) {
+            Ok(candidate) => Ok(candidate),
+            Err(e) if target_w != cfg.rec_img_w => self
+                .recognize_candidate_at_width(session, alphabet, image, cfg, variant, cfg.rec_img_w)
+                .map_err(|fallback| format!("{e}; fixed-width fallback failed: {fallback}")),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn recognize_candidate_at_width(
+        &self,
+        session: &OrtSession,
+        alphabet: &[String],
+        image: &DynamicImage,
+        cfg: &OcrConfig,
+        variant: RecVariant,
+        target_w: usize,
+    ) -> Result<RecCandidate, String> {
         let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
         let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
         let logits = &output[0];
@@ -345,13 +377,15 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
     ) -> Result<Vec<BoxRect>, String> {
-        let (det_input, det_shape, sx, sy, src_w, src_h) = preprocess_det_image(img, cfg.det_img_side)?;
+        let (det_input, det_shape, sx, sy, src_w, src_h) =
+            preprocess_det_image(img, cfg.det_img_side)?;
         let (det_output, _det_shapes) = ort::run_session(&self.det, &[det_input], &[det_shape])?;
         let map = &det_output[0];
         let shape = &_det_shapes[0];
         let map_h = shape.get(2).copied().unwrap_or(960) as u32;
         let map_w = shape.get(3).copied().unwrap_or(960) as u32;
-        let boxes = extract_boxes_from_map(map, cfg.det_box_thresh, cfg.det_min_box_area, map_w, map_h);
+        let boxes =
+            extract_boxes_from_map(map, cfg.det_box_thresh, cfg.det_min_box_area, map_w, map_h);
 
         let min_w = (src_w as f32 * 0.015).ceil() as u32;
         let min_h = (src_h as f32 * 0.012).ceil() as u32;
@@ -448,15 +482,15 @@ fn preprocess_det_image(
     let (src_w, src_h) = rgb.dimensions();
     let max_side = side as f32;
     let base = (src_w.max(src_h)) as f32;
-    let ratio = if base > max_side { max_side / base } else { 1.0 };
+    let ratio = if base > max_side {
+        max_side / base
+    } else {
+        1.0
+    };
     let resize_w = ((((src_w as f32) * ratio).round() as usize).max(32) / 32) * 32;
     let resize_h = ((((src_h as f32) * ratio).round() as usize).max(32) / 32) * 32;
-    let resized = image::imageops::resize(
-        &rgb,
-        resize_w as u32,
-        resize_h as u32,
-        FilterType::Triangle,
-    );
+    let resized =
+        image::imageops::resize(&rgb, resize_w as u32, resize_h as u32, FilterType::Triangle);
 
     let mut data = vec![0f32; 1 * 3 * side * side];
     for y in 0..resize_h {
@@ -578,7 +612,8 @@ fn collect_boxes_from_mask(
                 continue;
             }
 
-            let score = average_component_score(data, component_mask, min_x, min_y, max_x, max_y, w);
+            let score =
+                average_component_score(data, component_mask, min_x, min_y, max_x, max_y, w);
             if score < (thresh * 0.3) {
                 continue;
             }
@@ -589,7 +624,14 @@ fn collect_boxes_from_mask(
     boxes
 }
 
-fn count_mask_area(mask: &[bool], min_x: usize, min_y: usize, max_x: usize, max_y: usize, w: usize) -> usize {
+fn count_mask_area(
+    mask: &[bool],
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    w: usize,
+) -> usize {
     let mut area = 0usize;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
@@ -620,14 +662,17 @@ fn average_component_score(
             }
         }
     }
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f32
-    }
+    if count == 0 { 0.0 } else { sum / count as f32 }
 }
 
-fn expand_box(min_x: usize, min_y: usize, max_x: usize, max_y: usize, w: usize, h: usize) -> BoxRect {
+fn expand_box(
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    w: usize,
+    h: usize,
+) -> BoxRect {
     let rect_w = max_x.saturating_sub(min_x) + 1;
     let rect_h = max_y.saturating_sub(min_y) + 1;
     let pad = if rect_w.min(rect_h) > 4 {
@@ -755,9 +800,25 @@ fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
         let stretched = contrast_stretch_luma(base);
         let binary = adaptive_binary_luma(&stretched, false);
         let binary_invert = adaptive_binary_luma(&stretched, true);
-        out.push((format!("{prefix}contrast"), DynamicImage::ImageLuma8(stretched)));
+        let local_binary = local_binary_luma(&stretched, false);
+        let local_binary_invert = local_binary_luma(&stretched, true);
+        out.push((
+            format!("{prefix}contrast"),
+            DynamicImage::ImageLuma8(stretched),
+        ));
         out.push((format!("{prefix}binary"), DynamicImage::ImageLuma8(binary)));
-        out.push((format!("{prefix}binary-invert"), DynamicImage::ImageLuma8(binary_invert)));
+        out.push((
+            format!("{prefix}binary-invert"),
+            DynamicImage::ImageLuma8(binary_invert),
+        ));
+        out.push((
+            format!("{prefix}local-binary"),
+            DynamicImage::ImageLuma8(local_binary),
+        ));
+        out.push((
+            format!("{prefix}local-binary-invert"),
+            DynamicImage::ImageLuma8(local_binary_invert),
+        ));
     }
     out
 }
@@ -813,16 +874,11 @@ fn rotation_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
 }
 
 fn adaptive_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
-    let mut sum = 0u64;
-    for pixel in gray.pixels() {
-        sum += pixel[0] as u64;
-    }
-    let avg = if gray.pixels().len() == 0 {
-        127
-    } else {
-        (sum / gray.pixels().len() as u64) as i16
-    };
-    let threshold = (avg + if invert { 12 } else { -12 }).clamp(32, 223) as u8;
+    let threshold = otsu_threshold_luma(gray).clamp(32, 223);
+    binary_with_threshold(gray, threshold, invert)
+}
+
+fn binary_with_threshold(gray: &GrayImage, threshold: u8, invert: bool) -> GrayImage {
     let mut out = GrayImage::new(gray.width(), gray.height());
     for (x, y, pixel) in gray.enumerate_pixels() {
         let is_fg = if invert {
@@ -832,6 +888,90 @@ fn adaptive_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
         };
         let value = if is_fg { 0 } else { 255 };
         out.put_pixel(x, y, Luma([value]));
+    }
+    out
+}
+
+fn otsu_threshold_luma(gray: &GrayImage) -> u8 {
+    let total = gray.width() as u64 * gray.height() as u64;
+    if total == 0 {
+        return 127;
+    }
+    let mut hist = [0u64; 256];
+    for pixel in gray.pixels() {
+        hist[pixel[0] as usize] += 1;
+    }
+
+    let mut sum_total = 0u64;
+    for (value, count) in hist.iter().enumerate() {
+        sum_total += value as u64 * count;
+    }
+
+    let mut weight_bg = 0u64;
+    let mut sum_bg = 0u64;
+    let mut best_threshold = 127u8;
+    let mut best_variance = -1.0f64;
+    for (threshold, count) in hist.iter().enumerate() {
+        weight_bg += count;
+        if weight_bg == 0 {
+            continue;
+        }
+        let weight_fg = total.saturating_sub(weight_bg);
+        if weight_fg == 0 {
+            break;
+        }
+        sum_bg += threshold as u64 * count;
+        let mean_bg = sum_bg as f64 / weight_bg as f64;
+        let mean_fg = (sum_total - sum_bg) as f64 / weight_fg as f64;
+        let diff = mean_bg - mean_fg;
+        let variance = weight_bg as f64 * weight_fg as f64 * diff * diff;
+        if variance > best_variance {
+            best_variance = variance;
+            best_threshold = threshold as u8;
+        }
+    }
+    best_threshold
+}
+
+fn local_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
+    let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return GrayImage::new(w, h);
+    }
+
+    let iw = (w + 1) as usize;
+    let ih = (h + 1) as usize;
+    let mut integral = vec![0u64; iw * ih];
+    for y in 0..h as usize {
+        let mut row_sum = 0u64;
+        for x in 0..w as usize {
+            row_sum += gray.get_pixel(x as u32, y as u32)[0] as u64;
+            integral[(y + 1) * iw + x + 1] = integral[y * iw + x + 1] + row_sum;
+        }
+    }
+
+    let radius = 12usize;
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h as usize {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius + 1).min(h as usize);
+        for x in 0..w as usize {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(w as usize);
+            let area = (x1 - x0) * (y1 - y0);
+            let sum = integral[y1 * iw + x1] + integral[y0 * iw + x0]
+                - integral[y0 * iw + x1]
+                - integral[y1 * iw + x0];
+            let mean = (sum / area.max(1) as u64) as i16;
+            let threshold = (mean + if invert { 8 } else { -8 }).clamp(24, 231) as u8;
+            let pixel = gray.get_pixel(x as u32, y as u32)[0];
+            let is_fg = if invert {
+                pixel >= threshold
+            } else {
+                pixel <= threshold
+            };
+            out.put_pixel(x as u32, y as u32, Luma([if is_fg { 0 } else { 255 }]));
+        }
     }
     out
 }
@@ -945,7 +1085,11 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
         }
         prev = best_id;
     }
-    let confidence = if count == 0 { 0.0 } else { prob_sum / count as f32 };
+    let confidence = if count == 0 {
+        0.0
+    } else {
+        prob_sum / count as f32
+    };
     (text, confidence)
 }
 
@@ -976,6 +1120,29 @@ fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCa
     primary
 }
 
+fn is_usable_recognition(candidate: &RecCandidate) -> bool {
+    let text = candidate.text.trim();
+    if text.is_empty() || candidate.confidence < MIN_ACCEPT_REC_CONFIDENCE {
+        return false;
+    }
+
+    let readable = readable_ratio(text);
+    let repeat = dominant_char_ratio(text);
+    let punct = punctuation_ratio(text);
+    let char_count = text.chars().filter(|c| !c.is_whitespace()).count();
+
+    if readable < 0.45 {
+        return false;
+    }
+    if char_count >= 4 && repeat >= 0.78 {
+        return false;
+    }
+    if char_count >= 4 && punct >= 0.75 {
+        return false;
+    }
+    true
+}
+
 fn ascii_ratio(text: &str) -> f32 {
     let mut total = 0usize;
     let mut ascii = 0usize;
@@ -992,6 +1159,73 @@ fn ascii_ratio(text: &str) -> f32 {
         0.0
     } else {
         ascii as f32 / total as f32
+    }
+}
+
+fn readable_ratio(text: &str) -> f32 {
+    let mut total = 0usize;
+    let mut readable = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if is_readable_ocr_char(ch) {
+            readable += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        readable as f32 / total as f32
+    }
+}
+
+fn is_readable_ocr_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || ch.is_ascii_punctuation()
+        || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+        || ('\u{3000}'..='\u{303F}').contains(&ch)
+        || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
+}
+
+fn dominant_char_ratio(text: &str) -> f32 {
+    let mut counts: Vec<(char, usize)> = Vec::new();
+    let mut total = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if let Some((_, count)) = counts.iter_mut().find(|(seen, _)| *seen == ch) {
+            *count += 1;
+        } else {
+            counts.push((ch, 1));
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        counts.iter().map(|(_, count)| *count).max().unwrap_or(0) as f32 / total as f32
+    }
+}
+
+fn punctuation_ratio(text: &str) -> f32 {
+    let mut total = 0usize;
+    let mut punct = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if ch.is_ascii_punctuation() || ('\u{3000}'..='\u{303F}').contains(&ch) {
+            punct += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        punct as f32 / total as f32
     }
 }
 
@@ -1035,13 +1269,28 @@ mod tests {
         gray.put_pixel(2, 1, Luma([146]));
         gray.put_pixel(3, 1, Luma([164]));
         let variants = enhancement_variants(&DynamicImage::ImageLuma8(gray));
-        let names = variants.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+        let names = variants
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
             names,
             vec![
-                "contrast", "binary", "binary-invert",
-                "hsl-contrast", "hsl-binary", "hsl-binary-invert",
-                "max-contrast", "max-binary", "max-binary-invert",
+                "contrast",
+                "binary",
+                "binary-invert",
+                "local-binary",
+                "local-binary-invert",
+                "hsl-contrast",
+                "hsl-binary",
+                "hsl-binary-invert",
+                "hsl-local-binary",
+                "hsl-local-binary-invert",
+                "max-contrast",
+                "max-binary",
+                "max-binary-invert",
+                "max-local-binary",
+                "max-local-binary-invert",
             ]
         );
     }
@@ -1069,6 +1318,33 @@ mod tests {
         let inverted = adaptive_binary_luma(&gray, true);
         assert_eq!(normal.get_pixel(1, 0)[0], 255);
         assert_eq!(inverted.get_pixel(1, 0)[0], 0);
+    }
+
+    #[test]
+    fn otsu_threshold_splits_bimodal_luma() {
+        let mut gray = GrayImage::new(8, 1);
+        for x in 0..4 {
+            gray.put_pixel(x, 0, Luma([24]));
+        }
+        for x in 4..8 {
+            gray.put_pixel(x, 0, Luma([220]));
+        }
+        let threshold = otsu_threshold_luma(&gray);
+        assert!((24..=220).contains(&threshold));
+    }
+
+    #[test]
+    fn local_binary_preserves_shadowed_dark_text() {
+        let mut gray = GrayImage::from_pixel(32, 8, Luma([180]));
+        for x in 4..12 {
+            gray.put_pixel(x, 3, Luma([120]));
+        }
+        for x in 20..28 {
+            gray.put_pixel(x, 3, Luma([80]));
+        }
+        let binary = local_binary_luma(&gray, false);
+        assert_eq!(binary.get_pixel(6, 3)[0], 0);
+        assert_eq!(binary.get_pixel(24, 3)[0], 0);
     }
 
     #[test]
@@ -1132,7 +1408,7 @@ mod tests {
     #[test]
     fn dynamic_rec_target_width_grows_for_long_lines() {
         let long = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
-        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 320);
+        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 960);
         let narrow = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 48, Luma([128])));
         assert_eq!(dynamic_rec_target_width(&narrow, 48, 320), 320);
     }
@@ -1172,10 +1448,35 @@ mod tests {
     }
 
     #[test]
+    fn usable_recognition_rejects_low_quality_text() {
+        let repeated = RecCandidate {
+            text: "||||||".to_string(),
+            confidence: 0.91,
+            variant: RecVariant::Primary,
+        };
+        let low_confidence = RecCandidate {
+            text: "Invoice 42".to_string(),
+            confidence: 0.12,
+            variant: RecVariant::Alt,
+        };
+        let valid = RecCandidate {
+            text: "Invoice 42".to_string(),
+            confidence: 0.42,
+            variant: RecVariant::Alt,
+        };
+        assert!(!is_usable_recognition(&repeated));
+        assert!(!is_usable_recognition(&low_confidence));
+        assert!(is_usable_recognition(&valid));
+    }
+
+    #[test]
     fn rotation_variants_include_expected_angles() {
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(12, 8, Luma([128])));
         let variants = rotation_variants(&img);
-        let names = variants.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+        let names = variants
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(names, vec!["90", "180", "270"]);
         assert_eq!(variants[0].1.dimensions(), (8, 12));
         assert_eq!(variants[1].1.dimensions(), (12, 8));
