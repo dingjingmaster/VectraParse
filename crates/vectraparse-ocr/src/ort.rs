@@ -51,7 +51,7 @@ pub(crate) fn ensure_initialized() -> Result<(), String> {
         api_fn(3);
     let cname = CString::new("vectraparse-ocr").unwrap();
     let mut env_ptr: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { create_env(2, cname.as_ptr(), &mut env_ptr) };
+    let status = unsafe { create_env(3, cname.as_ptr(), &mut env_ptr) };
     check_status(status)?;
     if env_ptr.is_null() {
         return Err("CreateEnv returned null".into());

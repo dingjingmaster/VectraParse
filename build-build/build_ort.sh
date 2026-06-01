@@ -7,8 +7,15 @@ THRDP_DIR="$PROJECT_ROOT/3thrd"
 ORT_SRC="$THRDP_DIR/onnxruntime"
 BUILD_DIR="$SCRIPT_DIR/ort_build"
 INSTALL_DIR="$SCRIPT_DIR/install"
+STATIC_MODE=false
 
-echo "=== Building ONNX Runtime v$(cat "$ORT_SRC/VERSION_NUMBER") ==="
+for arg in "$@"; do
+    case "$arg" in
+        --static) STATIC_MODE=true ;;
+    esac
+done
+
+echo "=== Building ONNX Runtime v$(cat "$ORT_SRC/VERSION_NUMBER") (static=$STATIC_MODE) ==="
 echo "Project root: $PROJECT_ROOT"
 echo "Build dir:    $BUILD_DIR"
 echo "Install dir:  $INSTALL_DIR"
@@ -48,11 +55,16 @@ done
 
 echo ""
 echo "=== Configuring with CMake ==="
+SHARED_LIB_FLAG=ON
+if $STATIC_MODE; then
+    SHARED_LIB_FLAG=OFF
+fi
+
 cmake -S "$ORT_SRC/cmake" -B "$BUILD_DIR" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
-    -Donnxruntime_BUILD_SHARED_LIB=ON \
+    -Donnxruntime_BUILD_SHARED_LIB="$SHARED_LIB_FLAG" \
     -Donnxruntime_BUILD_UNIT_TESTS=OFF \
     -Donnxruntime_ENABLE_PYTHON=OFF \
     -Donnxruntime_ENABLE_TRAINING=OFF \
@@ -70,7 +82,8 @@ cmake -S "$ORT_SRC/cmake" -B "$BUILD_DIR" \
     -Donnxruntime_USE_FULL_PROTOBUF=OFF \
     -Donnxruntime_ENABLE_CPUINFO=ON \
     "${CMAKE_DEPS_FLAGS[@]}" \
-    -DCMAKE_CXX_FLAGS="-march=native -O3" \
+    -DCMAKE_CXX_FLAGS="-march=native -O3 -static-libgcc -static-libstdc++" \
+    -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
 echo ""
@@ -80,6 +93,29 @@ cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 echo ""
 echo "=== Installing ==="
 cmake --install "$BUILD_DIR" --config Release --prefix "$INSTALL_DIR"
+
+if $STATIC_MODE; then
+    echo ""
+    echo "=== Merging static libraries ==="
+    STATIC_DIR="$INSTALL_DIR/static"
+    mkdir -p "$STATIC_DIR"
+    # Copy headers from install
+    cp -r "$INSTALL_DIR/include" "$STATIC_DIR/"
+
+    # Find all .a files and merge into one
+    MERGE_DIR="$BUILD_DIR/merge_objs"
+    rm -rf "$MERGE_DIR"
+    mkdir -p "$MERGE_DIR"
+    cd "$MERGE_DIR"
+    find "$BUILD_DIR" -name "*.a" | while read f; do
+        ar x "$f" 2>/dev/null || true
+    done
+    ar rcs "$STATIC_DIR/lib/libonnxruntime_all.a" *.o 2>/dev/null || true
+    cd "$SCRIPT_DIR"
+
+    echo "Static library: $STATIC_DIR/lib/libonnxruntime_all.a"
+    ls -lh "$STATIC_DIR/lib/libonnxruntime_all.a" 2>/dev/null || true
+fi
 
 echo ""
 echo "=== Done ==="

@@ -36,8 +36,8 @@ impl Default for OcrConfig {
             rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
             rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
             det_img_side: 960,
-            det_box_thresh: 0.25,
-            det_min_box_area: 30,
+            det_box_thresh: 0.20,
+            det_min_box_area: 20,
         }
     }
 }
@@ -231,16 +231,19 @@ impl OrtOcrEngine {
             }
         }
 
-        scaled.sort_by_key(|(_, y0, _, _)| *y0);
+        scaled.sort_by(|a, b| {
+            let ya = a.1 as i32 / 8;
+            let yb = b.1 as i32 / 8;
+            ya.cmp(&yb).then_with(|| a.0.cmp(&b.0))
+        });
         let mut merged: Vec<BoxRect> = Vec::new();
         for b in scaled {
             if let Some(last) = merged.last_mut() {
                 let y_overlap = last.1 < b.3 && b.1 < last.3;
-                let y_center_diff =
-                    ((last.1 + last.3) as i32 - (b.1 + b.3) as i32).unsigned_abs() as u32;
-                let line_h = (last.3 - last.1).max(b.3 - b.1).max(1);
                 let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
-                if (y_overlap || y_center_diff <= line_h) && x_gap <= line_h * 3 {
+                let line_h = (last.3 - last.1).min(b.3 - b.1);
+                let new_w = last.2.max(b.2) - last.0.min(b.0);
+                if y_overlap && x_gap <= (line_h * 3).max(20) && new_w <= 1200 {
                     last.0 = last.0.min(b.0);
                     last.1 = last.1.min(b.1);
                     last.2 = last.2.max(b.2);

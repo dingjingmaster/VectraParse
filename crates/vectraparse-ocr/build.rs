@@ -12,18 +12,28 @@ fn main() {
 
     let lib_dir = canon.join("lib");
 
-    if !lib_dir.join("libonnxruntime.so").exists() {
+    let static_lib = canon.join("static").join("lib").join("libonnxruntime_all.a");
+
+    if static_lib.exists() {
+        println!("cargo:rustc-link-lib=static=onnxruntime_all");
+        println!("cargo:rustc-link-search=native={}", static_lib.parent().unwrap().display());
+        println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+        println!("cargo:rustc-link-lib=static=onnxruntime_all");
+        println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rerun-if-changed={}", static_lib.display());
+    } else if lib_dir.join("libonnxruntime.so").exists() {
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-lib=onnxruntime");
+    } else {
         panic!(
-            "libonnxruntime.so not found at `{}`.\n\
-             Run `build-build/build_ort.sh` to build onnxruntime from source, or\n\
-             extract a pre-built release to `build-build/install/`.\n\
+            "libonnxruntime not found at `{}`.\n\
+             Run `build-build/build_ort.sh` to build onnxruntime (shared or with --static).\n\
              Set ORT_INSTALL_DIR to a valid onnxruntime installation.",
             lib_dir.display()
         );
     }
 
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=onnxruntime");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ORT_INSTALL_DIR");
 }

@@ -26,18 +26,19 @@ ort-test:
 
 file-content:
 	gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a \
-		-Lbuild-build/install/lib -lonnxruntime -ldl -lpthread -lm -o target/extract-static
+		-Lbuild-build/install/lib -lonnxruntime -ldl -lpthread -lm \
+		-Wl,-rpath,'$$ORIGIN/../build-build/install/lib' -o target/extract-static
 
 abi-smoke:
 	cargo build --release -p vectraparse-ffi
 	gcc examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi \
 		-Lbuild-build/install/lib -lonnxruntime \
 		-Wl,-rpath,'$$ORIGIN/../target/release' -Wl,-rpath,'$$ORIGIN/../build-build/install/lib' -o target/smoke-c
-	LD_LIBRARY_PATH=target/release:build-build/install/lib ./target/smoke-c
+	./target/smoke-c
 
 golden:
 	bash scripts/golden_validate.sh tests/golden/manifest.tsv
-	LD_LIBRARY_PATH=target/release ./target/smoke-c | sed -n '1p' | sed 's/^detect: //' > /tmp/minimal_pdf.actual.json
+	./target/smoke-c | sed -n '1p' | sed 's/^detect: //' > /tmp/minimal_pdf.actual.json
 	bash scripts/golden_compare.sh tests/golden/expected/minimal_pdf.detect.json /tmp/minimal_pdf.actual.json
 
 fuzz-smoke:
