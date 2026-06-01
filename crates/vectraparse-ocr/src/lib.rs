@@ -19,6 +19,7 @@ const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
+const MAX_PAGE_REGION_DET_PASSES: usize = 4;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
 
@@ -134,6 +135,7 @@ struct RecognizedText {
 #[derive(Debug, Clone, Default)]
 struct DetectedText {
     det_box_count: usize,
+    boxes: Vec<DetectionBox>,
     recognized: RecognizedText,
 }
 
@@ -163,6 +165,12 @@ enum BboxTransform {
     Scale {
         sx: f32,
         sy: f32,
+        max_w: u32,
+        max_h: u32,
+    },
+    Offset {
+        dx: u32,
+        dy: u32,
         max_w: u32,
         max_h: u32,
     },
@@ -259,6 +267,28 @@ impl OrtOcrEngine {
             det_pass_count: 1,
             fallback_attempt_count: 0,
         };
+
+        let (page_region_count, page_region_candidate) =
+            self.recognize_page_regions(img, cfg, &detected.boxes)?;
+        if page_region_count > 0 {
+            trace.det_pass_count += page_region_count;
+            let candidate = if text.trim().is_empty() {
+                page_region_candidate
+            } else {
+                filter_page_region_supplement(&page_region_candidate, &regions)
+            };
+            maybe_adopt_recognized(
+                &mut text,
+                &mut confidence,
+                &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
+                &mut regions,
+                &mut fallback,
+                "det-page-regions".to_string(),
+                &candidate,
+            );
+        }
 
         let (candidate_count, candidate) = self.recognize_color_regions_limited(
             img,
@@ -440,8 +470,57 @@ impl OrtOcrEngine {
 
         Ok(DetectedText {
             det_box_count: boxes.len(),
+            boxes,
             recognized: recognized_from_text_lines(&mut lines),
         })
+    }
+
+    fn recognize_page_regions(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        base_boxes: &[DetectionBox],
+    ) -> Result<(usize, RecognizedText), String> {
+        let region_boxes = page_region_boxes_from_detection_boxes(base_boxes, img.dimensions());
+        let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!("[OCR_TRACE] page-regions candidates={}", region_boxes.len());
+        }
+        if region_boxes.is_empty() {
+            return Ok((0, RecognizedText::default()));
+        }
+
+        let (img_w, img_h) = img.dimensions();
+        let mut lines = Vec::new();
+        for (idx, region_box) in region_boxes.iter().enumerate() {
+            if trace_enabled {
+                eprintln!(
+                    "[OCR_TRACE] page-region index={} bbox={}x{}@{},{}",
+                    idx + 1,
+                    box_width(*region_box),
+                    box_height(*region_box),
+                    region_box.0,
+                    region_box.1
+                );
+            }
+            let crop = crop_box(img, *region_box);
+            let source = format!("det-page-region:{}", idx + 1);
+            let detected = self.recognize_detected_text(
+                &crop,
+                cfg,
+                false,
+                &source,
+                BboxTransform::Offset {
+                    dx: region_box.0,
+                    dy: region_box.1,
+                    max_w: img_w,
+                    max_h: img_h,
+                },
+            )?;
+            lines.extend(text_lines_from_recognized(&detected.recognized));
+        }
+
+        Ok((region_boxes.len(), recognized_from_text_lines(&mut lines)))
     }
 
     fn push_recognized_box_lines(
@@ -1090,6 +1169,44 @@ fn merge_ocr_regions(current: &[OcrTextRegion], candidate: &[OcrTextRegion]) -> 
     out
 }
 
+#[cfg(test)]
+fn merge_recognized_line_sets(
+    current_regions: &[OcrTextRegion],
+    candidate: &RecognizedText,
+) -> RecognizedText {
+    let mut lines = text_lines_from_regions(current_regions);
+    lines.extend(text_lines_from_recognized(candidate));
+    recognized_from_text_lines(&mut lines)
+}
+
+fn text_lines_from_recognized(recognized: &RecognizedText) -> Vec<TextLine> {
+    text_lines_from_regions(&recognized.regions)
+}
+
+fn text_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<TextLine> {
+    let mut lines = Vec::new();
+    for region in regions {
+        if region.lines.is_empty() {
+            lines.push(TextLine {
+                bbox: box_from_array(region.bbox),
+                text: region.text.clone(),
+                confidence: region.confidence,
+                source: region.source.clone(),
+            });
+            continue;
+        }
+        for line in &region.lines {
+            lines.push(TextLine {
+                bbox: box_from_array(line.bbox),
+                text: line.text.clone(),
+                confidence: line.confidence,
+                source: line.source.clone(),
+            });
+        }
+    }
+    lines
+}
+
 impl LayoutRegion {
     fn from_line(line: TextLine) -> Self {
         Self {
@@ -1282,6 +1399,21 @@ impl BboxTransform {
                 let y1 = ((b.3 as f32) * sy).ceil().min(max_h as f32) as u32;
                 clamp_box((x0, y0, x1, y1), max_w, max_h)
             }
+            BboxTransform::Offset {
+                dx,
+                dy,
+                max_w,
+                max_h,
+            } => clamp_box(
+                (
+                    b.0.saturating_add(dx),
+                    b.1.saturating_add(dy),
+                    b.2.saturating_add(dx),
+                    b.3.saturating_add(dy),
+                ),
+                max_w,
+                max_h,
+            ),
             BboxTransform::Rotate90 { src_w, src_h } => {
                 let mapped = (
                     b.1,
@@ -1738,6 +1870,95 @@ fn filter_non_overlapping_recognized(
     }
 
     recognized_from_text_lines(&mut lines)
+}
+
+fn filter_page_region_supplement(
+    candidate: &RecognizedText,
+    existing_regions: &[OcrTextRegion],
+) -> RecognizedText {
+    let existing_boxes = collect_region_line_boxes(existing_regions);
+    if existing_boxes.is_empty() {
+        return candidate.clone();
+    }
+
+    let existing_keys = collect_region_text_keys(existing_regions);
+    let mut lines = Vec::new();
+    for region in &candidate.regions {
+        for line in &region.lines {
+            if !is_strong_page_region_supplement(line) {
+                continue;
+            }
+            if page_region_line_is_existing_fragment(&line.text, &existing_keys) {
+                continue;
+            }
+            let bbox = box_from_array(line.bbox);
+            if existing_boxes
+                .iter()
+                .any(|existing| boxes_significantly_overlap(bbox, *existing))
+            {
+                continue;
+            }
+            lines.push(TextLine {
+                bbox,
+                text: line.text.clone(),
+                confidence: line.confidence,
+                source: line.source.clone(),
+            });
+        }
+    }
+
+    recognized_from_text_lines(&mut lines)
+}
+
+fn collect_region_text_keys(regions: &[OcrTextRegion]) -> Vec<String> {
+    regions
+        .iter()
+        .flat_map(|region| {
+            if region.lines.is_empty() {
+                vec![normalize_ocr_line(&region.text)]
+            } else {
+                region
+                    .lines
+                    .iter()
+                    .map(|line| normalize_ocr_line(&line.text))
+                    .collect::<Vec<_>>()
+            }
+        })
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+fn page_region_line_is_existing_fragment(text: &str, existing_keys: &[String]) -> bool {
+    let text = text.trim();
+    let key = normalize_ocr_line(text);
+    if key.is_empty() {
+        return true;
+    }
+    if text.ends_with('@') || text.ends_with(':') || text.ends_with('：') {
+        return true;
+    }
+    let key_chars = key.chars().count();
+    if key_chars <= 4 && !text.chars().any(is_cjk_char) {
+        return existing_keys
+            .iter()
+            .any(|existing| existing.len() > key.len() && existing.contains(&key));
+    }
+    false
+}
+
+fn is_strong_page_region_supplement(line: &OcrTextLine) -> bool {
+    let text = line.text.trim();
+    let chars = recognized_char_count(text);
+    if chars == 0 || line.confidence < 0.45 {
+        return false;
+    }
+    if chars < 3 && !(chars >= 2 && text.chars().any(is_cjk_char)) {
+        return false;
+    }
+    readable_ratio(text) >= 0.60
+        && dominant_char_ratio(text) < 0.70
+        && punctuation_ratio(text) < 0.65
+        && !is_low_value_short_ocr_line(text)
 }
 
 fn collect_region_line_boxes(regions: &[OcrTextRegion]) -> Vec<BoxRect> {
@@ -2226,6 +2447,89 @@ fn raw_box_is_split_candidate(raw: BoxRect, merged: BoxRect) -> bool {
         return false;
     }
     box_width(raw) + 8 < box_width(merged)
+}
+
+fn page_region_boxes_from_detection_boxes(
+    boxes: &[DetectionBox],
+    dimensions: (u32, u32),
+) -> Vec<BoxRect> {
+    let (img_w, img_h) = dimensions;
+    if img_w < 640 || img_h < 320 || boxes.len() < 8 {
+        return Vec::new();
+    }
+
+    let max_seed_width = (img_w / 4).clamp(180, 520);
+    let mut seeds = boxes
+        .iter()
+        .map(|det_box| det_box.bbox)
+        .filter(|b| box_width(*b) >= 16 && box_height(*b) >= 6)
+        .filter(|b| box_width(*b) <= max_seed_width)
+        .map(|b| {
+            let pad = (box_width(b) / 10).clamp(8, 32);
+            let x0 = b.0.saturating_sub(pad);
+            let x1 = b.2.saturating_add(pad).min(img_w);
+            (x0, x1, (x0.saturating_add(x1)) / 2, box_area(b), 1usize)
+        })
+        .collect::<Vec<_>>();
+    if seeds.len() < 4 {
+        return Vec::new();
+    }
+
+    seeds.sort_by_key(|(x0, x1, cx, _, _)| (*cx, *x0, *x1));
+    let center_gap = (img_w / 9).clamp(120, 260);
+    let mut bands: Vec<(u32, u32, u32, u64, usize)> = Vec::new();
+    for (x0, x1, cx, area, count) in seeds {
+        if let Some(last) = bands.last_mut()
+            && cx <= last.2.saturating_add(center_gap)
+        {
+            let total_count = last.4 + count;
+            last.1 = last.1.max(x1);
+            last.0 = last.0.min(x0);
+            last.2 = ((last.2 as u64 * last.4 as u64 + cx as u64 * count as u64)
+                / total_count.max(1) as u64) as u32;
+            last.3 = last.3.saturating_add(area);
+            last.4 = total_count;
+            continue;
+        }
+        bands.push((x0, x1, cx, area, count));
+    }
+
+    let min_region_width = (img_w / 18).clamp(80, 180);
+    bands.retain(|(x0, x1, _, _, count)| x1.saturating_sub(*x0) >= min_region_width || *count >= 2);
+    if bands.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for idx in 0..bands.len() {
+        let (band_x0, band_x1, _center, score_area, score_count) = bands[idx];
+        let x0 = if idx == 0 {
+            0
+        } else {
+            (bands[idx - 1].1.saturating_add(band_x0)) / 2
+        };
+        let x1 = if idx + 1 == bands.len() {
+            img_w
+        } else {
+            (band_x1.saturating_add(bands[idx + 1].0)) / 2
+        };
+        let region = clamp_box((x0, 0, x1, img_h), img_w, img_h);
+        let region_width = box_width(region);
+        if region_width < min_region_width
+            || region_width.saturating_mul(100) > img_w.saturating_mul(92)
+        {
+            continue;
+        }
+        candidates.push((region, score_count, score_area));
+    }
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    candidates.sort_by_key(|(b, _, _)| (b.0, b.1));
+    candidates.into_iter().map(|(b, _, _)| b).collect()
 }
 
 fn reading_box_order(a: &BoxRect, b: &BoxRect) -> std::cmp::Ordering {
@@ -3738,6 +4042,123 @@ mod tests {
     }
 
     #[test]
+    fn page_region_boxes_split_detected_columns() {
+        let boxes = vec![
+            detection_box((28, 20, 150, 38)),
+            detection_box((34, 90, 170, 108)),
+            detection_box((42, 180, 160, 198)),
+            detection_box((270, 32, 410, 50)),
+            detection_box((278, 112, 430, 130)),
+            detection_box((286, 220, 420, 238)),
+            detection_box((710, 42, 900, 60)),
+            detection_box((724, 140, 880, 158)),
+        ];
+
+        let regions = page_region_boxes_from_detection_boxes(&boxes, (1000, 600));
+
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].1, 0);
+        assert_eq!(regions[0].3, 600);
+        assert!(regions[0].2 <= regions[1].0);
+        assert!(regions[1].2 <= regions[2].0);
+    }
+
+    #[test]
+    fn page_region_boxes_skip_small_or_simple_images() {
+        let boxes = vec![
+            detection_box((28, 20, 150, 38)),
+            detection_box((34, 90, 170, 108)),
+        ];
+
+        let regions = page_region_boxes_from_detection_boxes(&boxes, (1000, 600));
+
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn bbox_offset_transform_maps_crop_coordinates() {
+        let mapped = BboxTransform::Offset {
+            dx: 100,
+            dy: 40,
+            max_w: 300,
+            max_h: 120,
+        }
+        .map_box((10, 6, 80, 30));
+
+        assert_eq!(mapped, (110, 46, 180, 70));
+    }
+
+    #[test]
+    fn merge_recognized_line_sets_dedupes_existing_lines() {
+        let current = vec![OcrTextRegion {
+            bbox: [10, 10, 120, 28],
+            text: "Header".to_string(),
+            confidence: 0.64,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 120, 28],
+                text: "Header".to_string(),
+                confidence: 0.64,
+                source: "det".to_string(),
+            }],
+        }];
+        let mut candidate_lines = vec![
+            text_line((12, 11, 122, 29), "Header", 0.78),
+            text_line((220, 48, 360, 66), "New detail", 0.72),
+        ];
+        let candidate = recognized_from_text_lines(&mut candidate_lines);
+
+        let merged = merge_recognized_line_sets(&current, &candidate);
+
+        assert_eq!(merged.line_count, 2);
+        assert_eq!(merged.text.matches("Header").count(), 1);
+        assert!(merged.text.contains("New detail"));
+    }
+
+    #[test]
+    fn page_region_supplement_keeps_only_strong_new_lines() {
+        let current = vec![
+            OcrTextRegion {
+                bbox: [10, 10, 120, 28],
+                text: "Header".to_string(),
+                confidence: 0.64,
+                source: "det".to_string(),
+                lines: vec![OcrTextLine {
+                    bbox: [10, 10, 120, 28],
+                    text: "Header".to_string(),
+                    confidence: 0.64,
+                    source: "det".to_string(),
+                }],
+            },
+            OcrTextRegion {
+                bbox: [10, 40, 220, 60],
+                text: "WidgetSuite2408".to_string(),
+                confidence: 0.70,
+                source: "det".to_string(),
+                lines: vec![OcrTextLine {
+                    bbox: [10, 40, 220, 60],
+                    text: "WidgetSuite2408".to_string(),
+                    confidence: 0.70,
+                    source: "det".to_string(),
+                }],
+            },
+        ];
+        let mut candidate_lines = vec![
+            text_line((12, 11, 122, 29), "Header", 0.78),
+            text_line((220, 48, 360, 66), "Approve", 0.72),
+            text_line((420, 48, 450, 66), "X", 0.92),
+            text_line((500, 48, 560, 66), "2408", 0.88),
+            text_line((600, 48, 720, 66), "WidgetSuite@", 0.88),
+        ];
+        let candidate = recognized_from_text_lines(&mut candidate_lines);
+
+        let supplement = filter_page_region_supplement(&candidate, &current);
+
+        assert_eq!(supplement.text, "Approve");
+        assert_eq!(supplement.line_count, 1);
+    }
+
+    #[test]
     fn expand_box_uses_capped_unclip_margin() {
         assert_eq!(expand_box(20, 20, 79, 79, 100, 100), (12, 12, 88, 88));
     }
@@ -3834,12 +4255,12 @@ mod tests {
     #[test]
     fn normalize_recognized_text_splits_joined_chat_time_marker() {
         assert_eq!(
-            normalize_recognized_text("陈晗：mac是用内核导的刚刚网关说不支持邮件"),
-            "陈晗：mac是用内核导的\n刚刚网关说不支持邮件"
+            normalize_recognized_text("Sender: alpha build刚刚next update"),
+            "Sender: alpha build\n刚刚next update"
         );
         assert_eq!(
-            normalize_recognized_text("那可能邮件这块的时间有点兜不住"),
-            "那可能邮件这块的时间有点兜不住"
+            normalize_recognized_text("plain message without marker"),
+            "plain message without marker"
         );
     }
 
@@ -3888,24 +4309,24 @@ mod tests {
     #[test]
     fn recognized_from_text_lines_dedupes_overlapping_similar_lines() {
         let mut lines = vec![
-            text_line((10, 10, 120, 26), "通讯录胡成：昨天", 0.62),
-            text_line((12, 11, 122, 27), "通迅录胡成：昨天", 0.70),
-            text_line((10, 90, 120, 106), "通讯录胡成：昨天", 0.63),
+            text_line((10, 10, 180, 26), "Project status: ready", 0.62),
+            text_line((12, 11, 182, 27), "Project status: reedy", 0.70),
+            text_line((10, 90, 180, 106), "Release notes: ready", 0.63),
         ];
 
         let recognized = recognized_from_text_lines(&mut lines);
 
         assert_eq!(recognized.line_count, 2);
-        assert!(recognized.text.contains("通迅录胡成：昨天"));
-        assert!(recognized.text.contains("通讯录胡成：昨天"));
+        assert!(recognized.text.contains("Project status: reedy"));
+        assert!(recognized.text.contains("Release notes: ready"));
     }
 
     #[test]
     fn recognized_from_text_lines_dedupes_nearby_long_text_variants() {
         let mut lines = vec![
-            text_line((320, 10, 470, 26), "赵剑超@安得和众3084", 0.70),
-            text_line((322, 54, 468, 70), "赵剑超@安和众3084", 0.74),
-            text_line((320, 300, 470, 316), "冯育坤@安得和众3084", 0.68),
+            text_line((320, 10, 540, 26), "Project Alpha Release 2024", 0.70),
+            text_line((322, 54, 538, 70), "Project Alfa Release 2024", 0.74),
+            text_line((320, 300, 520, 316), "Quarterly Sales Summary", 0.68),
         ];
 
         let recognized = recognized_from_text_lines(&mut lines);
@@ -3916,30 +4337,36 @@ mod tests {
     #[test]
     fn recognized_from_text_lines_dedupes_distant_same_column_long_variants() {
         let mut lines = vec![
-            text_line((320, 10, 470, 26), "赵剑超@安得和众3084", 0.70),
-            text_line((322, 360, 468, 376), "赵剑超@安和众3084", 0.74),
-            text_line((24, 360, 130, 376), "工作台", 0.80),
+            text_line((320, 10, 540, 26), "Project Alpha Release 2024", 0.70),
+            text_line((322, 360, 538, 376), "Project Alfa Release 2024", 0.74),
+            text_line((24, 360, 130, 376), "Toolbar", 0.80),
         ];
 
         let recognized = recognized_from_text_lines(&mut lines);
 
         assert_eq!(recognized.line_count, 2);
-        assert!(recognized.text.contains("工作台"));
+        assert!(recognized.text.contains("Toolbar"));
     }
 
     #[test]
     fn recognized_from_text_lines_dedupes_global_exact_long_text_only() {
         let mut lines = vec![
-            text_line((20, 10, 180, 26), "赵剑超@安得和众3084", 0.70),
-            text_line((360, 420, 520, 436), "赵剑超@安得和众3084", 0.76),
-            text_line((20, 60, 80, 76), "陈晗", 0.70),
-            text_line((360, 460, 420, 476), "陈晗", 0.76),
+            text_line((20, 10, 260, 26), "Project Alpha Release 2024", 0.70),
+            text_line((360, 420, 600, 436), "Project Alpha Release 2024", 0.76),
+            text_line((20, 60, 80, 76), "短名", 0.70),
+            text_line((360, 460, 420, 476), "短名", 0.76),
         ];
 
         let recognized = recognized_from_text_lines(&mut lines);
 
-        assert_eq!(recognized.text.matches("赵剑超@安得和众3084").count(), 1);
-        assert_eq!(recognized.text.matches("陈晗").count(), 2);
+        assert_eq!(
+            recognized
+                .text
+                .matches("Project Alpha Release 2024")
+                .count(),
+            1
+        );
+        assert_eq!(recognized.text.matches("短名").count(), 2);
     }
 
     #[test]
@@ -4218,6 +4645,13 @@ mod tests {
             text: text.to_string(),
             confidence,
             source: "det".to_string(),
+        }
+    }
+
+    fn detection_box(bbox: BoxRect) -> DetectionBox {
+        DetectionBox {
+            bbox,
+            alternatives: Vec::new(),
         }
     }
 }
