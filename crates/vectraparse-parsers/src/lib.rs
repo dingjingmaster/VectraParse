@@ -1294,6 +1294,17 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
         "image.ocr.color_region_count",
         ocr.diagnostics.color_region_count.to_string(),
     );
+    metadata.insert(
+        "image.ocr.det_pass_count",
+        ocr.trace.det_pass_count.to_string(),
+    );
+    metadata.insert(
+        "image.ocr.fallback_attempt_count",
+        ocr.trace.fallback_attempt_count.to_string(),
+    );
+    if let Some(source) = &ocr.trace.selected_source {
+        metadata.insert("image.ocr.selected_source", source.clone());
+    }
     metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
     metadata.insert(
         "image.ocr.source_has_alpha",
@@ -3494,6 +3505,12 @@ mod tests {
                 source_has_alpha: true,
                 detect_used_whole_image_box: false,
             },
+            regions: Vec::new(),
+            trace: vectraparse_ocr::OcrTrace {
+                selected_source: Some("whole-image".to_string()),
+                det_pass_count: 2,
+                fallback_attempt_count: 3,
+            },
         };
         apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
         assert_eq!(
@@ -3530,6 +3547,27 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.det_pass_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.fallback_attempt_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.selected_source")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("whole-image")
         );
         assert_eq!(
             metadata
@@ -3582,6 +3620,8 @@ mod tests {
                 source_has_alpha: false,
                 detect_used_whole_image_box: true,
             },
+            regions: Vec::new(),
+            trace: vectraparse_ocr::OcrTrace::default(),
         };
         apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
         assert_eq!(

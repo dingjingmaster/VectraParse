@@ -54,6 +54,32 @@ pub struct OcrResult {
     pub confidence: f32,
     pub warning: Option<String>,
     pub diagnostics: OcrDiagnostics,
+    pub regions: Vec<OcrTextRegion>,
+    pub trace: OcrTrace,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTextRegion {
+    pub bbox: [u32; 4],
+    pub text: String,
+    pub confidence: f32,
+    pub source: String,
+    pub lines: Vec<OcrTextLine>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTextLine {
+    pub bbox: [u32; 4],
+    pub text: String,
+    pub confidence: f32,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTrace {
+    pub selected_source: Option<String>,
+    pub det_pass_count: usize,
+    pub fallback_attempt_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,6 +123,7 @@ struct RecognizedText {
     line_count: usize,
     region_count: usize,
     layout_applied: bool,
+    regions: Vec<OcrTextRegion>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,12 +137,36 @@ struct TextLine {
     bbox: BoxRect,
     text: String,
     confidence: f32,
+    source: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct LayoutRegion {
     bbox: BoxRect,
     lines: Vec<TextLine>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BboxTransform {
+    Identity,
+    Scale {
+        sx: f32,
+        sy: f32,
+        max_w: u32,
+        max_h: u32,
+    },
+    Rotate90 {
+        src_w: u32,
+        src_h: u32,
+    },
+    Rotate180 {
+        src_w: u32,
+        src_h: u32,
+    },
+    Rotate270 {
+        src_w: u32,
+        src_h: u32,
+    },
 }
 
 struct OrtSession {
@@ -172,7 +223,7 @@ impl OrtOcrEngine {
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
         let source_has_alpha = has_non_opaque_alpha(img);
         let detected = self
-            .recognize_detected_text(img, cfg, true)
+            .recognize_detected_text(img, cfg, true, "det", BboxTransform::Identity)
             .map_err(|e| format!("detect: {e}"))?;
         let det_box_count = detected.det_box_count;
         let detect_used_whole_image_box = det_box_count == 0;
@@ -181,8 +232,18 @@ impl OrtOcrEngine {
         let mut line_count = detected.recognized.line_count;
         let mut region_count = detected.recognized.region_count;
         let mut layout_applied = detected.recognized.layout_applied;
+        let mut regions = detected.recognized.regions;
         let mut color_region_count = 0usize;
         let mut fallback = None;
+        let mut trace = OcrTrace {
+            selected_source: if text.trim().is_empty() {
+                None
+            } else {
+                Some("det".to_string())
+            },
+            det_pass_count: 1,
+            fallback_attempt_count: 0,
+        };
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
             self.apply_quality_fallbacks(
@@ -194,7 +255,9 @@ impl OrtOcrEngine {
                 &mut line_count,
                 &mut region_count,
                 &mut layout_applied,
+                &mut regions,
                 &mut color_region_count,
+                &mut trace,
                 &mut fallback,
             )?;
         }
@@ -205,11 +268,18 @@ impl OrtOcrEngine {
             None
         };
         let empty_result = text.trim().is_empty();
+        trace.selected_source = fallback.clone().or_else(|| {
+            if empty_result {
+                None
+            } else {
+                Some("det".to_string())
+            }
+        });
 
         if std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1") {
             let (w, h) = img.dimensions();
             eprintln!(
-                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} whole_image_box={} fallback={} empty={}",
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} source={} whole_image_box={} fallback={} empty={}",
                 w,
                 h,
                 source_has_alpha,
@@ -218,6 +288,9 @@ impl OrtOcrEngine {
                 region_count,
                 layout_applied,
                 color_region_count,
+                trace.det_pass_count,
+                trace.fallback_attempt_count,
+                trace.selected_source.as_deref().unwrap_or("-"),
                 detect_used_whole_image_box,
                 fallback.as_deref().unwrap_or("-"),
                 empty_result
@@ -239,6 +312,8 @@ impl OrtOcrEngine {
                 source_has_alpha,
                 detect_used_whole_image_box,
             },
+            regions,
+            trace,
         })
     }
 
@@ -247,6 +322,8 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
         allow_crop_enhancement: bool,
+        source: &str,
+        transform: BboxTransform,
     ) -> Result<DetectedText, String> {
         let boxes = self.detect_text_boxes(img, cfg)?;
         let mut lines = Vec::new();
@@ -259,9 +336,10 @@ impl OrtOcrEngine {
             };
             if let Some(candidate) = candidate {
                 lines.push(TextLine {
-                    bbox: *b,
+                    bbox: transform.map_box(*b),
                     text: candidate.text,
                     confidence: candidate.confidence,
+                    source: source.to_string(),
                 });
             }
         }
@@ -282,19 +360,24 @@ impl OrtOcrEngine {
         line_count: &mut usize,
         region_count: &mut usize,
         layout_applied: &mut bool,
+        regions: &mut Vec<OcrTextRegion>,
         color_region_count: &mut usize,
+        trace: &mut OcrTrace,
         fallback: &mut Option<String>,
     ) -> Result<(), String> {
+        let image_bbox = image_box(img);
+        trace.fallback_attempt_count += 1;
         match self.recognize_best(img, cfg) {
             Ok(candidate) if is_usable_recognition(&candidate) => {
                 let label = recognition_fallback_label("whole-image", candidate.variant);
-                let candidate = recognized_from_candidate(candidate);
+                let candidate = recognized_from_candidate(candidate, image_bbox, &label);
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     label,
                     &candidate,
@@ -308,6 +391,7 @@ impl OrtOcrEngine {
             return Ok(());
         }
 
+        trace.fallback_attempt_count += 1;
         let (candidate_count, candidate) = self.recognize_color_regions(img, cfg);
         *color_region_count = candidate_count;
         maybe_adopt_recognized(
@@ -316,6 +400,7 @@ impl OrtOcrEngine {
             line_count,
             region_count,
             layout_applied,
+            regions,
             fallback,
             "color-regions".to_string(),
             &candidate,
@@ -325,13 +410,22 @@ impl OrtOcrEngine {
         }
 
         for (name, enhanced) in enhancement_variants(img) {
-            if let Ok(candidate) = self.recognize_detected_text(&enhanced, cfg, false) {
+            trace.fallback_attempt_count += 1;
+            trace.det_pass_count += 1;
+            if let Ok(candidate) = self.recognize_detected_text(
+                &enhanced,
+                cfg,
+                false,
+                &format!("det-enhanced:{name}"),
+                BboxTransform::Identity,
+            ) {
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     format!("det-enhanced:{name}"),
                     &candidate.recognized,
@@ -341,18 +435,20 @@ impl OrtOcrEngine {
                 return Ok(());
             }
 
+            trace.fallback_attempt_count += 1;
             if let Ok(candidate) = self.recognize_best(&enhanced, cfg)
                 && is_usable_recognition(&candidate)
             {
                 let label =
                     recognition_fallback_label(&format!("enhanced:{name}"), candidate.variant);
-                let candidate = recognized_from_candidate(candidate);
+                let candidate = recognized_from_candidate(candidate, image_bbox, &label);
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     label,
                     &candidate,
@@ -363,14 +459,31 @@ impl OrtOcrEngine {
             }
         }
 
+        let (orig_w, orig_h) = img.dimensions();
         for (name, upscaled) in upscale_variants(img) {
-            if let Ok(candidate) = self.recognize_detected_text(&upscaled, cfg, false) {
+            trace.fallback_attempt_count += 1;
+            trace.det_pass_count += 1;
+            let (variant_w, variant_h) = upscaled.dimensions();
+            let transform = BboxTransform::Scale {
+                sx: orig_w as f32 / variant_w.max(1) as f32,
+                sy: orig_h as f32 / variant_h.max(1) as f32,
+                max_w: orig_w,
+                max_h: orig_h,
+            };
+            if let Ok(candidate) = self.recognize_detected_text(
+                &upscaled,
+                cfg,
+                false,
+                &format!("det-upscaled:{name}"),
+                transform,
+            ) {
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     format!("det-upscaled:{name}"),
                     &candidate.recognized,
@@ -380,18 +493,20 @@ impl OrtOcrEngine {
                 return Ok(());
             }
 
+            trace.fallback_attempt_count += 1;
             if let Ok(candidate) = self.recognize_best(&upscaled, cfg)
                 && is_usable_recognition(&candidate)
             {
                 let label =
                     recognition_fallback_label(&format!("upscaled:{name}"), candidate.variant);
-                let candidate = recognized_from_candidate(candidate);
+                let candidate = recognized_from_candidate(candidate, image_bbox, &label);
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     label,
                     &candidate,
@@ -403,13 +518,37 @@ impl OrtOcrEngine {
         }
 
         for (name, rotated) in rotation_variants(img) {
-            if let Ok(candidate) = self.recognize_detected_text(&rotated, cfg, false) {
+            trace.fallback_attempt_count += 1;
+            trace.det_pass_count += 1;
+            let transform = match name.as_str() {
+                "90" => BboxTransform::Rotate90 {
+                    src_w: orig_w,
+                    src_h: orig_h,
+                },
+                "180" => BboxTransform::Rotate180 {
+                    src_w: orig_w,
+                    src_h: orig_h,
+                },
+                "270" => BboxTransform::Rotate270 {
+                    src_w: orig_w,
+                    src_h: orig_h,
+                },
+                _ => BboxTransform::Identity,
+            };
+            if let Ok(candidate) = self.recognize_detected_text(
+                &rotated,
+                cfg,
+                false,
+                &format!("det-rotated:{name}"),
+                transform,
+            ) {
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     format!("det-rotated:{name}"),
                     &candidate.recognized,
@@ -419,18 +558,20 @@ impl OrtOcrEngine {
                 return Ok(());
             }
 
+            trace.fallback_attempt_count += 1;
             if let Ok(candidate) = self.recognize_best(&rotated, cfg)
                 && is_usable_recognition(&candidate)
             {
                 let label =
                     recognition_fallback_label(&format!("rotated:{name}"), candidate.variant);
-                let candidate = recognized_from_candidate(candidate);
+                let candidate = recognized_from_candidate(candidate, image_bbox, &label);
                 maybe_adopt_recognized(
                     text,
                     confidence,
                     line_count,
                     region_count,
                     layout_applied,
+                    regions,
                     fallback,
                     label,
                     &candidate,
@@ -441,6 +582,7 @@ impl OrtOcrEngine {
             }
         }
 
+        trace.fallback_attempt_count += 1;
         let candidate = self.recognize_line_crops(img, cfg);
         maybe_adopt_recognized(
             text,
@@ -448,6 +590,7 @@ impl OrtOcrEngine {
             line_count,
             region_count,
             layout_applied,
+            regions,
             fallback,
             "line-crops".to_string(),
             &candidate,
@@ -474,6 +617,7 @@ impl OrtOcrEngine {
                     bbox: *b,
                     text: candidate.text,
                     confidence: candidate.confidence,
+                    source: "color-region".to_string(),
                 });
             }
         }
@@ -492,6 +636,7 @@ impl OrtOcrEngine {
                     bbox: (0, y0, line.width(), y0 + line_h.max(1)),
                     text: candidate.text,
                     confidence: candidate.confidence,
+                    source: "line-crops".to_string(),
                 });
             }
         }
@@ -595,6 +740,7 @@ fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
     let mut blocks = Vec::new();
     let mut confidence_sum = 0.0f32;
     let mut confidence_count = 0usize;
+    let mut public_regions = Vec::new();
     for region in regions.iter_mut() {
         region.lines.sort_by(reading_line_order);
         let block = region
@@ -611,6 +757,7 @@ fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
             confidence_sum += line.confidence;
             confidence_count += 1;
         }
+        public_regions.push(public_region_from_layout(region, &block));
         blocks.push(block);
     }
 
@@ -628,18 +775,110 @@ fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
         line_count,
         region_count,
         layout_applied: region_count > 1,
+        regions: public_regions,
     }
 }
 
-fn recognized_from_candidate(candidate: RecCandidate) -> RecognizedText {
+fn recognized_from_candidate(
+    candidate: RecCandidate,
+    bbox: BoxRect,
+    source: &str,
+) -> RecognizedText {
     let line_count = text_line_count(&candidate.text);
+    let regions = if candidate.text.trim().is_empty() {
+        Vec::new()
+    } else {
+        let line = OcrTextLine {
+            bbox: box_to_array(bbox),
+            text: candidate.text.clone(),
+            confidence: candidate.confidence,
+            source: source.to_string(),
+        };
+        vec![OcrTextRegion {
+            bbox: box_to_array(bbox),
+            text: candidate.text.clone(),
+            confidence: candidate.confidence,
+            source: source.to_string(),
+            lines: vec![line],
+        }]
+    };
     RecognizedText {
         text: candidate.text,
         confidence: candidate.confidence,
         line_count,
         region_count: if line_count == 0 { 0 } else { 1 },
         layout_applied: false,
+        regions,
     }
+}
+
+fn public_region_from_layout(region: &LayoutRegion, text: &str) -> OcrTextRegion {
+    let lines = region
+        .lines
+        .iter()
+        .map(|line| OcrTextLine {
+            bbox: box_to_array(line.bbox),
+            text: line.text.clone(),
+            confidence: line.confidence,
+            source: line.source.clone(),
+        })
+        .collect::<Vec<_>>();
+    let confidence = if region.lines.is_empty() {
+        0.0
+    } else {
+        region.lines.iter().map(|line| line.confidence).sum::<f32>() / region.lines.len() as f32
+    };
+    OcrTextRegion {
+        bbox: box_to_array(region.bbox),
+        text: text.to_string(),
+        confidence,
+        source: dominant_region_source(&region.lines),
+        lines,
+    }
+}
+
+fn dominant_region_source(lines: &[TextLine]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for line in lines {
+        if let Some((_, count)) = counts
+            .iter_mut()
+            .find(|(source, _)| *source == line.source.as_str())
+        {
+            *count += 1;
+        } else {
+            counts.push((line.source.as_str(), 1));
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(source, _)| source.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn merge_ocr_regions(current: &[OcrTextRegion], candidate: &[OcrTextRegion]) -> Vec<OcrTextRegion> {
+    let mut out = current.to_vec();
+    let mut seen = out
+        .iter()
+        .map(|region| normalize_ocr_line(&region.text))
+        .collect::<Vec<_>>();
+    for region in candidate {
+        let key = normalize_ocr_line(&region.text);
+        if key.is_empty() {
+            continue;
+        }
+        let duplicate = seen.iter().any(|existing| {
+            existing == &key
+                || (existing.len().min(key.len()) >= 4
+                    && (existing.contains(&key) || key.contains(existing)))
+        });
+        if duplicate {
+            continue;
+        }
+        seen.push(key);
+        out.push(region.clone());
+    }
+    out
 }
 
 impl LayoutRegion {
@@ -816,6 +1055,70 @@ fn region_average_line_height(region: &LayoutRegion) -> f32 {
         .map(|line| box_height(line.bbox).max(1) as f32)
         .sum::<f32>()
         / region.lines.len() as f32
+}
+
+impl BboxTransform {
+    fn map_box(self, b: BoxRect) -> BoxRect {
+        match self {
+            BboxTransform::Identity => b,
+            BboxTransform::Scale {
+                sx,
+                sy,
+                max_w,
+                max_h,
+            } => {
+                let x0 = ((b.0 as f32) * sx).floor().max(0.0) as u32;
+                let y0 = ((b.1 as f32) * sy).floor().max(0.0) as u32;
+                let x1 = ((b.2 as f32) * sx).ceil().min(max_w as f32) as u32;
+                let y1 = ((b.3 as f32) * sy).ceil().min(max_h as f32) as u32;
+                clamp_box((x0, y0, x1, y1), max_w, max_h)
+            }
+            BboxTransform::Rotate90 { src_w, src_h } => {
+                let mapped = (
+                    b.1,
+                    src_h.saturating_sub(b.2),
+                    b.3,
+                    src_h.saturating_sub(b.0),
+                );
+                clamp_box(mapped, src_w, src_h)
+            }
+            BboxTransform::Rotate180 { src_w, src_h } => {
+                let mapped = (
+                    src_w.saturating_sub(b.2),
+                    src_h.saturating_sub(b.3),
+                    src_w.saturating_sub(b.0),
+                    src_h.saturating_sub(b.1),
+                );
+                clamp_box(mapped, src_w, src_h)
+            }
+            BboxTransform::Rotate270 { src_w, src_h } => {
+                let mapped = (
+                    src_w.saturating_sub(b.3),
+                    b.0,
+                    src_w.saturating_sub(b.1),
+                    b.2,
+                );
+                clamp_box(mapped, src_w, src_h)
+            }
+        }
+    }
+}
+
+fn clamp_box(b: BoxRect, max_w: u32, max_h: u32) -> BoxRect {
+    let x0 = b.0.min(max_w);
+    let y0 = b.1.min(max_h);
+    let x1 = b.2.min(max_w).max(x0.saturating_add(1).min(max_w));
+    let y1 = b.3.min(max_h).max(y0.saturating_add(1).min(max_h));
+    (x0, y0, x1, y1)
+}
+
+fn image_box(image: &DynamicImage) -> BoxRect {
+    let (w, h) = image.dimensions();
+    (0, 0, w.max(1), h.max(1))
+}
+
+fn box_to_array(b: BoxRect) -> [u32; 4] {
+    [b.0, b.1, b.2, b.3]
 }
 
 fn color_region_boxes(image: &DynamicImage) -> Vec<BoxRect> {
@@ -1121,6 +1424,7 @@ fn maybe_adopt_recognized(
     line_count: &mut usize,
     region_count: &mut usize,
     layout_applied: &mut bool,
+    regions: &mut Vec<OcrTextRegion>,
     fallback: &mut Option<String>,
     label: String,
     candidate: &RecognizedText,
@@ -1137,6 +1441,7 @@ fn maybe_adopt_recognized(
             .region_count
             .max(if text.trim().is_empty() { 0 } else { 1 });
         *layout_applied = candidate.layout_applied;
+        *regions = candidate.regions.clone();
         *fallback = Some(label);
         return true;
     }
@@ -1157,6 +1462,7 @@ fn maybe_adopt_recognized(
             .region_count
             .max(if text.trim().is_empty() { 0 } else { 1 });
         *layout_applied = candidate.layout_applied;
+        *regions = candidate.regions.clone();
         *fallback = Some(label);
         return true;
     }
@@ -1174,6 +1480,7 @@ fn maybe_adopt_recognized(
         *line_count = text_line_count(text);
         *region_count = (*region_count).max(candidate.region_count).max(1);
         *layout_applied = *layout_applied || candidate.layout_applied || *region_count > 1;
+        *regions = merge_ocr_regions(regions, &candidate.regions);
         *fallback = Some(format!("merged:{label}"));
         return true;
     }
@@ -1189,6 +1496,7 @@ fn maybe_adopt_recognized(
             .region_count
             .max(if text.trim().is_empty() { 0 } else { 1 });
         *layout_applied = candidate.layout_applied;
+        *regions = candidate.regions.clone();
         *fallback = Some(label);
         return true;
     }
@@ -2502,6 +2810,7 @@ mod tests {
         let mut line_count = 1;
         let mut region_count = 1;
         let mut layout_applied = false;
+        let mut regions = Vec::new();
         let mut fallback = None;
         let candidate = RecognizedText {
             text: "Header\nTotal 42".to_string(),
@@ -2509,6 +2818,13 @@ mod tests {
             line_count: 2,
             region_count: 1,
             layout_applied: false,
+            regions: vec![OcrTextRegion {
+                bbox: [0, 0, 120, 32],
+                text: "Header\nTotal 42".to_string(),
+                confidence: 0.54,
+                source: "det-enhanced:contrast".to_string(),
+                lines: Vec::new(),
+            }],
         };
         assert!(maybe_adopt_recognized(
             &mut text,
@@ -2516,6 +2832,7 @@ mod tests {
             &mut line_count,
             &mut region_count,
             &mut layout_applied,
+            &mut regions,
             &mut fallback,
             "det-enhanced:contrast".to_string(),
             &candidate,
@@ -2524,6 +2841,7 @@ mod tests {
         assert_eq!(line_count, 2);
         assert_eq!(region_count, 1);
         assert!(!layout_applied);
+        assert_eq!(regions.len(), 1);
         assert_eq!(fallback.as_deref(), Some("merged:det-enhanced:contrast"));
     }
 
@@ -2540,6 +2858,8 @@ mod tests {
         assert_eq!(recognized.line_count, 4);
         assert_eq!(recognized.region_count, 2);
         assert!(recognized.layout_applied);
+        assert_eq!(recognized.regions[0].bbox, [0, 0, 90, 30]);
+        assert_eq!(recognized.regions[0].lines[0].source, "det");
     }
 
     #[test]
@@ -2628,6 +2948,7 @@ mod tests {
             bbox,
             text: text.to_string(),
             confidence,
+            source: "det".to_string(),
         }
     }
 }

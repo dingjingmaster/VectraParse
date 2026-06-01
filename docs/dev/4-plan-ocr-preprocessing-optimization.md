@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.5
+> - 文档版本：v1.0.6
 > - 最后更新：2026-06-01
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类和颜色背景区域 fallback。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出和 trace metadata。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -18,7 +18,7 @@
 - 成功标准：
   - 常见图片格式能稳定进入 `ImageMetadataParser` 的 OCR 路径。
   - 失败样本可按原因分桶，并在 metadata 或 warnings 中体现。
-  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选和 OLE 图片候选处理。
+  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、结构化区域/行输出和 OLE 图片候选处理。
   - 当前 golden 仅覆盖 `image/png` parser 叶子行为和 `image.format` 基础元数据；尚未落地真实 OCR 文本 fixture。
   - 当前验证主要证明入口、诊断和辅助算法行为；尚未用真实失败样本系统证明 OCR 文本质量提升。
 - 前置条件：
@@ -44,7 +44,7 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、区域级布局聚类、颜色背景区域候选 fallback、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、区域级布局聚类、颜色背景区域候选 fallback、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
   - OCR 核心未实现：长 crop 分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
@@ -77,6 +77,7 @@
   - fallback 已从“仅空结果触发”扩展为“空结果、低置信、det 框多但识别行少、有效字符过少或可读比例偏低”触发；补跑候选会按行去重后合并，或在明显更长/更高置信时替换原结果。
   - 检测框识别结果已不再只按全局 y/x 排序；当前会按 bbox 水平重叠、纵向距离、宽度差异将行聚类为区域，区域之间用空行分隔，并在 metadata 中记录 `image.ocr.region_count` 和 `image.ocr.layout_applied`。
   - 颜色背景区域 fallback 会在低质量路径中按粗量化颜色连通域提取明显色块，跳过整页背景和低填充率噪声区域；候选区域内会根据边框背景色做前景色差二值化，再执行 rec，并在 metadata 中记录 `image.ocr.color_region_count`。
+  - `OcrResult` 已输出结构化 `regions: Vec<OcrTextRegion>`，每个 region 包含 bbox、文本、置信度、来源和行级 `OcrTextLine`；trace 当前记录最终选中来源、det pass 次数和 fallback 尝试次数，并通过 metadata 写出。
   - 当前新增行级质量过滤会拒绝低置信、重复字符占比过高和标点占比过高的候选，可能降低垃圾输出，也可能丢弃少量真实低置信文本，需要真实样本评估。
 - 最小修复点：
   - 先补入口识别和诊断，再引入可回退的预处理增强，不一次性重写 OCR 管线。
@@ -100,6 +101,7 @@
 | 10 | 收口 golden/文档：当前仅将 `image/png` stub 纳入 parser 提取矩阵；真实 OCR 文本样本尚未进入 golden | 定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 部分完成 |
 | 11 | 增加区域级布局聚类：逐框识别后按 bbox 聚类为区域，区域内按行排序，区域间用空行分隔，并输出区域诊断 metadata | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 | 12 | 增加颜色背景区域 fallback：按近似背景色连通域提取 UI 色块，在候选区域内做背景色差二值化后识别，并输出颜色区域候选数 metadata | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
+| 13 | 增加结构化区域/行输出和 trace metadata：暴露 OCR region/line bbox、source、confidence，并记录选中来源、det pass 和 fallback 尝试数 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 
 ## 6. 验证计划
 
@@ -124,6 +126,7 @@
   - 部分成功 fallback 的替换/合并策略仍是启发式：可能保留少量原始漏识别片段，也可能在候选更长时替换掉原有短文本。
   - 区域级布局聚类仍是几何启发式，不理解页面语义；复杂表格、嵌套卡片、瀑布流、多弹窗叠加或跨区域标题仍可能排序不符合人工阅读顺序。
   - 颜色背景区域 fallback 使用粗颜色量化和边框背景估计；渐变、阴影、图片背景、透明叠层或彩色插图可能产生候选过多或候选缺失，当前只在低质量 fallback 路径触发并限制最大候选数。
+  - 结构化 bbox 对原图 det、增强图 det、上采样和旋转 det 做了坐标回映；复杂旋转/裁剪组合仍需真实截图验证坐标是否足够准确。
   - 不更换模型的前提下，极端模糊、严重透视、手写字或超低分辨率图片仍可能无法可靠提取。
 
 当前验证记录：
@@ -236,6 +239,14 @@
 - 本轮验证命令：
   - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
   - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers ocr_success_metadata`
+- 已完成结构化区域/行输出和 trace metadata：
+  - `OcrResult` 新增 `regions: Vec<OcrTextRegion>` 和 `trace: OcrTrace`；每个 region/line 包含 bbox、text、confidence 和 source。
+  - 原图 det、增强图 det、上采样 det、旋转 det、颜色区域和行切分 fallback 会标记来源；上采样和旋转 det 的 bbox 会回映到原图坐标。
+  - trace 记录最终选中来源、det pass 次数和 fallback 尝试次数；`ImageMetadataParser` 同步写入 `image.ocr.selected_source`、`image.ocr.det_pass_count`、`image.ocr.fallback_attempt_count`。
+  - `VECTRAPARSE_OCR_TRACE=1` 输出同步增加 selected source、det pass 和 fallback attempt，方便复杂截图排查。
+- 本轮验证命令：
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers ocr_success_metadata`
 - 已完成 OLE 嵌入图片 OCR 候选处理增强：
   - `vectraparse-mso-binary` 现会在 `.doc` 路径先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
   - 去重 key 从“长度 + 前 4 字节”提升为“长度 + 前后 64 字节哈希”，降低同源嵌入图被重复 OCR 的概率。
@@ -337,6 +348,21 @@
   - 单测覆盖对比色面板区域检测和区域内前景二值化。
   - 仍缺真实 OCR 文本 fixture，`color_region_count` 可用于观察该路径是否命中以及候选规模是否失控。
 
+## 7.5 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只增加 OCR 结果结构和诊断 metadata，未触碰 `crates/vectraparse-ocr/src/ort.rs`、模型、字典、构建链接或 C ABI。
+  - 新增 `regions` 是 Rust API 扩展；下游若直接构造 `OcrResult` 需要补字段，本仓库测试已同步。
+- 高级产品：
+  - 结构化 regions/lines 让复杂截图测试可定位到具体区域和来源，不再只能靠最终纯文本判断。
+  - trace metadata 能快速判断是否走了 fallback、是否命中颜色区域、最终采用哪个来源。
+- 高级架构师：
+  - bbox 坐标保持原图坐标语义；增强图保持 identity，上采样和旋转 det 做坐标回映，整图 fallback 使用原图整框。
+  - 当前仍不提供序列化 JSON 字段，parser 侧只沉淀轻量 trace metadata；如上层需要完整区域结构，需要在对应 API 层明确输出格式。
+- 高级工程师：
+  - 单测覆盖结构化 region/line 的 bbox 和 source；parser metadata 覆盖 selected source、det pass 和 fallback attempt。
+  - 仍需真实复杂截图验证旋转 det bbox 回映和区域 source 对齐是否满足调试需求。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -358,3 +384,4 @@
 | 2026-06-01 | 完成 OCR 质量补强优化 2/3/5/6 | 对增强/上采样/旋转变体重跑 det，增加部分成功补跑合并、det NMS/unclip 扩边和透明图黑底增强 |
 | 2026-06-01 | 完成区域级布局聚类 | 将复杂截图 OCR 输出从全局 y/x 排序升级为区域聚类输出，并增加区域诊断 metadata |
 | 2026-06-01 | 完成颜色背景区域 fallback | 针对明显背景色块上的文字增加色块候选、区域二值化识别和颜色区域诊断 metadata |
+| 2026-06-01 | 完成结构化 OCR regions/lines 和 trace metadata | 让复杂截图 OCR 结果可按区域、行、来源和 fallback 路径调试 |
