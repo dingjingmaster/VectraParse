@@ -943,7 +943,8 @@ impl OrtOcrEngine {
 fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
     lines.sort_by(reading_line_order);
     let deduped = dedupe_text_lines(lines);
-    let mut regions = group_text_lines_into_regions(&deduped);
+    let filtered = filter_low_value_text_lines(&deduped);
+    let mut regions = group_text_lines_into_regions(&filtered);
     regions.sort_by(reading_region_order);
 
     let mut blocks = Vec::new();
@@ -1797,8 +1798,17 @@ fn dedupe_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
 
 fn text_lines_are_near_duplicates(a: &TextLine, b: &TextLine) -> bool {
     let similarity = normalized_text_similarity(&a.text, &b.text);
+    if long_texts_are_near_duplicates(&a.text, &b.text) && similarity >= 0.96 {
+        return true;
+    }
     if boxes_significantly_overlap(a.bbox, b.bbox) || box_iou(a.bbox, b.bbox) >= 0.35 {
         return similarity >= 0.78;
+    }
+    if long_texts_are_near_duplicates(&a.text, &b.text)
+        && boxes_share_column(a.bbox, b.bbox)
+        && similarity >= 0.90
+    {
+        return true;
     }
     long_texts_are_near_duplicates(&a.text, &b.text)
         && boxes_are_near_same_column(a.bbox, b.bbox)
@@ -1854,14 +1864,59 @@ fn long_texts_are_near_duplicates(a: &str, b: &str) -> bool {
         >= 8
 }
 
-fn boxes_are_near_same_column(a: BoxRect, b: BoxRect) -> bool {
+fn filter_low_value_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
+    if lines.len() < 6 {
+        return lines.to_vec();
+    }
+    lines
+        .iter()
+        .filter(|line| !is_low_value_short_ocr_line(&line.text))
+        .cloned()
+        .collect()
+}
+
+fn is_low_value_short_ocr_line(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    if text.chars().any(is_cjk_char) {
+        return false;
+    }
+    let chars = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    if chars.is_empty() {
+        return true;
+    }
+    if chars.iter().all(|ch| ch.is_ascii_punctuation()) {
+        return true;
+    }
+    if chars.len() <= 1 && chars.iter().all(|ch| ch.is_ascii()) {
+        return true;
+    }
+    chars.len() <= 2
+        && chars.iter().all(|ch| ch.is_ascii())
+        && !chars.iter().any(|ch| ch.is_ascii_lowercase())
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+}
+
+fn boxes_share_column(a: BoxRect, b: BoxRect) -> bool {
     let min_width = box_width(a).min(box_width(b)).max(1) as f32;
     let overlap_ratio = horizontal_overlap(a, b) as f32 / min_width;
     let center_close = (box_center_x(a) - box_center_x(b)).abs()
         <= box_width(a).max(box_width(b)).max(1) as f32 * 0.45;
+    overlap_ratio >= 0.35 || center_close
+}
+
+fn boxes_are_near_same_column(a: BoxRect, b: BoxRect) -> bool {
     let max_h = box_height(a).max(box_height(b)).max(1);
     let max_gap = (max_h * 10).clamp(80, 220);
-    (overlap_ratio >= 0.35 || center_close) && vertical_gap(a, b) <= max_gap
+    boxes_share_column(a, b) && vertical_gap(a, b) <= max_gap
 }
 
 fn levenshtein_chars(a: &str, b: &str) -> usize {
@@ -3850,12 +3905,61 @@ mod tests {
         let mut lines = vec![
             text_line((320, 10, 470, 26), "赵剑超@安得和众3084", 0.70),
             text_line((322, 54, 468, 70), "赵剑超@安和众3084", 0.74),
-            text_line((320, 300, 470, 316), "赵剑超@安得和众3084", 0.68),
+            text_line((320, 300, 470, 316), "冯育坤@安得和众3084", 0.68),
         ];
 
         let recognized = recognized_from_text_lines(&mut lines);
 
         assert_eq!(recognized.line_count, 2);
+    }
+
+    #[test]
+    fn recognized_from_text_lines_dedupes_distant_same_column_long_variants() {
+        let mut lines = vec![
+            text_line((320, 10, 470, 26), "赵剑超@安得和众3084", 0.70),
+            text_line((322, 360, 468, 376), "赵剑超@安和众3084", 0.74),
+            text_line((24, 360, 130, 376), "工作台", 0.80),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 2);
+        assert!(recognized.text.contains("工作台"));
+    }
+
+    #[test]
+    fn recognized_from_text_lines_dedupes_global_exact_long_text_only() {
+        let mut lines = vec![
+            text_line((20, 10, 180, 26), "赵剑超@安得和众3084", 0.70),
+            text_line((360, 420, 520, 436), "赵剑超@安得和众3084", 0.76),
+            text_line((20, 60, 80, 76), "陈晗", 0.70),
+            text_line((360, 460, 420, 476), "陈晗", 0.76),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.text.matches("赵剑超@安得和众3084").count(), 1);
+        assert_eq!(recognized.text.matches("陈晗").count(), 2);
+    }
+
+    #[test]
+    fn recognized_from_text_lines_drops_short_ascii_noise_in_dense_results() {
+        let mut lines = vec![
+            text_line((0, 0, 20, 12), "AM", 0.92),
+            text_line((0, 20, 20, 32), "+", 0.88),
+            text_line((0, 40, 20, 52), "WH", 0.90),
+            text_line((40, 0, 130, 12), "Q搜索", 0.81),
+            text_line((40, 20, 130, 32), "工作台", 0.82),
+            text_line((40, 40, 130, 52), "发送(S)", 0.83),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 3);
+        assert!(!recognized.text.contains("AM"));
+        assert!(!recognized.text.contains("WH"));
+        assert!(!recognized.text.contains("+"));
+        assert!(recognized.text.contains("Q搜索"));
     }
 
     #[test]

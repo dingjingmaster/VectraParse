@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.9
+> - 文档版本：v1.0.10
 > - 最后更新：2026-06-01
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop 和近似重复去重。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop、近似重复去重和短噪声过滤。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -18,7 +18,7 @@
 - 成功标准：
   - 常见图片格式能稳定进入 `ImageMetadataParser` 的 OCR 路径。
   - 失败样本可按原因分桶，并在 metadata 或 warnings 中体现。
-  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、浅色底黑字候选、det 原始小框替代切分候选、rec 前景 tight crop、近似重复行去重、结构化区域/行输出、det 框内部多行切分和 OLE 图片候选处理。
+  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、浅色底黑字候选、det 原始小框替代切分候选、rec 前景 tight crop、近似重复行去重、短 ASCII/符号噪声过滤、结构化区域/行输出、det 框内部多行切分和 OLE 图片候选处理。
   - 当前 golden 仅覆盖 `image/png` parser 叶子行为和 `image.format` 基础元数据；尚未落地真实 OCR 文本 fixture。
   - 当前验证主要证明入口、诊断和辅助算法行为；尚未用真实失败样本系统证明 OCR 文本质量提升。
 - 前置条件：
@@ -44,7 +44,7 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、原始 det 小框作为合并框的替代切分候选、rec 前景 tight crop、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、聊天 UI 中间时间标记断行后处理、区域级布局聚类、bbox+文本相似度的近似重复行去重、颜色背景区域候选 fallback、受限主动颜色区域补充识别、4-bit 颜色量化的浅色底黑字候选、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、原始 det 小框作为合并框的替代切分候选、rec 前景 tight crop、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、聊天 UI 中间时间标记断行后处理、区域级布局聚类、bbox+文本相似度的近似重复行去重、短 ASCII/符号噪声过滤、颜色背景区域候选 fallback、受限主动颜色区域补充识别、4-bit 颜色量化的浅色底黑字候选、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
   - OCR 核心未实现：长文本横向分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
@@ -78,7 +78,7 @@
   - 检测框识别结果已不再只按全局 y/x 排序；当前会按 bbox 水平重叠、纵向距离、宽度差异将行聚类为区域，区域之间用空行分隔，并在 metadata 中记录 `image.ocr.region_count` 和 `image.ocr.layout_applied`。
   - 原始 det 小框不会直接追加到最终结果；当前只作为合并宽框的替代切分候选，候选切分必须通过内容量和置信度门禁才替代整框识别，避免召回过头造成重复噪声。
   - rec 输入前会尝试根据前景 mask 裁掉大块空白并保留 padding，降低宽 crop 或空白背景对 rec 缩放和识别的干扰。
-  - 行级输出会先做 bbox 重叠 + 文本相似度去重，并对同一列附近的长文本近似重复做保守去重；短名字等可能真实重复的文本不做全局强去重。
+  - 行级输出会先做 bbox 重叠 + 文本相似度去重，并对同列长文本近似重复、全局完全相同长文本做保守去重；密集结果中的短 ASCII/符号行会被过滤，短中文名字等可能真实重复的文本不做全局强去重。
   - 颜色背景区域识别会在正常 det 后主动用小预算补充一次，并在低质量路径中继续作为 fallback；当前颜色量化提升到 4-bit，可区分浅灰/浅蓝底和页面背景，候选区域内会根据区域主色做前景色差二值化，再执行 rec；主动补充只合并与已有 det 行不明显重叠的候选，避免重复噪声，并在 metadata 中记录 `image.ocr.color_region_count`。
   - `OcrResult` 已输出结构化 `regions: Vec<OcrTextRegion>`，每个 region 包含 bbox、文本、置信度、来源和行级 `OcrTextLine`；trace 当前记录最终选中来源、det pass 次数和 fallback 尝试次数，并通过 metadata 写出。
   - 原图 det 框识别前会优先尝试明显背景色块切分，再对包含多行文字的 crop 做前景行投影切分，并对同一行内存在水平大空隙的宽 crop 做列段切分；只有拆出至少两条有效子段且子段识别未明显丢内容/置信度时，才用子段结果替代整框 rec，避免相邻消息或左右区域被 rec 模型粘成一行；每次 det pass 额外子行 rec 和逐 crop 增强都有固定预算，子段只做 direct rec，增强/旋转 det 不再叠加拆行成本。
@@ -111,6 +111,7 @@
 | 15 | 增加聊天 UI 时间标记断行后处理：对发送者前缀后串入 `刚刚/昨天/星期X` 的合并行插入换行 | `cargo test -p vectraparse-ocr`; 真实截图 `/home/dingjing/files/b.png` 实测 | 完成 |
 | 16 | 增加浅色底黑字主动补充识别：正常 det 后用小预算识别颜色区域候选，颜色量化提升到 4-bit 以捕获浅灰/浅蓝 UI 色块 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 | 17 | 增加 det 候选质量优化、rec 前景 tight crop 和近似重复去重：原始小框仅作为合并框替代切分候选，rec 前裁掉大块空白，输出前按 bbox/text 相似度去重 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试；真实截图回测 | 完成 |
+| 18 | 增加短噪声过滤和全局长文本精确去重：密集结果中过滤短 ASCII/符号噪声，完全相同或近乎完全相同的长文本可跨位置去重 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试；真实截图回测 | 完成 |
 
 ## 6. 验证计划
 
@@ -306,6 +307,19 @@
   - `/home/dingjing/files/b.png` 的目标合并行仍保持 `陈晗：mac是用内核导的` 与 `刚刚网关说不支持邮件` 两行。
   - 右侧成员/组织文本的重复比“直接追加原始小框”版本收敛，但仍有少量相近行残留；该类问题后续更适合通过真实 OCR golden 和版面区域先切分继续处理。
   - 本地端到端仍约百秒，说明复杂整页截图的性能预算已成为后续优化约束。
+- 已完成短噪声过滤和全局长文本精确去重：
+  - 当 OCR 行数较多时，会过滤短 ASCII/符号噪声行，例如孤立大写字母、纯符号和极短非中文片段；短中文名字不会因此被全局删除。
+  - 长文本若完全相同或几乎完全相同，可跨位置去重；同列长文本近似重复继续保留较高质量候选。
+  - 真实截图回测中，`AM`、`WH`、`Y`、`D`、`+`、`...`、`2+` 等短噪声明显减少，目标聊天合并行仍保持拆分。
+- 本轮验证命令：
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers ocr_success_metadata`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo build --release -p vectraparse-ffi`
+  - `gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a -L/tmp/onnxruntime-linux-x64-1.26.0/lib -lonnxruntime -ldl -lpthread -lm -Wl,-rpath,/tmp/onnxruntime-linux-x64-1.26.0/lib -o target/extract-static`
+  - `timeout 180s env ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ./target/extract-static /home/dingjing/files/b.png`
+- 真实截图验证结果：
+  - `/home/dingjing/files/b.png` 输出比上一轮少了多处孤立短噪声和一处重复长组织文本。
+  - 仍有少量语义相近但 OCR 文本不够相似的组织/成员行残留；继续优化应优先补真实截图 golden，再做页面区域级预切分。
 - 已完成 OLE 嵌入图片 OCR 候选处理增强：
   - `vectraparse-mso-binary` 现会在 `.doc` 路径先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
   - 去重 key 从“长度 + 前 4 字节”提升为“长度 + 前后 64 字节哈希”，降低同源嵌入图被重复 OCR 的概率。
@@ -468,6 +482,21 @@
   - 单测覆盖原始 det 小框替代候选、rec tight crop、bbox 重叠近似去重和同列长文本近似去重。
   - `extract-static` 端到端回测仍约百秒，后续继续提升准确率前应补真实截图 golden 并同步做性能预算。
 
+## 7.9 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只修改 OCR crate 内部最终行过滤和当前任务文档，未触碰 `crates/vectraparse-ocr/src/ort.rs`、ONNX 模型、字典、构建链接或 C ABI。
+  - 短噪声过滤只在密集结果中生效，且不删除短中文文本；长文本全局去重要求文本几乎完全相同，避免过度合并真实短名字。
+- 高级产品：
+  - 本轮针对复杂截图输出中的孤立字母、符号和重复组织名做收口，优先降低可见噪声。
+  - 回测显示短噪声明显减少，但语义相近、字面差异较大的组织/成员行仍会残留；后续需要真实 golden 和区域级预切分。
+- 高级架构师：
+  - 未新增依赖，仍基于已有文本相似度、bbox 和行过滤逻辑，不扩大 OCR 模型调用范围。
+  - 该优化属于最终文本清理层，不改变 det/rec 模型输入输出协议。
+- 高级工程师：
+  - 单测覆盖密集结果短 ASCII/符号噪声过滤、全局长文本精确去重，并保留短中文名字重复。
+  - `extract-static` 端到端回测确认目标聊天行仍拆分，短噪声减少；复杂截图耗时仍是残余问题。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -495,3 +524,4 @@
 | 2026-06-01 | 增加聊天 UI 时间标记断行 | 覆盖左侧会话预览时间与右侧气泡内容被同一 OCR 行串读的样本 |
 | 2026-06-01 | 增加浅色底黑字主动补充识别 | 用 4-bit 颜色区域候选、区域主色二值化和重叠过滤提升 UI 色块黑字召回 |
 | 2026-06-01 | 增加 det 候选质量、rec tight crop 和近似重复去重 | 降低合并框误读、宽 crop 空白干扰和复杂截图重复噪声 |
+| 2026-06-01 | 增加短噪声过滤和全局长文本精确去重 | 减少复杂截图中的孤立字母、符号和重复长组织文本 |
