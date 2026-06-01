@@ -86,6 +86,19 @@ pub struct OcrTrace {
     pub selected_source: Option<String>,
     pub det_pass_count: usize,
     pub fallback_attempt_count: usize,
+    pub lines: Vec<OcrTraceLine>,
+    pub json: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTraceLine {
+    pub region_index: usize,
+    pub line_index: usize,
+    pub bbox: [u32; 4],
+    pub crop_size: [u32; 2],
+    pub text: String,
+    pub confidence: f32,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -266,6 +279,8 @@ impl OrtOcrEngine {
             },
             det_pass_count: 1,
             fallback_attempt_count: 0,
+            lines: Vec::new(),
+            json: None,
         };
 
         let (page_region_count, page_region_candidate) =
@@ -344,6 +359,24 @@ impl OrtOcrEngine {
                 Some("det".to_string())
             }
         });
+        trace.lines = ocr_trace_lines_from_regions(&regions);
+        if ocr_trace_json_enabled() {
+            let (w, h) = img.dimensions();
+            let json = ocr_trace_json(
+                w,
+                h,
+                source_has_alpha,
+                det_box_count,
+                color_region_count,
+                detect_used_whole_image_box,
+                empty_result,
+                confidence,
+                &trace,
+                &regions,
+            );
+            eprintln!("[OCR_TRACE_JSON] {json}");
+            trace.json = Some(json);
+        }
 
         if trace_enabled {
             let (w, h) = img.dimensions();
@@ -1125,6 +1158,232 @@ fn public_region_from_layout(region: &LayoutRegion, text: &str) -> OcrTextRegion
         source: dominant_region_source(&region.lines),
         lines,
     }
+}
+
+fn ocr_trace_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<OcrTraceLine> {
+    let mut trace_lines = Vec::new();
+    for (region_idx, region) in regions.iter().enumerate() {
+        if region.lines.is_empty() && !region.text.trim().is_empty() {
+            let bbox = region.bbox;
+            trace_lines.push(OcrTraceLine {
+                region_index: region_idx,
+                line_index: 0,
+                bbox,
+                crop_size: bbox_size(bbox),
+                text: region.text.clone(),
+                confidence: region.confidence,
+                source: region.source.clone(),
+            });
+            continue;
+        }
+        for (line_idx, line) in region.lines.iter().enumerate() {
+            trace_lines.push(OcrTraceLine {
+                region_index: region_idx,
+                line_index: line_idx,
+                bbox: line.bbox,
+                crop_size: bbox_size(line.bbox),
+                text: line.text.clone(),
+                confidence: line.confidence,
+                source: line.source.clone(),
+            });
+        }
+    }
+    trace_lines
+}
+
+fn bbox_size(bbox: [u32; 4]) -> [u32; 2] {
+    [
+        bbox[2].saturating_sub(bbox[0]),
+        bbox[3].saturating_sub(bbox[1]),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ocr_trace_json(
+    image_w: u32,
+    image_h: u32,
+    source_has_alpha: bool,
+    det_box_count: usize,
+    color_region_count: usize,
+    detect_used_whole_image_box: bool,
+    empty_result: bool,
+    confidence: f32,
+    trace: &OcrTrace,
+    regions: &[OcrTextRegion],
+) -> String {
+    let selected_source = trace.selected_source.as_deref().unwrap_or("");
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"image\":{");
+    push_json_u32_field(&mut out, "width", image_w, false);
+    push_json_u32_field(&mut out, "height", image_h, true);
+    push_json_bool_field(&mut out, "source_has_alpha", source_has_alpha, true);
+    out.push('}');
+
+    out.push_str(",\"summary\":{");
+    push_json_usize_field(&mut out, "det_box_count", det_box_count, false);
+    push_json_usize_field(&mut out, "line_count", trace.lines.len(), true);
+    push_json_usize_field(&mut out, "region_count", regions.len(), true);
+    push_json_usize_field(&mut out, "color_region_count", color_region_count, true);
+    push_json_usize_field(&mut out, "det_pass_count", trace.det_pass_count, true);
+    push_json_usize_field(
+        &mut out,
+        "fallback_attempt_count",
+        trace.fallback_attempt_count,
+        true,
+    );
+    push_json_bool_field(
+        &mut out,
+        "detect_used_whole_image_box",
+        detect_used_whole_image_box,
+        true,
+    );
+    push_json_bool_field(&mut out, "empty_result", empty_result, true);
+    push_json_f32_field(&mut out, "confidence", confidence, true);
+    push_json_str_field(&mut out, "selected_source", selected_source, true);
+    out.push('}');
+
+    out.push_str(",\"regions\":[");
+    for (region_idx, region) in regions.iter().enumerate() {
+        if region_idx > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_json_usize_field(&mut out, "index", region_idx, false);
+        push_json_bbox_field(&mut out, "bbox", region.bbox, true);
+        push_json_f32_field(&mut out, "confidence", region.confidence, true);
+        push_json_str_field(&mut out, "source", &region.source, true);
+        push_json_str_field(&mut out, "text", &region.text, true);
+        out.push_str(",\"lines\":[");
+        for (line_idx, line) in region.lines.iter().enumerate() {
+            if line_idx > 0 {
+                out.push(',');
+            }
+            out.push('{');
+            push_json_usize_field(&mut out, "index", line_idx, false);
+            push_json_bbox_field(&mut out, "bbox", line.bbox, true);
+            push_json_size_field(&mut out, "crop_size", bbox_size(line.bbox), true);
+            push_json_f32_field(&mut out, "confidence", line.confidence, true);
+            push_json_str_field(&mut out, "source", &line.source, true);
+            push_json_str_field(&mut out, "text", &line.text, true);
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+    out.push_str("],\"lines\":[");
+    for (idx, line) in trace.lines.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_json_usize_field(&mut out, "region_index", line.region_index, false);
+        push_json_usize_field(&mut out, "line_index", line.line_index, true);
+        push_json_bbox_field(&mut out, "bbox", line.bbox, true);
+        push_json_size_field(&mut out, "crop_size", line.crop_size, true);
+        push_json_f32_field(&mut out, "confidence", line.confidence, true);
+        push_json_str_field(&mut out, "source", &line.source, true);
+        push_json_str_field(&mut out, "text", &line.text, true);
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
+}
+
+fn push_json_str_field(out: &mut String, key: &str, value: &str, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":\"");
+    out.push_str(&escape_json(value));
+    out.push('"');
+}
+
+fn push_json_bool_field(out: &mut String, key: &str, value: bool, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(if value { "true" } else { "false" });
+}
+
+fn push_json_usize_field(out: &mut String, key: &str, value: usize, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(&value.to_string());
+}
+
+fn push_json_u32_field(out: &mut String, key: &str, value: u32, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(&value.to_string());
+}
+
+fn push_json_f32_field(out: &mut String, key: &str, value: f32, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(&format!("{value:.4}"));
+}
+
+fn push_json_bbox_field(out: &mut String, key: &str, bbox: [u32; 4], comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":[");
+    out.push_str(&bbox[0].to_string());
+    out.push(',');
+    out.push_str(&bbox[1].to_string());
+    out.push(',');
+    out.push_str(&bbox[2].to_string());
+    out.push(',');
+    out.push_str(&bbox[3].to_string());
+    out.push(']');
+}
+
+fn push_json_size_field(out: &mut String, key: &str, size: [u32; 2], comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":[");
+    out.push_str(&size[0].to_string());
+    out.push(',');
+    out.push_str(&size[1].to_string());
+    out.push(']');
+}
+
+fn escape_json(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn dominant_region_source(lines: &[TextLine]) -> String {
@@ -3161,6 +3420,10 @@ fn ocr_trace_enabled() -> bool {
     std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1")
 }
 
+fn ocr_trace_json_enabled() -> bool {
+    std::env::var("VECTRAPARSE_OCR_TRACE_JSON").ok().as_deref() == Some("1")
+}
+
 fn to_hsl_lightness(image: &DynamicImage) -> GrayImage {
     to_hsl_lightness_on_background(image, 255)
 }
@@ -4399,6 +4662,71 @@ mod tests {
 
         assert_eq!(supplement.text, "Approve");
         assert_eq!(supplement.line_count, 1);
+    }
+
+    #[test]
+    fn ocr_trace_lines_include_region_line_source_and_crop_size() {
+        let regions = vec![OcrTextRegion {
+            bbox: [10, 20, 120, 60],
+            text: "Alpha\nBeta".to_string(),
+            confidence: 0.73,
+            source: "det".to_string(),
+            lines: vec![
+                OcrTextLine {
+                    bbox: [10, 20, 80, 36],
+                    text: "Alpha".to_string(),
+                    confidence: 0.70,
+                    source: "det".to_string(),
+                },
+                OcrTextLine {
+                    bbox: [12, 42, 120, 60],
+                    text: "Beta".to_string(),
+                    confidence: 0.76,
+                    source: "page-region:1".to_string(),
+                },
+            ],
+        }];
+
+        let lines = ocr_trace_lines_from_regions(&regions);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].region_index, 0);
+        assert_eq!(lines[0].line_index, 0);
+        assert_eq!(lines[0].bbox, [10, 20, 80, 36]);
+        assert_eq!(lines[0].crop_size, [70, 16]);
+        assert_eq!(lines[1].source, "page-region:1");
+    }
+
+    #[test]
+    fn ocr_trace_json_escapes_text_and_records_lines() {
+        let regions = vec![OcrTextRegion {
+            bbox: [0, 0, 80, 24],
+            text: "A \"quoted\" line".to_string(),
+            confidence: 0.82,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [0, 0, 80, 24],
+                text: "A \"quoted\" line".to_string(),
+                confidence: 0.82,
+                source: "det".to_string(),
+            }],
+        }];
+        let mut trace = OcrTrace {
+            selected_source: Some("det".to_string()),
+            det_pass_count: 1,
+            fallback_attempt_count: 0,
+            lines: ocr_trace_lines_from_regions(&regions),
+            json: None,
+        };
+
+        let json = ocr_trace_json(100, 50, false, 1, 0, false, false, 0.82, &trace, &regions);
+        trace.json = Some(json.clone());
+
+        assert!(json.contains("\"width\":100"));
+        assert!(json.contains("\"source\":\"det\""));
+        assert!(json.contains("\"crop_size\":[80,24]"));
+        assert!(json.contains("A \\\"quoted\\\" line"));
+        assert_eq!(trace.json.as_deref(), Some(json.as_str()));
     }
 
     #[test]

@@ -1305,6 +1305,10 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
     if let Some(source) = &ocr.trace.selected_source {
         metadata.insert("image.ocr.selected_source", source.clone());
     }
+    metadata.insert("image.ocr.trace_line_count", ocr.trace.lines.len().to_string());
+    if let Some(json) = &ocr.trace.json {
+        metadata.insert("image.ocr.trace_json", json.clone());
+    }
     metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
     metadata.insert(
         "image.ocr.source_has_alpha",
@@ -3510,6 +3514,16 @@ mod tests {
                 selected_source: Some("whole-image".to_string()),
                 det_pass_count: 2,
                 fallback_attempt_count: 3,
+                lines: vec![vectraparse_ocr::OcrTraceLine {
+                    region_index: 0,
+                    line_index: 0,
+                    bbox: [1, 2, 11, 22],
+                    crop_size: [10, 20],
+                    text: "abc".to_string(),
+                    confidence: 0.2,
+                    source: "whole-image".to_string(),
+                }],
+                json: Some("{\"lines\":[]}".to_string()),
             },
         };
         apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
@@ -3568,6 +3582,20 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("whole-image")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_line_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_json")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("{\"lines\":[]}")
         );
         assert_eq!(
             metadata

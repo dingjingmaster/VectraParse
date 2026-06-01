@@ -527,6 +527,21 @@
   - 单测覆盖三列视觉分栏、单列密集内容不切分、以及无 det 框时仍能从视觉候选产生页面区域。
   - 验证已执行 `cargo test -p vectraparse-ocr`、`cargo check -p vectraparse-ffi`、`rustfmt --check` 和 `git diff --check`。
 
+## 7.12 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只增加 OCR trace 结构、JSON 生成和 parser metadata 映射，未触碰 `crates/vectraparse-ocr/src/ort.rs`、ONNX 模型、字典、构建链接或 C ABI。
+  - `VECTRAPARSE_OCR_TRACE_JSON=1` 才生成大 JSON 并输出到 stderr/metadata，默认路径只保留结构化 trace lines，避免默认结果膨胀。
+- 高级产品：
+  - 本轮补齐准确率优化的可观测基础：每条最终 OCR 行可追踪 `source`、`bbox`、`crop_size`、`confidence` 和 `text`，便于定位错误来自 det、page-region、color-region 或 fallback。
+  - 本轮没有新增识别启发式，也没有引入真实截图业务文本作为测试锚点。
+- 高级架构师：
+  - 未新增依赖，JSON 使用内部转义和拼接；parser 侧仅将 trace line 数量和可选 JSON 写入 metadata。
+  - 该 trace 是后续 golden/候选仲裁的输入基础，尚不等同于完整 golden 评估。
+- 高级工程师：
+  - 单测覆盖 trace line 的 bbox/source/crop_size 和 JSON 文本转义；parser metadata 覆盖 trace line count 与 trace JSON。
+  - 验证已执行 `cargo test -p vectraparse-ocr`、`cargo test -p vectraparse-parsers ocr_success_metadata_records_fallback_and_low_confidence`、`cargo check -p vectraparse-ffi`、`rustfmt --check` 和 `git diff --check`。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -557,3 +572,4 @@
 | 2026-06-01 | 增加短噪声过滤和全局长文本精确去重 | 减少复杂截图中的孤立字母、符号和重复长组织文本 |
 | 2026-06-01 | 增加页面区域预切分补充识别 | 基于检测框横向分布对复杂截图做受限区域 det/rec，并清理测试中的真实样本文本以保持泛化约束 |
 | 2026-06-01 | 增加视觉布局页面区域候选 | 通过图像边缘/前景列投影生成多栏页面区域，降低初始 det 框漏检时的召回依赖 |
+| 2026-06-01 | 增加 OCR trace JSON | 输出行级 source/bbox/crop_size/confidence/text 诊断信息，为后续 golden 和候选仲裁提供依据 |
