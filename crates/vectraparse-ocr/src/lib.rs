@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GrayImage, Luma};
+use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 
 mod ort;
 
@@ -10,6 +10,7 @@ const EMBED_REC_ZH_ONNX: &[u8] = include_bytes!("../../../data/chinese/rec.onnx"
 const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx");
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
+const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
@@ -196,6 +197,36 @@ impl OrtOcrEngine {
                             text = alt_text;
                             confidence = alt_confidence;
                             fallback = Some(format!("enhanced:{name}:alt"));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if text.trim().is_empty() {
+                for (name, upscaled) in upscale_variants(img) {
+                    let (rec_input, rec_shape) = preprocess_rec_image(&upscaled, cfg.rec_img_h, cfg.rec_img_w)?;
+                    let (up_output, up_shapes) =
+                        ort::run_session(&self.rec, &[rec_input.clone()], &[rec_shape.clone()])
+                            .map_err(|e| format!("recognize: {e}"))?;
+                    let logits = &up_output[0];
+                    let (up_text, up_confidence) = ctc_greedy_decode(logits, &up_shapes[0], &self.alphabet);
+                    if !up_text.trim().is_empty() {
+                        text = up_text;
+                        confidence = up_confidence;
+                        fallback = Some(format!("upscaled:{name}"));
+                        break;
+                    }
+                    if let Some(rec_alt) = &self.rec_alt {
+                        let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
+                            .map_err(|e| format!("recognize-alt: {e}"))?;
+                        let logits = &alt_output[0];
+                        let (alt_text, alt_confidence) =
+                            ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
+                        if !alt_text.trim().is_empty() {
+                            text = alt_text;
+                            confidence = alt_confidence;
+                            fallback = Some(format!("upscaled:{name}:alt"));
                             break;
                         }
                     }
@@ -530,6 +561,28 @@ fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
     ]
 }
 
+fn upscale_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    let (w, h) = image.dimensions();
+    let base_pixels = (w as u64).saturating_mul(h as u64);
+    let is_small = w < 640 || h < 160 || base_pixels < 160_000;
+    if !is_small || w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (name, scale) in [("1.5x", 1.5f32), ("2x", 2.0f32)] {
+        let target_w = ((w as f32) * scale).round() as u32;
+        let target_h = ((h as f32) * scale).round() as u32;
+        let pixels = (target_w as u64).saturating_mul(target_h as u64);
+        if pixels > MAX_UPSCALE_PIXELS {
+            continue;
+        }
+        let resized = image::imageops::resize(image, target_w, target_h, FilterType::CatmullRom);
+        out.push((name.to_string(), DynamicImage::ImageRgba8(resized)));
+    }
+    out
+}
+
 fn contrast_stretch_luma(gray: &GrayImage) -> GrayImage {
     let mut min_v = u8::MAX;
     let mut max_v = u8::MIN;
@@ -754,5 +807,27 @@ mod tests {
         let inverted = adaptive_binary_luma(&gray, true);
         assert_eq!(normal.get_pixel(1, 0)[0], 255);
         assert_eq!(inverted.get_pixel(1, 0)[0], 0);
+    }
+
+    #[test]
+    fn upscale_variants_generated_for_small_images_only() {
+        let small = DynamicImage::ImageLuma8(GrayImage::from_pixel(120, 40, Luma([128])));
+        let large = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 800, Luma([128])));
+        let small_names = upscale_variants(&small)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(small_names, vec!["1.5x".to_string(), "2x".to_string()]);
+        assert!(upscale_variants(&large).is_empty());
+    }
+
+    #[test]
+    fn upscale_variants_respect_max_pixel_budget() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(5000, 150, Luma([128])));
+        let names = upscale_variants(&img)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["1.5x".to_string()]);
     }
 }
