@@ -11,7 +11,7 @@ const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx"
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
-const MAX_REC_IMG_W: usize = 960;
+const MAX_REC_IMG_W: usize = 320;
 
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
@@ -143,10 +143,8 @@ impl OrtOcrEngine {
         let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
         for b in boxes.iter() {
             let crop = crop_box(img, *b);
-            let candidate = self
-                .recognize_best(&crop, cfg)
-                .map_err(|e| format!("recognize: {e}"))?;
-            if !candidate.text.trim().is_empty() {
+            let candidate = self.best_from_crop(&crop, cfg);
+            if let Some(candidate) = candidate {
                 lines.push((b.1, b.0, candidate.text, candidate.confidence));
             }
         }
@@ -296,6 +294,26 @@ impl OrtOcrEngine {
             None
         };
         Ok(select_recognition(primary, alt))
+    }
+
+    fn best_from_crop(&self, image: &DynamicImage, cfg: &OcrConfig) -> Option<RecCandidate> {
+        let direct = self.recognize_best(image, cfg).ok();
+        if let Some(candidate) = &direct {
+            if !candidate.text.trim().is_empty() && candidate.confidence >= 0.55 {
+                return Some(candidate.clone());
+            }
+        }
+        let mut best = direct.filter(|c| !c.text.trim().is_empty());
+        for (_name, enhanced) in enhancement_variants(image) {
+            if let Ok(candidate) = self.recognize_best(&enhanced, cfg) {
+                if !candidate.text.trim().is_empty()
+                    && best.as_ref().map_or(true, |b| candidate.confidence > b.confidence)
+                {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best
     }
 
     fn recognize_candidate(
@@ -636,35 +654,26 @@ fn preprocess_rec_image(
     target_h: usize,
     target_w: usize,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let gray = to_luma_on_white(image);
-    let (src_w, src_h) = gray.dimensions();
+    let rgb = to_rgb_on_white(image);
+    let (src_w, src_h) = rgb.dimensions();
     let ratio = src_w as f32 / src_h as f32;
     let mut resized_w = (ratio * target_h as f32).ceil() as usize;
     resized_w = resized_w.clamp(1, target_w);
     let resized = image::imageops::resize(
-        &gray,
+        &rgb,
         resized_w as u32,
         target_h as u32,
         FilterType::Triangle,
     );
 
-    let mut sum: u64 = 0;
-    for pixel in resized.pixels() {
-        sum += pixel[0] as u64;
-    }
-    let avg = sum / resized.pixels().len() as u64;
-    let invert = avg < 128;
-
     let mut data = vec![0f32; 1 * 3 * target_h * target_w];
     for y in 0..target_h {
         for x in 0..resized_w {
             let px = resized.get_pixel(x as u32, y as u32);
-            let raw = px[0] as f32 / 255.0;
-            let v = if invert { 1.0 - raw } else { raw };
-            let norm = (v - 0.5) / 0.5;
             for c in 0..3 {
+                let v = (px[2 - c] as f32 / 255.0 - 0.5) / 0.5;
                 let idx = c * target_h * target_w + y * target_w + x;
-                data[idx] = norm;
+                data[idx] = v;
             }
         }
     }
@@ -709,16 +718,48 @@ fn has_non_opaque_alpha(image: &DynamicImage) -> bool {
     rgba.pixels().any(|p| p[3] < 255)
 }
 
+fn to_hsl_lightness(image: &DynamicImage) -> GrayImage {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgb.get_pixel(x, y);
+            let max_c = p[0].max(p[1]).max(p[2]);
+            let min_c = p[0].min(p[1]).min(p[2]);
+            out.put_pixel(x, y, Luma([((max_c as u16 + min_c as u16) / 2) as u8]));
+        }
+    }
+    out
+}
+
+fn to_max_channel_gray(image: &DynamicImage) -> GrayImage {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgb.get_pixel(x, y);
+            out.put_pixel(x, y, Luma([p[0].max(p[1]).max(p[2])]));
+        }
+    }
+    out
+}
+
 fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
-    let gray = image.to_luma8();
-    let stretched = contrast_stretch_luma(&gray);
-    let binary = adaptive_binary_luma(&stretched, false);
-    let binary_invert = adaptive_binary_luma(&stretched, true);
-    vec![
-        ("contrast".to_string(), DynamicImage::ImageLuma8(stretched)),
-        ("binary".to_string(), DynamicImage::ImageLuma8(binary)),
-        ("binary-invert".to_string(), DynamicImage::ImageLuma8(binary_invert)),
-    ]
+    let gray = to_luma_on_white(image);
+    let hsl = to_hsl_lightness(image);
+    let max_c = to_max_channel_gray(image);
+    let mut out = Vec::new();
+    for (prefix, base) in [("", &gray), ("hsl-", &hsl), ("max-", &max_c)] {
+        let stretched = contrast_stretch_luma(base);
+        let binary = adaptive_binary_luma(&stretched, false);
+        let binary_invert = adaptive_binary_luma(&stretched, true);
+        out.push((format!("{prefix}contrast"), DynamicImage::ImageLuma8(stretched)));
+        out.push((format!("{prefix}binary"), DynamicImage::ImageLuma8(binary)));
+        out.push((format!("{prefix}binary-invert"), DynamicImage::ImageLuma8(binary_invert)));
+    }
+    out
 }
 
 fn upscale_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
@@ -926,6 +967,9 @@ fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCa
     if alt_ascii >= 0.75 && primary_ascii <= 0.5 && alt.confidence + 0.02 >= primary.confidence {
         return alt;
     }
+    if alt_ascii >= 0.75 && primary_ascii >= 0.75 && alt.confidence > primary.confidence {
+        return alt;
+    }
     if alt.confidence > primary.confidence + 0.08 {
         return alt;
     }
@@ -992,7 +1036,14 @@ mod tests {
         gray.put_pixel(3, 1, Luma([164]));
         let variants = enhancement_variants(&DynamicImage::ImageLuma8(gray));
         let names = variants.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
-        assert_eq!(names, vec!["contrast", "binary", "binary-invert"]);
+        assert_eq!(
+            names,
+            vec![
+                "contrast", "binary", "binary-invert",
+                "hsl-contrast", "hsl-binary", "hsl-binary-invert",
+                "max-contrast", "max-binary", "max-binary-invert",
+            ]
+        );
     }
 
     #[test]
@@ -1080,8 +1131,10 @@ mod tests {
 
     #[test]
     fn dynamic_rec_target_width_grows_for_long_lines() {
-        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
-        assert_eq!(dynamic_rec_target_width(&img, 48, 320), 960);
+        let long = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
+        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 320);
+        let narrow = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 48, Luma([128])));
+        assert_eq!(dynamic_rec_target_width(&narrow, 48, 320), 320);
     }
 
     #[test]
