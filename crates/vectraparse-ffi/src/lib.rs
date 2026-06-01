@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(out.content, None);
         assert_eq!(out.parser_chain, vec!["ImageMetadataParser".to_string()]);
         assert!(out.warnings.iter().any(|w| {
-            w == "image-ocr-failed" || w == "image-ocr-model-unavailable"
+            w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable"
         }));
         assert_eq!(
             out.metadata
@@ -479,6 +479,19 @@ mod tests {
                 .map(String::as_str),
             Some("jpeg")
         );
+        if out
+            .warnings
+            .iter()
+            .any(|w| w == "image-ocr-decode-failed")
+        {
+            assert_eq!(
+                out.metadata
+                    .values("image.ocr.error_stage")
+                    .and_then(|vals| vals.first())
+                    .map(String::as_str),
+                Some("decode")
+            );
+        }
     }
 
     #[test]

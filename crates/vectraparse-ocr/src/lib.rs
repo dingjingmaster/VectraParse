@@ -47,6 +47,15 @@ pub struct OcrResult {
     pub text: String,
     pub confidence: f32,
     pub warning: Option<String>,
+    pub diagnostics: OcrDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrDiagnostics {
+    pub det_box_count: usize,
+    pub line_count: usize,
+    pub fallback: Option<String>,
+    pub empty_result: bool,
 }
 
 pub struct OrtOcrEngine {
@@ -109,13 +118,17 @@ impl OrtOcrEngine {
     }
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
-        let boxes = self.detect_text_boxes(img, cfg)?;
+        let boxes = self
+            .detect_text_boxes(img, cfg)
+            .map_err(|e| format!("detect: {e}"))?;
+        let det_box_count = boxes.len();
 
         let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
         for b in boxes.iter() {
             let crop = crop_box(img, *b);
             let (rec_input, rec_shape) = preprocess_rec_image(&crop, cfg.rec_img_h, cfg.rec_img_w)?;
-            let (output, out_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])?;
+            let (output, out_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])
+                .map_err(|e| format!("recognize: {e}"))?;
             let logits = &output[0];
             let (text, confidence) = ctc_greedy_decode(logits, &out_shapes[0], &self.alphabet);
             if !text.trim().is_empty() {
@@ -134,24 +147,29 @@ impl OrtOcrEngine {
         } else {
             lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
         };
+        let mut fallback = None;
 
         if text.trim().is_empty() {
             let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-            let (rec_output, rec_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])?;
+            let (rec_output, rec_shapes) = ort::run_session(&self.rec, &[rec_input], &[rec_shape])
+                .map_err(|e| format!("recognize: {e}"))?;
             let logits = &rec_output[0];
             let (fallback_text, fallback_confidence) = ctc_greedy_decode(logits, &rec_shapes[0], &self.alphabet);
             text = fallback_text;
             confidence = fallback_confidence;
+            fallback = Some("whole-image".to_string());
 
             if text.trim().is_empty()
                 && let Some(rec_alt) = &self.rec_alt
             {
                 let (rec_input, rec_shape) = preprocess_rec_image(img, cfg.rec_img_h, cfg.rec_img_w)?;
-                let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])?;
+                let (alt_output, alt_shapes) = ort::run_session(rec_alt, &[rec_input], &[rec_shape])
+                    .map_err(|e| format!("recognize-alt: {e}"))?;
                 let logits = &alt_output[0];
                 let (alt_text, alt_confidence) = ctc_greedy_decode(logits, &alt_shapes[0], &self.alphabet_alt);
                 text = alt_text;
                 confidence = alt_confidence;
+                fallback = Some("whole-image-alt".to_string());
             }
 
             if text.trim().is_empty() {
@@ -171,6 +189,7 @@ impl OrtOcrEngine {
                 if !line_texts.is_empty() {
                     text = line_texts.join("\n");
                     confidence = confs.iter().sum::<f32>() / confs.len() as f32;
+                    fallback = Some("line-crops".to_string());
                 }
             }
         }
@@ -180,11 +199,18 @@ impl OrtOcrEngine {
         } else {
             None
         };
+        let empty_result = text.trim().is_empty();
 
         Ok(OcrResult {
             text,
             confidence,
             warning,
+            diagnostics: OcrDiagnostics {
+                det_box_count,
+                line_count: lines.len(),
+                fallback,
+                empty_result,
+            },
         })
     }
 }

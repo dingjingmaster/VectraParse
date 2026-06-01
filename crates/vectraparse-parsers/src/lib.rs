@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use vectraparse_core::metadata::Metadata;
 use vectraparse_mime::detect_encoding;
 use vectraparse_mso_binary::{build_text_blocks, extract_legacy_mso_text};
-use vectraparse_ocr::{OcrConfig, OrtOcrEngine};
+use vectraparse_ocr::{OcrConfig, OcrResult, OrtOcrEngine};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1210,14 +1210,11 @@ impl Parser for ImageMetadataParser {
             warnings.push("image-corrupted-or-unknown".to_string());
         }
         if let Some(engine) = ocr_engine() {
+            metadata.insert("image.ocr.enabled", "true");
             let cfg = OcrConfig::default();
             match engine.infer(input, &cfg) {
                 Ok(ocr) => {
-                    metadata.insert("image.ocr.enabled", "true");
-                    metadata.insert("image.ocr.confidence", format!("{:.4}", ocr.confidence));
-                    if let Some(w) = ocr.warning {
-                        warnings.push(w);
-                    }
+                    apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
                     let content = if ocr.text.trim().is_empty() {
                         None
                     } else {
@@ -1230,8 +1227,15 @@ impl Parser for ImageMetadataParser {
                         parser_chain: Vec::new(),
                     });
                 }
-                Err(_) => {
-                    warnings.push("image-ocr-failed".to_string());
+                Err(e) => {
+                    let stage = classify_ocr_error_stage(&e);
+                    metadata.insert("image.ocr.error_stage", stage);
+                    if stage == "decode" {
+                        metadata.insert("image.ocr.decode_failed", "true");
+                        warnings.push("image-ocr-decode-failed".to_string());
+                    } else {
+                        warnings.push("image-ocr-failed".to_string());
+                    }
                 }
             }
         } else {
@@ -1258,6 +1262,36 @@ fn ocr_engine() -> Option<&'static OrtOcrEngine> {
             }
         })
         .as_ref()
+}
+
+fn classify_ocr_error_stage(err: &str) -> &'static str {
+    if err.starts_with("image decode:") {
+        "decode"
+    } else if err.starts_with("detect:") {
+        "detect"
+    } else if err.starts_with("recognize-alt:") || err.starts_with("recognize:") {
+        "recognize"
+    } else {
+        "runtime"
+    }
+}
+
+fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String>, ocr: &OcrResult) {
+    metadata.insert("image.ocr.confidence", format!("{:.4}", ocr.confidence));
+    metadata.insert("image.ocr.box_count", ocr.diagnostics.det_box_count.to_string());
+    metadata.insert("image.ocr.line_count", ocr.diagnostics.line_count.to_string());
+    metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
+    if let Some(fallback) = &ocr.diagnostics.fallback {
+        metadata.insert("image.ocr.fallback", fallback.clone());
+    }
+    if let Some(w) = &ocr.warning {
+        warnings.push(w.clone());
+    }
+    if ocr.diagnostics.empty_result {
+        warnings.push("image-ocr-empty-result".to_string());
+    } else if ocr.confidence > 0.0 && ocr.confidence < 0.35 {
+        warnings.push("image-ocr-low-confidence".to_string());
+    }
 }
 
 pub struct AudioMetadataParser;
@@ -2470,7 +2504,8 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositeParser, DerivedTextParser, FeedParser, HtmlParser, MetadataOnlyParser, Parser,
+        apply_ocr_success_metadata, CompositeParser, DerivedTextParser, FeedParser, HtmlParser,
+        MetadataOnlyParser, Parser,
         EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
         LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
         AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
@@ -2481,6 +2516,8 @@ mod tests {
         OcrExternalParser, XmpNormalizeParser, JsonSchemaCompatParser,
         SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
     };
+    use vectraparse_core::metadata::Metadata;
+    use vectraparse_ocr::{OcrDiagnostics, OcrResult};
 
     #[test]
     fn mime_to_parser_mapping_and_fallback() {
@@ -3367,9 +3404,10 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "image-corrupted-or-unknown"));
-        assert!(out.warnings.iter().any(|w| {
-            w == "image-ocr-failed" || w == "image-ocr-model-unavailable"
-        }));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable"));
         assert_eq!(
             out.metadata
                 .values("image.mime")
@@ -3377,6 +3415,108 @@ mod tests {
                 .map(String::as_str),
             Some("image/png")
         );
+        if out
+            .warnings
+            .iter()
+            .any(|w| w == "image-ocr-decode-failed")
+        {
+            assert_eq!(
+                out.metadata
+                    .values("image.ocr.enabled")
+                    .and_then(|v| v.first())
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                out.metadata
+                    .values("image.ocr.error_stage")
+                    .and_then(|v| v.first())
+                    .map(String::as_str),
+                Some("decode")
+            );
+            assert_eq!(
+                out.metadata
+                    .values("image.ocr.decode_failed")
+                    .and_then(|v| v.first())
+                    .map(String::as_str),
+                Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn ocr_success_metadata_records_fallback_and_low_confidence() {
+        let mut metadata = Metadata::default();
+        let mut warnings = Vec::new();
+        let ocr = OcrResult {
+            text: "abc".to_string(),
+            confidence: 0.2,
+            warning: Some("ocr-dictionary-missing".to_string()),
+            diagnostics: OcrDiagnostics {
+                det_box_count: 3,
+                line_count: 1,
+                fallback: Some("whole-image".to_string()),
+                empty_result: false,
+            },
+        };
+        apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
+        assert_eq!(
+            metadata
+                .values("image.ocr.box_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.line_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.fallback")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("whole-image")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.empty_result")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("false")
+        );
+        assert!(warnings.iter().any(|w| w == "ocr-dictionary-missing"));
+        assert!(warnings.iter().any(|w| w == "image-ocr-low-confidence"));
+    }
+
+    #[test]
+    fn ocr_success_metadata_records_empty_result_warning() {
+        let mut metadata = Metadata::default();
+        let mut warnings = Vec::new();
+        let ocr = OcrResult {
+            text: String::new(),
+            confidence: 0.0,
+            warning: None,
+            diagnostics: OcrDiagnostics {
+                det_box_count: 0,
+                line_count: 0,
+                fallback: Some("line-crops".to_string()),
+                empty_result: true,
+            },
+        };
+        apply_ocr_success_metadata(&mut metadata, &mut warnings, &ocr);
+        assert_eq!(
+            metadata
+                .values("image.ocr.empty_result")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(warnings.iter().any(|w| w == "image-ocr-empty-result"));
+        assert!(!warnings.iter().any(|w| w == "image-ocr-low-confidence"));
     }
 
     #[test]
