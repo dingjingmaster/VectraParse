@@ -208,6 +208,23 @@ impl OrtOcrEngine {
             }
 
             if text.trim().is_empty() {
+                for (name, rotated) in rotation_variants(img) {
+                    let candidate = self
+                        .recognize_best(&rotated, cfg)
+                        .map_err(|e| format!("recognize: {e}"))?;
+                    if !candidate.text.trim().is_empty() {
+                        text = candidate.text;
+                        confidence = candidate.confidence;
+                        fallback = Some(match candidate.variant {
+                            RecVariant::Primary => format!("rotated:{name}"),
+                            RecVariant::Alt => format!("rotated:{name}:alt"),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            if text.trim().is_empty() {
                 let mut line_texts = Vec::new();
                 let mut confs = Vec::new();
                 for line in fallback_line_crops(img) {
@@ -721,6 +738,14 @@ fn contrast_stretch_luma(gray: &GrayImage) -> GrayImage {
     out
 }
 
+fn rotation_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    vec![
+        ("90".to_string(), image.rotate90()),
+        ("180".to_string(), image.rotate180()),
+        ("270".to_string(), image.rotate270()),
+    ]
+}
+
 fn adaptive_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
     let mut sum = 0u64;
     for pixel in gray.pixels() {
@@ -1066,5 +1091,16 @@ mod tests {
         let chosen = select_recognition(primary.clone(), Some(alt));
         assert_eq!(chosen.variant, primary.variant);
         assert_eq!(chosen.text, primary.text);
+    }
+
+    #[test]
+    fn rotation_variants_include_expected_angles() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(12, 8, Luma([128])));
+        let variants = rotation_variants(&img);
+        let names = variants.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["90", "180", "270"]);
+        assert_eq!(variants[0].1.dimensions(), (8, 12));
+        assert_eq!(variants[1].1.dimensions(), (12, 8));
+        assert_eq!(variants[2].1.dimensions(), (8, 12));
     }
 }

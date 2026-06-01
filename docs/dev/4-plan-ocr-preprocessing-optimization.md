@@ -89,7 +89,7 @@
 | 5 | 增加多尺度与小字策略：对低分辨率或 det 空结果执行 1.5x/2x 上采样，限制最大像素和重试次数 | 定向 OCR 样本测试；记录耗时和内存上限，避免大图性能失控 | 完成 |
 | 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/扩边，减少碎框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 完成 |
 | 7 | 处理长行与英文行：长 crop 分段或动态 rec 宽度；每个 crop 可按置信度/字符集选择中文或英文模型 | 长英文行、混合中英文截图 fixture；确认没有大量乱码输出 | 完成 |
-| 8 | 增加旋转/倾斜保守兜底：先支持 90/180/270 度方向重试；小角度 deskew 视样本收益决定是否落地 | 旋转 fixture；验证正常方向图片不会额外引入重复文本 | 待开始 |
+| 8 | 增加旋转/倾斜保守兜底：先支持 90/180/270 度方向重试；小角度 deskew 视样本收益决定是否落地 | 旋转 fixture；验证正常方向图片不会额外引入重复文本 | 完成 |
 | 9 | 增强 OLE 嵌入图片 OCR 候选处理：格式过滤、去重 key、预算命中诊断，确保嵌入图失败不影响主文本 | `cargo test -p vectraparse-mso-binary`; OLE 样本保持可提取 | 待开始 |
 | 10 | 收口 golden/文档：补 OCR golden 样本、更新验证说明，记录未覆盖场景和后续边界 | `cargo test --workspace` 或定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 待开始 |
 
@@ -177,6 +177,14 @@
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr select_recognition_prefers_primary_when_alt_is_not_clear_win -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr extract_boxes_from_map_merges_nearby_fragments_after_dilation -- --nocapture`
+- 已完成旋转保守兜底：
+  - `vectraparse-ocr` 在整图、增强图和上采样 fallback 仍为空后，会继续尝试 `90/180/270` 三个方向的整图识别。
+  - 旋转路径同样会走逐 crop 的中英文结果选择逻辑；命中时 diagnostics.fallback 记为 `rotated:<angle>` 或 `rotated:<angle>:alt`。
+  - 当前未实现小角度 deskew，仍保持在计划边界外，后续是否需要取决于真实失败样本收益。
+- 本轮验证命令：
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr rotation_variants_include_expected_angles -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
+  - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr select_recognition_can_choose_alt_for_ascii_line -- --nocapture`
 
 ## 7. Plan 阶段审视
 
@@ -206,3 +214,4 @@
 | 2026-06-01 | 完成执行计划步骤 5：增加多尺度与小字策略 | 为小图和小字号场景增加受限上采样整图识别兜底 |
 | 2026-06-01 | 完成执行计划步骤 6：改进文本框后处理 | 通过膨胀合并碎框、component score 过滤和旧逻辑回退提升 det 框稳定性 |
 | 2026-06-01 | 完成执行计划步骤 7：处理长行与英文行 | 通过动态 rec 宽度和逐 crop 中英文结果选择提升长英文行识别稳定性 |
+| 2026-06-01 | 完成执行计划步骤 8：增加旋转保守兜底 | 通过 90/180/270 度整图重试覆盖横竖方向错误场景 |
