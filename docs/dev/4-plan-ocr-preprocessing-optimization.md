@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.2
+> - 文档版本：v1.0.3
 > - 最后更新：2026-06-01
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边和透明图黑底增强。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -44,8 +44,8 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、小图 1.5x/2x 上采样整图 fallback、90/180/270 度整图 fallback、行切分 fallback、中英文 rec 结果选择、行级质量过滤和诊断。
-  - OCR 核心未实现：长 crop 分段、小角度 deskew、旋转/增强/上采样后的重新 det、锐化/去噪、真实 OCR 文本 golden。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心未实现：长 crop 分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip 或旋转框裁剪。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
   - P0 入口与诊断先行；否则无法判断后续预处理是否真正生效。
@@ -71,10 +71,10 @@
 - 证据等级：E1。已有现象描述和代码根因线索，但尚缺稳定失败样本与自动化复现。
 - 当前代码事实与残余短板：
   - 非 PNG 图片入口已补齐到 JPEG/TIFF/WebP/BMP/GIF magic 和常见扩展名回退。
-  - 预处理 fallback 已不再只是灰度缩放和平均亮度反色；当前包含 luma/HSL/max-channel 三类灰度源、对比度拉伸、Otsu 全局二值化、反色二值化和局部均值二值化，但未实现锐化或去噪。
-  - det 后处理已从原始连通域扩展为 1 像素 dilation、component score 过滤和轻量扩边；仍缺少 unclip、旋转框、NMS 和更接近 PaddleOCR 的多边形后处理。
+  - 预处理 fallback 已不再只是灰度缩放和平均亮度反色；当前包含 luma/HSL/max-channel 三类灰度源、对比度拉伸、Otsu 全局二值化、反色二值化、局部均值二值化，并在透明图上额外生成黑底增强变体；仍未实现锐化或去噪。
+  - det 后处理已从原始连通域扩展为 1 像素 dilation、component score 过滤、轻量 unclip 扩边和 NMS；仍缺少旋转框和更接近 PaddleOCR 的多边形后处理。
   - 中英文 rec 已在逐 crop 和各类 fallback 中统一比较；当前已将动态 rec 宽度上限提升到 `MAX_REC_IMG_W=960`，并保留固定宽度失败回退，避免模型不接受宽输入时整条识别失败。
-  - fallback 只在已识别文本为空时触发；对“部分识别但漏主体内容”的场景没有低质量成功判定和补跑策略。
+  - fallback 已从“仅空结果触发”扩展为“空结果、低置信、det 框多但识别行少、有效字符过少或可读比例偏低”触发；补跑候选会按行去重后合并，或在明显更长/更高置信时替换原结果。
   - 当前新增行级质量过滤会拒绝低置信、重复字符占比过高和标点占比过高的候选，可能降低垃圾输出，也可能丢弃少量真实低置信文本，需要真实样本评估。
 - 最小修复点：
   - 先补入口识别和诊断，再引入可回退的预处理增强，不一次性重写 OCR 管线。
@@ -89,11 +89,11 @@
 | 1 | 建立 OCR 失败样本分桶与最小复现记录，输出当前 MIME、parser_chain、warnings、metadata、content | 对失败图片运行现有 FFI/示例解析；保存人工记录或测试 fixture | 完成 |
 | 2 | 补齐图片入口识别：JPEG/TIFF/WebP/BMP/GIF magic，资源名扩展映射，并对齐 parser 支持格式与 `image` 解码能力 | `cargo test -p vectraparse-mime`; parser 定向测试验证各格式进入图片 parser | 完成 |
 | 3 | 增强 OCR 诊断：记录 OCR 是否启用、解码失败、det 框数、rec 空结果、fallback 命中、平均置信度和低置信度告警 | `cargo test -p vectraparse-parsers`; 用失败样本确认 warnings/metadata 能分桶 | 完成 |
-| 4 | 增加轻量图像增强 fallback：luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、反色二值化和局部均值二值化 | `cargo test -p vectraparse-ocr`; 覆盖增强变体、对比度拉伸、Otsu 和局部二值化辅助函数 | 完成 |
-| 5 | 增加多尺度与小字策略：在整图和增强整图识别为空后，对小图执行 1.5x/2x 上采样整图识别，限制最大像素 | 定向 OCR 辅助函数测试；当前未覆盖真实小字 OCR 文本 fixture | 完成 |
-| 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/扩边，减少碎框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 完成 |
+| 4 | 增加轻量图像增强 fallback：luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、反色二值化、局部均值二值化和透明图黑底增强变体 | `cargo test -p vectraparse-ocr`; 覆盖增强变体、对比度拉伸、Otsu、局部二值化和 alpha 黑底辅助函数 | 完成 |
+| 5 | 增加多尺度与小字策略：对小图执行 1.5x/2x 上采样，并在 fallback 中先重新 det+逐框 rec，再保留整图识别兜底，限制最大像素 | 定向 OCR 辅助函数测试；当前未覆盖真实小字 OCR 文本 fixture | 完成 |
+| 6 | 改进文本框后处理：det map 做 dilation/box score 过滤/轻量 unclip 扩边/NMS，减少碎框、重复框和裁剪不完整；保留旧逻辑 fallback | OCR det 单元测试或 fixture 对比；验证多行截图顺序稳定 | 完成 |
 | 7 | 处理长行与英文行：每个 crop 可按置信度/字符集选择中文或英文模型；动态 rec 宽度上限提升到 `960` 并保留固定宽度失败回退；长 crop 分段未实现 | 当前测试覆盖中英文结果选择和 960 宽度行为；长英文真实 OCR fixture 未落地 | 部分完成 |
-| 8 | 增加旋转保守兜底：支持 90/180/270 度整图识别重试；未对旋转图重新 det，未实现小角度 deskew | 当前测试覆盖旋转变体生成；未覆盖旋转真实 OCR 文本 fixture | 部分完成 |
+| 8 | 增加旋转保守兜底：支持 90/180/270 度旋转图重新 det+逐框 rec，并保留整图识别重试；未实现小角度 deskew | 当前测试覆盖旋转变体生成；未覆盖旋转真实 OCR 文本 fixture | 完成 |
 | 9 | 增强 OLE 嵌入图片 OCR 候选处理：仅 `.doc` 路径做图片候选汇总、格式过滤、去重 key 和预算命中诊断，嵌入图失败不影响主文本 | `cargo test -p vectraparse-mso-binary`; 当前 WebP 支持直接流，payload 切片未实现 | 完成 |
 | 10 | 收口 golden/文档：当前仅将 `image/png` stub 纳入 parser 提取矩阵；真实 OCR 文本样本尚未进入 golden | 定向替代命令；更新 `docs/dev/4-plan...` 后续状态/总结 | 部分完成 |
 
@@ -115,9 +115,9 @@
   - 没有真实失败样本前，只能用构造样本和辅助函数测试覆盖典型路径，不能证明生产 OCR 文本质量已系统提升。
   - 当前没有真实 OCR 文本 golden，无法自动发现长行、小字、旋转、低对比场景的识别质量回退。
 - 残余风险：
-  - 预处理增强可能提升召回但带来误识别和重复文本；当前已增加低置信、重复字符和高标点占比过滤，但仍缺少真实样本阈值校准。
+  - 预处理增强和变体重跑 det 可能提升召回但带来误识别、重复文本和耗时增加；当前已增加低置信、重复字符、高标点占比过滤、NMS 和行级去重合并，但仍缺少真实样本阈值校准。
   - 行级质量过滤可能减少垃圾输出，也可能丢弃少量真实低置信文本；需要用户测试样本评估阈值是否过严。
-  - fallback 仅在输出为空时触发，对部分漏识别场景仍可能直接返回不完整结果。
+  - 部分成功 fallback 的替换/合并策略仍是启发式：可能保留少量原始漏识别片段，也可能在候选更长时替换掉原有短文本。
   - 不更换模型的前提下，极端模糊、严重透视、手写字或超低分辨率图片仍可能无法可靠提取。
 
 当前验证记录：
@@ -193,15 +193,25 @@
 - 本轮验证命令：
   - `cargo test -p vectraparse-ocr`（未设置 `ORT_INSTALL_DIR` 时失败：构建脚本找不到 ONNX Runtime）
   - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
-  - `rustfmt --edition 2024 --check crates/vectraparse-ocr/src/lib.rs`
-- 已部分完成旋转保守兜底：
-  - `vectraparse-ocr` 在整图、增强图和上采样 fallback 仍为空后，会继续尝试 `90/180/270` 三个方向的整图识别。
-  - 旋转路径只做整图识别，不会对旋转后的图片重新跑 det 和逐框 rec；命中时 diagnostics.fallback 记为 `rotated:<angle>` 或 `rotated:<angle>:alt`。
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/vectraparse-ocr/src/lib.rs`
+- 已完成旋转保守兜底：
+  - `vectraparse-ocr` 在原图结果为空或质量偏低时，会继续尝试 `90/180/270` 三个方向的旋转图。
+  - 旋转路径现在会先对旋转图重新跑 det+逐框 rec，命中时 diagnostics.fallback 记为 `det-rotated:<angle>`；仍保留整图识别兜底，命中时记为 `rotated:<angle>` 或 `rotated:<angle>:alt`。
   - 当前未实现小角度 deskew，仍保持在计划边界外，后续是否需要取决于真实失败样本收益。
 - 本轮验证命令：
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr rotation_variants_include_expected_angles -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr default_result_is_empty -- --nocapture`
   - `LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 cargo test -p vectraparse-ocr select_recognition_can_choose_alt_for_ascii_line -- --nocapture`
+- 已完成本轮 OCR 质量补强（优化 2/3/5/6）：
+  - 增强、上采样和旋转 fallback 现在会先对变体图重新 det+逐框 rec，再保留整图 rec 兜底；变体逐框识别不再对每个 crop 二次展开增强，控制补跑成本。
+  - 原图识别结果为空、低置信、det 框多但识别行少、有效字符过少或可读比例偏低时，会触发补跑；补跑结果按行去重合并，明显更长或更高置信时替换原结果。
+  - det 后处理增加轻量 unclip 扩边和 NMS，减少裁剪过紧、重复框和重叠框；仍保持轴对齐框。
+  - 带透明通道的图片会额外生成黑底 luma/HSL/max-channel 增强变体，用于白字透明底或深色底贴图场景。
+- 本轮验证命令：
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-ocr`
+  - `ORT_INSTALL_DIR=/tmp/onnxruntime-linux-x64-1.26.0 LD_LIBRARY_PATH=/tmp/onnxruntime-linux-x64-1.26.0/lib cargo test -p vectraparse-parsers image_metadata_parser_records_decode_failure_bucket`
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/vectraparse-ocr/src/lib.rs`
+  - `git diff --check -- crates/vectraparse-ocr/src/lib.rs docs/dev/4-plan-ocr-preprocessing-optimization.md`
 - 已完成 OLE 嵌入图片 OCR 候选处理增强：
   - `vectraparse-mso-binary` 现会在 `.doc` 路径先汇总唯一图片候选，再做 OCR；候选过滤统一使用 OCR 真正支持的图片头判断，并补上 `WebP` 直接流支持。
   - 去重 key 从“长度 + 前 4 字节”提升为“长度 + 前后 64 字节哈希”，降低同源嵌入图被重复 OCR 的概率。
@@ -257,6 +267,22 @@
   - 变更保持在现有 pipeline 内：rec 宽度、二值化变体、候选质量过滤均为局部函数改动。
   - 单测覆盖新增 Otsu、局部二值化、960 动态宽度和候选过滤；仍缺真实 OCR 文本 fixture。
 
+## 7.2 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只修改 `crates/vectraparse-ocr/src/lib.rs` 和当前任务文档，未触碰 `crates/vectraparse-ocr/src/ort.rs`、ONNX 模型、字典、构建链接或 C ABI。
+  - 变体 det/rec 失败只影响 fallback 候选，不覆盖原始识别结果；原图为空且基础 rec 失败时仍返回错误，保持原有失败分桶。
+  - 验证证据：`cargo test -p vectraparse-ocr`、parser decode 分桶回归、`rustfmt --config skip_children=true --check` 和 `git diff --check` 通过。
+- 高级产品：
+  - 本轮针对“部分识别但漏主体内容”增加补跑触发条件，并将增强/上采样/旋转变体从单纯整图 rec 升级为先 det+逐框 rec。
+  - 透明图黑底增强覆盖白字透明底类样本；实际收益仍需用户真实图片验证。
+- 高级架构师：
+  - 未新增依赖，继续复用现有 `image` crate；det 后处理仍保持轻量轴对齐框，不引入 polygon/旋转框裁剪复杂度。
+  - 性能风险来自低质量路径下变体 det 增多；当前通过仅在 quality fallback 中触发、变体 crop 不再二次增强、上采样像素预算来限制成本。
+- 高级工程师：
+  - 单测覆盖 alpha 黑底增强、NMS、unclip 扩边、部分成功 fallback 判定和行级去重合并。
+  - 仍缺真实 OCR 文本 fixture，无法自动判断这些启发式对具体业务样本的净收益。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -268,10 +294,11 @@
 | 2026-06-01 | 完成执行计划步骤 4：增加轻量图像增强 fallback | 为低对比和白字黑底场景增加整图增强识别兜底 |
 | 2026-06-01 | 完成执行计划步骤 5：增加多尺度与小字策略 | 为小图和小字号场景增加受限上采样整图识别兜底 |
 | 2026-06-01 | 完成执行计划步骤 6：改进文本框后处理 | 通过膨胀合并碎框、component score 过滤和旧逻辑回退提升 det 框稳定性 |
-| 2026-06-01 | 部分完成执行计划步骤 7：处理长行与英文行 | 已完成逐 crop 中英文结果选择；长行动态宽度实际仍受 `320` 上限限制 |
-| 2026-06-01 | 部分完成执行计划步骤 8：增加旋转保守兜底 | 已完成 90/180/270 度整图识别重试；未对旋转图重新 det，未实现小角度 deskew |
+| 2026-06-01 | 部分完成执行计划步骤 7：处理长行与英文行 | 已完成逐 crop 中英文结果选择和 `960` 动态宽度；长 crop 分段仍未实现 |
+| 2026-06-01 | 完成执行计划步骤 8：增加旋转保守兜底 | 已完成 90/180/270 度旋转图重新 det+逐框 rec 和整图识别兜底；小角度 deskew 仍未实现 |
 | 2026-06-01 | 完成执行计划步骤 9：增强 OLE 嵌入图片 OCR 候选处理 | 通过 `.doc` 候选去重、预算告警和失败诊断降低嵌入图 OCR 对主提取链路的干扰 |
 | 2026-06-01 | 部分完成执行计划步骤 10：收口 golden/文档 | 已覆盖 `image/png` parser 元数据；真实 OCR 文本 golden 尚未落地 |
 | 2026-06-01 | 修复 PNG OCR 回归：统一 rec 白底预处理并移除 det 无框伪整图框 | 针对普通 RGBA PNG 无法识别的回归，恢复 det/rec 图像前处理一致性并让整图 fallback 只在真实 fallback 阶段触发 |
 | 2026-06-01 | 按当前代码实现校准 OCR 计划文档 | 移除与代码不一致的 960 rec 宽度、真实 OCR golden、旋转逐框识别等完成表述 |
 | 2026-06-01 | 完成本轮 OCR 识别质量优化 | 放开长行 rec 宽度到 960，增加 Otsu/局部二值化增强变体，并增加行级候选质量过滤 |
+| 2026-06-01 | 完成 OCR 质量补强优化 2/3/5/6 | 对增强/上采样/旋转变体重跑 det，增加部分成功补跑合并、det NMS/unclip 扩边和透明图黑底增强 |
