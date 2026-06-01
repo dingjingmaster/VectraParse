@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.10
+> - 文档版本：v1.0.11
 > - 最后更新：2026-06-01
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop、近似重复去重和短噪声过滤。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop、近似重复去重、短噪声过滤、page-region 局部修复预算和高分辨率 tile det 补充。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -44,7 +44,7 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、原始 det 小框作为合并框的替代切分候选、rec 前景 tight crop、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、聊天 UI 中间时间标记断行后处理、区域级布局聚类、bbox+文本相似度的近似重复行去重、短 ASCII/符号噪声过滤、颜色背景区域候选 fallback、受限主动颜色区域补充识别、4-bit 颜色量化的浅色底黑字候选、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、原始 det 小框作为合并框的替代切分候选、rec 前景 tight crop、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、聊天 UI 中间时间标记断行后处理、区域级布局聚类、bbox+文本相似度的近似重复行去重、短 ASCII/符号噪声过滤、颜色背景区域候选 fallback、受限主动颜色区域补充识别、4-bit 颜色量化的浅色底黑字候选、page-region 本地拆行/修复预算、高分辨率 tile det 补充、结构化 `regions/lines` 输出、trace 统计、整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、行级质量过滤、部分成功质量判定和诊断。
   - OCR 核心未实现：长文本横向分段、小角度 deskew、锐化/去噪、真实 OCR 文本 golden；det 后处理仍是轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
@@ -82,6 +82,7 @@
   - 颜色背景区域识别会在正常 det 后主动用小预算补充一次，并在低质量路径中继续作为 fallback；当前颜色量化提升到 4-bit，可区分浅灰/浅蓝底和页面背景，候选区域内会根据区域主色做前景色差二值化，再执行 rec；主动补充只合并与已有 det 行不明显重叠的候选，避免重复噪声，并在 metadata 中记录 `image.ocr.color_region_count`。
   - `OcrResult` 已输出结构化 `regions: Vec<OcrTextRegion>`，每个 region 包含 bbox、文本、置信度、来源和行级 `OcrTextLine`；trace 当前记录最终选中来源、det pass 次数和 fallback 尝试次数，并通过 metadata 写出。
   - 原图 det 框识别前会优先尝试明显背景色块切分，再对包含多行文字的 crop 做前景行投影切分，并对同一行内存在水平大空隙的宽 crop 做列段切分；只有拆出至少两条有效子段且子段识别未明显丢内容/置信度时，才用子段结果替代整框 rec，避免相邻消息或左右区域被 rec 模型粘成一行；每次 det pass 额外子行 rec 和逐 crop 增强都有固定预算，子段只做 direct rec，增强/旋转 det 不再叠加拆行成本。
+  - page-region 重新 det 路径现在也拥有独立的小型拆行/修复预算，用于修复区域 crop 内的低质大框或空识别行；高分辨率 tile det 补充只在大图且当前结果为空、低置信、det 框多但有效行少或已有行可修复时触发，并受 `MAX_HIGH_RES_TILE_DET_PASSES` 限制。
   - 针对聊天截图里“发送者：预览文本 + 刚刚/昨天/星期X + 另一侧内容”被 rec 串成一行的情况，识别后会在中间时间标记前断行；该规则要求前缀包含发送者分隔符且前后都有足够文本，避免普通句子误切。
   - 当前新增行级质量过滤会拒绝低置信、重复字符占比过高和标点占比过高的候选，可能降低垃圾输出，也可能丢弃少量真实低置信文本，需要真实样本评估。
 - 最小修复点：
@@ -112,6 +113,7 @@
 | 16 | 增加浅色底黑字主动补充识别：正常 det 后用小预算识别颜色区域候选，颜色量化提升到 4-bit 以捕获浅灰/浅蓝 UI 色块 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试 | 完成 |
 | 17 | 增加 det 候选质量优化、rec 前景 tight crop 和近似重复去重：原始小框仅作为合并框替代切分候选，rec 前裁掉大块空白，输出前按 bbox/text 相似度去重 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试；真实截图回测 | 完成 |
 | 18 | 增加短噪声过滤和全局长文本精确去重：密集结果中过滤短 ASCII/符号噪声，完全相同或近乎完全相同的长文本可跨位置去重 | `cargo test -p vectraparse-ocr`; parser metadata 定向测试；真实截图回测 | 完成 |
+| 19 | 增加 page-region 本地修复和高分辨率 tile det 补充：区域 crop 内保留受限拆行/修复预算，大图低质或空结果时按纹理密度选取有限 tile 用原图分辨率重新 det/rec | `cargo test -p vectraparse-ocr`; trace golden；`cargo check -p vectraparse-ffi`; 格式和 diff 检查 | 完成 |
 
 ## 6. 验证计划
 
@@ -572,6 +574,21 @@
   - 单测覆盖换行候选拆成独立 line、低质/大弱框触发修复判断、以及颜色区域覆盖过滤允许修复低质重叠框。
   - 验证已执行 `cargo test -p vectraparse-ocr`、`python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、`cargo check -p vectraparse-ffi`、`rustfmt --edition 2024 --check --config skip_children=true crates/vectraparse-ocr/src/lib.rs` 和 `git diff --check`。
 
+## 7.15 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只修改 `crates/vectraparse-ocr/src/lib.rs`、当前任务文档和 `docs/dev/README.md` 索引，不触碰 `crates/vectraparse-ocr/src/ort.rs`、ONNX 模型、字典、FFI ABI 或构建链接。
+  - 新增测试继续使用合成 `Alpha/Beta` 和矩形纹理，不包含真实截图里的姓名、组织、编号、原句或文件名，避免样本特化。
+- 高级产品：
+  - page-region 识别现在拥有独立的小型拆行/修复预算，复杂截图中局部区域被重新 det 后仍可继续修复低质大框或空行。
+  - 大图在当前识别为空、低置信、det 框多但有效行少，或已有行可修复时，会按纹理密度选择有限 tile 以原图分辨率重新 det/rec，用于补救整页缩放导致的小字漏检。
+- 高级架构师：
+  - 高分辨率 tile 补充受 `MAX_HIGH_RES_TILE_DET_PASSES` 限制，tile source 不叠加额外拆行/修复预算，避免与 page-region、颜色区域和质量 fallback 形成无界乘法成本。
+  - tile 结果仍走现有 `Offset` 坐标回映、行去重、区域聚类和补充过滤流程，不新增公开 OCR API 或外部依赖。
+- 高级工程师：
+  - 单测覆盖 page-region 本地预算、高分辨率 tile 触发条件、tile 覆盖尾部、纹理 tile 数量上限和阅读顺序。
+  - 验证已执行 `cargo test -p vectraparse-ocr`、`python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、`cargo check -p vectraparse-ffi`、`rustfmt --edition 2024 --check --config skip_children=true crates/vectraparse-ocr/src/lib.rs`、`git diff --check` 和样例文本禁入检查。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -605,3 +622,4 @@
 | 2026-06-01 | 增加 OCR trace JSON | 输出行级 source/bbox/crop_size/confidence/text 诊断信息，为后续 golden 和候选仲裁提供依据 |
 | 2026-06-01 | 增加 OCR trace golden 入口 | 用 manifest + expected JSON 校验 trace 行级 source、bbox、crop_size、confidence 和 must-have/must-not-have 规则 |
 | 2026-06-01 | 增强 OCR 行级修复与颜色区域补充 | 对低质/大框行做局部二次识别，把换行识别结果拆成独立 line，并优先识别未被可靠文本覆盖的颜色背景区域 |
+| 2026-06-01 | 增加 page-region 修复和高分辨率 tile 补充 | 为复杂截图小字、局部漏框和大图缩放后漏检场景增加受限区域内修复与原图 tile 重新 det |

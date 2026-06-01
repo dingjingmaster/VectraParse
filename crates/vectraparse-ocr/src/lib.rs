@@ -18,6 +18,9 @@ const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
 const MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS: usize = 8;
+const MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
+const MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
+const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
@@ -306,6 +309,32 @@ impl OrtOcrEngine {
             );
         }
 
+        if should_use_high_res_tile_supplement(
+            img,
+            cfg,
+            confidence,
+            det_box_count,
+            line_count,
+            &regions,
+        ) {
+            let (tile_region_count, tile_region_candidate) =
+                self.recognize_high_res_tiles(img, cfg, &regions)?;
+            if tile_region_count > 0 {
+                trace.det_pass_count += tile_region_count;
+                maybe_adopt_recognized(
+                    &mut text,
+                    &mut confidence,
+                    &mut line_count,
+                    &mut region_count,
+                    &mut layout_applied,
+                    &mut regions,
+                    &mut fallback,
+                    "det-high-res-tiles".to_string(),
+                    &tile_region_candidate,
+                );
+            }
+        }
+
         let (candidate_count, candidate) = self.recognize_uncovered_color_regions(
             img,
             cfg,
@@ -436,16 +465,8 @@ impl OrtOcrEngine {
                 } else {
                     0
                 },
-                if source == "det" {
-                    MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
-                } else {
-                    0
-                },
-                if source == "det" {
-                    MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
-                } else {
-                    0
-                }
+                split_line_recognition_budget(source),
+                line_repair_recognition_budget(source)
             );
         }
         let mut lines = Vec::new();
@@ -454,16 +475,8 @@ impl OrtOcrEngine {
         } else {
             0
         };
-        let mut split_line_rec_budget = if source == "det" {
-            MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
-        } else {
-            0
-        };
-        let mut line_repair_rec_budget = if source == "det" {
-            MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
-        } else {
-            0
-        };
+        let mut split_line_rec_budget = split_line_recognition_budget(source);
+        let mut line_repair_rec_budget = line_repair_recognition_budget(source);
         for (idx, det_box) in boxes.iter().enumerate() {
             let b = det_box.bbox;
             if trace_enabled {
@@ -562,6 +575,60 @@ impl OrtOcrEngine {
         }
 
         Ok((region_boxes.len(), recognized_from_text_lines(&mut lines)))
+    }
+
+    fn recognize_high_res_tiles(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        existing_regions: &[OcrTextRegion],
+    ) -> Result<(usize, RecognizedText), String> {
+        let tile_boxes = high_res_tile_boxes(img, cfg.det_img_side);
+        let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!("[OCR_TRACE] high-res-tiles candidates={}", tile_boxes.len());
+        }
+        if tile_boxes.is_empty() {
+            return Ok((0, RecognizedText::default()));
+        }
+
+        let (img_w, img_h) = img.dimensions();
+        let mut lines = Vec::new();
+        for (idx, tile_box) in tile_boxes.iter().enumerate() {
+            if trace_enabled {
+                eprintln!(
+                    "[OCR_TRACE] high-res-tile index={} bbox={}x{}@{},{}",
+                    idx + 1,
+                    box_width(*tile_box),
+                    box_height(*tile_box),
+                    tile_box.0,
+                    tile_box.1
+                );
+            }
+            let crop = crop_box(img, *tile_box);
+            let source = format!("tile-region:{}", idx + 1);
+            let detected = self.recognize_detected_text(
+                &crop,
+                cfg,
+                false,
+                &source,
+                BboxTransform::Offset {
+                    dx: tile_box.0,
+                    dy: tile_box.1,
+                    max_w: img_w,
+                    max_h: img_h,
+                },
+            )?;
+            lines.extend(text_lines_from_recognized(&detected.recognized));
+        }
+
+        let recognized = recognized_from_text_lines(&mut lines);
+        let candidate = if existing_regions.is_empty() {
+            recognized
+        } else {
+            filter_page_region_supplement(&recognized, existing_regions)
+        };
+        Ok((tile_boxes.len(), candidate))
     }
 
     fn push_recognized_box_lines(
@@ -2791,6 +2858,71 @@ fn color_region_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegio
     false
 }
 
+fn split_line_recognition_budget(source: &str) -> usize {
+    if source == "det" {
+        MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("page-region:") {
+        MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
+    } else {
+        0
+    }
+}
+
+fn line_repair_recognition_budget(source: &str) -> usize {
+    if source == "det" {
+        MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("page-region:") {
+        MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS
+    } else {
+        0
+    }
+}
+
+fn should_use_high_res_tile_supplement(
+    img: &DynamicImage,
+    cfg: &OcrConfig,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    let (w, h) = img.dimensions();
+    if w <= cfg.det_img_side as u32 && h <= cfg.det_img_side as u32 {
+        return false;
+    }
+    if line_count == 0 {
+        return true;
+    }
+    if confidence > 0.0 && confidence < 0.75 {
+        return true;
+    }
+    if det_box_count >= 8 && line_count * 2 <= det_box_count {
+        return true;
+    }
+    regions_have_repairable_lines(regions)
+}
+
+fn regions_have_repairable_lines(regions: &[OcrTextRegion]) -> bool {
+    for region in regions {
+        if region.lines.is_empty() {
+            if recognized_box_needs_repair(
+                box_from_array(region.bbox),
+                &region.text,
+                region.confidence,
+            ) {
+                return true;
+            }
+            continue;
+        }
+        for line in &region.lines {
+            if recognized_box_needs_repair(box_from_array(line.bbox), &line.text, line.confidence) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn recognized_char_count(text: &str) -> usize {
     text.chars().filter(|ch| !ch.is_whitespace()).count()
 }
@@ -2940,6 +3072,78 @@ fn page_region_boxes(image: &DynamicImage, detection_boxes: &[DetectionBox]) -> 
     }
     boxes.truncate(MAX_PAGE_REGION_DET_PASSES);
     boxes
+}
+
+fn high_res_tile_boxes(image: &DynamicImage, det_img_side: usize) -> Vec<BoxRect> {
+    let (w, h) = image.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let det_side = det_img_side.max(320) as u32;
+    let tile_side = ((det_side * 2) / 3).clamp(384, 720);
+    if w <= tile_side && h <= tile_side {
+        return Vec::new();
+    }
+
+    let overlap = (tile_side / 5).clamp(96, 160);
+    let xs = tile_axis_starts(w, tile_side, overlap);
+    let ys = tile_axis_starts(h, tile_side, overlap);
+    let mut scored = Vec::new();
+    for y in ys {
+        for x in &xs {
+            let x1 = x.saturating_add(tile_side).min(w);
+            let y1 = y.saturating_add(tile_side).min(h);
+            let b = clamp_box((*x, y, x1, y1), w, h);
+            let score = tile_text_score(image, b);
+            if score > 0 {
+                scored.push((b, score));
+            }
+        }
+    }
+
+    if scored.is_empty() {
+        return Vec::new();
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    scored.truncate(MAX_HIGH_RES_TILE_DET_PASSES);
+    scored.sort_by(|a, b| reading_box_order(&a.0, &b.0));
+    scored.into_iter().map(|(b, _)| b).collect()
+}
+
+fn tile_axis_starts(len: u32, tile_side: u32, overlap: u32) -> Vec<u32> {
+    if len <= tile_side {
+        return vec![0];
+    }
+    let stride = tile_side.saturating_sub(overlap).max(1);
+    let last = len - tile_side;
+    let mut starts = Vec::new();
+    let mut cur = 0u32;
+    loop {
+        if starts.last().copied() != Some(cur) {
+            starts.push(cur);
+        }
+        if cur >= last {
+            break;
+        }
+        let next = cur.saturating_add(stride);
+        cur = if next >= last { last } else { next };
+    }
+    starts
+}
+
+fn tile_text_score(image: &DynamicImage, b: BoxRect) -> usize {
+    let crop = crop_box(image, b);
+    let rgb = to_rgb_on_white(&crop);
+    if let Some(edge_mask) = visual_layout_edge_mask_from_rgb(&rgb) {
+        let edge_count = edge_mask.iter().filter(|active| **active).count();
+        if edge_count > 0 {
+            return edge_count;
+        }
+    }
+    foreground_mask_from_rgb(&rgb)
+        .or_else(|| dark_luma_mask_from_rgb(&rgb))
+        .map(|mask| mask.iter().filter(|active| **active).count())
+        .unwrap_or(0)
 }
 
 fn visual_page_region_boxes(image: &DynamicImage) -> Vec<BoxRect> {
@@ -4851,6 +5055,123 @@ mod tests {
         let regions = page_region_boxes(&DynamicImage::ImageRgb8(rgb), &[]);
 
         assert_eq!(regions.len(), 3);
+    }
+
+    #[test]
+    fn page_region_sources_get_local_repair_budgets() {
+        assert_eq!(
+            split_line_recognition_budget("det"),
+            MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            line_repair_recognition_budget("det"),
+            MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            split_line_recognition_budget("page-region:1"),
+            MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            line_repair_recognition_budget("page-region:1"),
+            MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(split_line_recognition_budget("tile-region:1"), 0);
+        assert_eq!(line_repair_recognition_budget("tile-region:1"), 0);
+    }
+
+    #[test]
+    fn high_res_tile_supplement_requires_large_or_weak_input() {
+        let cfg = OcrConfig::default();
+        let small = DynamicImage::ImageLuma8(GrayImage::from_pixel(480, 320, Luma([255])));
+        let large = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 900, Luma([255])));
+        let strong_regions = vec![OcrTextRegion {
+            bbox: [10, 10, 180, 36],
+            text: "Alpha Beta".to_string(),
+            confidence: 0.88,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 180, 36],
+                text: "Alpha Beta".to_string(),
+                confidence: 0.88,
+                source: "det".to_string(),
+            }],
+        }];
+        let weak_regions = vec![OcrTextRegion {
+            bbox: [10, 10, 640, 92],
+            text: "Alpha Beta".to_string(),
+            confidence: 0.70,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 640, 92],
+                text: "Alpha Beta".to_string(),
+                confidence: 0.70,
+                source: "det".to_string(),
+            }],
+        }];
+
+        assert!(!should_use_high_res_tile_supplement(
+            &small,
+            &cfg,
+            0.30,
+            12,
+            2,
+            &weak_regions
+        ));
+        assert!(!should_use_high_res_tile_supplement(
+            &large,
+            &cfg,
+            0.88,
+            6,
+            5,
+            &strong_regions
+        ));
+        assert!(should_use_high_res_tile_supplement(
+            &large,
+            &cfg,
+            0.88,
+            6,
+            5,
+            &weak_regions
+        ));
+        assert!(should_use_high_res_tile_supplement(
+            &large,
+            &cfg,
+            0.0,
+            0,
+            0,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn tile_axis_starts_cover_tail_with_overlap() {
+        let starts = tile_axis_starts(1500, 640, 128);
+
+        assert_eq!(starts.first().copied(), Some(0));
+        assert_eq!(starts.last().copied(), Some(860));
+        assert!(starts.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[test]
+    fn high_res_tile_boxes_keep_limited_textured_tiles() {
+        let mut rgb = image::RgbImage::from_pixel(1500, 900, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture(&mut rgb, 40, 520);
+        draw_synthetic_text_texture(&mut rgb, 820, 1420);
+
+        let tiles = high_res_tile_boxes(&DynamicImage::ImageRgb8(rgb), 960);
+
+        assert!(!tiles.is_empty());
+        assert!(tiles.len() <= MAX_HIGH_RES_TILE_DET_PASSES);
+        assert!(
+            tiles
+                .iter()
+                .all(|b| box_width(*b) <= 640 && box_height(*b) <= 640)
+        );
+        assert!(
+            tiles
+                .windows(2)
+                .all(|pair| reading_box_order(&pair[0], &pair[1]) != std::cmp::Ordering::Greater)
+        );
     }
 
     #[test]
