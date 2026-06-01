@@ -58,6 +58,8 @@ pub struct OcrResult {
 pub struct OcrDiagnostics {
     pub det_box_count: usize,
     pub line_count: usize,
+    pub region_count: usize,
+    pub layout_applied: bool,
     pub fallback: Option<String>,
     pub empty_result: bool,
     pub source_has_alpha: bool,
@@ -90,12 +92,27 @@ struct RecognizedText {
     text: String,
     confidence: f32,
     line_count: usize,
+    region_count: usize,
+    layout_applied: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct DetectedText {
     det_box_count: usize,
     recognized: RecognizedText,
+}
+
+#[derive(Debug, Clone)]
+struct TextLine {
+    bbox: BoxRect,
+    text: String,
+    confidence: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LayoutRegion {
+    bbox: BoxRect,
+    lines: Vec<TextLine>,
 }
 
 struct OrtSession {
@@ -159,6 +176,8 @@ impl OrtOcrEngine {
         let mut text = detected.recognized.text;
         let mut confidence = detected.recognized.confidence;
         let mut line_count = detected.recognized.line_count;
+        let mut region_count = detected.recognized.region_count;
+        let mut layout_applied = detected.recognized.layout_applied;
         let mut fallback = None;
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
@@ -169,6 +188,8 @@ impl OrtOcrEngine {
                 &mut text,
                 &mut confidence,
                 &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
                 &mut fallback,
             )?;
         }
@@ -183,12 +204,14 @@ impl OrtOcrEngine {
         if std::env::var("VECTRAPARSE_OCR_TRACE").ok().as_deref() == Some("1") {
             let (w, h) = img.dimensions();
             eprintln!(
-                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} whole_image_box={} fallback={} empty={}",
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} whole_image_box={} fallback={} empty={}",
                 w,
                 h,
                 source_has_alpha,
                 det_box_count,
                 line_count,
+                region_count,
+                layout_applied,
                 detect_used_whole_image_box,
                 fallback.as_deref().unwrap_or("-"),
                 empty_result
@@ -202,6 +225,8 @@ impl OrtOcrEngine {
             diagnostics: OcrDiagnostics {
                 det_box_count,
                 line_count,
+                region_count,
+                layout_applied,
                 fallback,
                 empty_result,
                 source_has_alpha,
@@ -217,7 +242,7 @@ impl OrtOcrEngine {
         allow_crop_enhancement: bool,
     ) -> Result<DetectedText, String> {
         let boxes = self.detect_text_boxes(img, cfg)?;
-        let mut lines: Vec<(u32, u32, String, f32)> = Vec::new();
+        let mut lines = Vec::new();
         for b in boxes.iter() {
             let crop = crop_box(img, *b);
             let candidate = if allow_crop_enhancement {
@@ -226,13 +251,17 @@ impl OrtOcrEngine {
                 self.best_from_crop_direct(&crop, cfg)
             };
             if let Some(candidate) = candidate {
-                lines.push((b.1, b.0, candidate.text, candidate.confidence));
+                lines.push(TextLine {
+                    bbox: *b,
+                    text: candidate.text,
+                    confidence: candidate.confidence,
+                });
             }
         }
 
         Ok(DetectedText {
             det_box_count: boxes.len(),
-            recognized: recognized_from_positioned_lines(&mut lines),
+            recognized: recognized_from_text_lines(&mut lines),
         })
     }
 
@@ -244,13 +273,24 @@ impl OrtOcrEngine {
         text: &mut String,
         confidence: &mut f32,
         line_count: &mut usize,
+        region_count: &mut usize,
+        layout_applied: &mut bool,
         fallback: &mut Option<String>,
     ) -> Result<(), String> {
         match self.recognize_best(img, cfg) {
             Ok(candidate) if is_usable_recognition(&candidate) => {
                 let label = recognition_fallback_label("whole-image", candidate.variant);
                 let candidate = recognized_from_candidate(candidate);
-                maybe_adopt_recognized(text, confidence, line_count, fallback, label, &candidate);
+                maybe_adopt_recognized(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    fallback,
+                    label,
+                    &candidate,
+                );
             }
             Err(e) if text.trim().is_empty() => return Err(format!("recognize: {e}")),
             _ => {}
@@ -266,6 +306,8 @@ impl OrtOcrEngine {
                     text,
                     confidence,
                     line_count,
+                    region_count,
+                    layout_applied,
                     fallback,
                     format!("det-enhanced:{name}"),
                     &candidate.recognized,
@@ -281,7 +323,16 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("enhanced:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate);
-                maybe_adopt_recognized(text, confidence, line_count, fallback, label, &candidate);
+                maybe_adopt_recognized(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    fallback,
+                    label,
+                    &candidate,
+                );
             }
             if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
                 return Ok(());
@@ -294,6 +345,8 @@ impl OrtOcrEngine {
                     text,
                     confidence,
                     line_count,
+                    region_count,
+                    layout_applied,
                     fallback,
                     format!("det-upscaled:{name}"),
                     &candidate.recognized,
@@ -309,7 +362,16 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("upscaled:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate);
-                maybe_adopt_recognized(text, confidence, line_count, fallback, label, &candidate);
+                maybe_adopt_recognized(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    fallback,
+                    label,
+                    &candidate,
+                );
             }
             if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
                 return Ok(());
@@ -322,6 +384,8 @@ impl OrtOcrEngine {
                     text,
                     confidence,
                     line_count,
+                    region_count,
+                    layout_applied,
                     fallback,
                     format!("det-rotated:{name}"),
                     &candidate.recognized,
@@ -337,7 +401,16 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("rotated:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate);
-                maybe_adopt_recognized(text, confidence, line_count, fallback, label, &candidate);
+                maybe_adopt_recognized(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    fallback,
+                    label,
+                    &candidate,
+                );
             }
             if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
                 return Ok(());
@@ -349,6 +422,8 @@ impl OrtOcrEngine {
             text,
             confidence,
             line_count,
+            region_count,
+            layout_applied,
             fallback,
             "line-crops".to_string(),
             &candidate,
@@ -363,10 +438,16 @@ impl OrtOcrEngine {
             if let Ok(candidate) = self.recognize_best(&line, cfg)
                 && is_usable_recognition(&candidate)
             {
-                lines.push((idx as u32, 0, candidate.text, candidate.confidence));
+                let (_, line_h) = line.dimensions();
+                let y0 = (idx as u32).saturating_mul(line_h.max(1) + 4);
+                lines.push(TextLine {
+                    bbox: (0, y0, line.width(), y0 + line_h.max(1)),
+                    text: candidate.text,
+                    confidence: candidate.confidence,
+                });
             }
         }
-        recognized_from_positioned_lines(&mut lines)
+        recognized_from_text_lines(&mut lines)
     }
 
     fn recognize_best(
@@ -458,24 +539,47 @@ impl OrtOcrEngine {
     }
 }
 
-fn recognized_from_positioned_lines(lines: &mut Vec<(u32, u32, String, f32)>) -> RecognizedText {
-    lines.sort_by_key(|(y, x, _, _)| (*y / 8, *x));
-    let text = lines
-        .iter()
-        .map(|(_, _, t, _)| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
+    lines.sort_by(reading_line_order);
+    let mut regions = group_text_lines_into_regions(lines);
+    regions.sort_by(reading_region_order);
+
+    let mut blocks = Vec::new();
+    let mut confidence_sum = 0.0f32;
+    let mut confidence_count = 0usize;
+    for region in regions.iter_mut() {
+        region.lines.sort_by(reading_line_order);
+        let block = region
+            .lines
+            .iter()
+            .map(|line| line.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if block.trim().is_empty() {
+            continue;
+        }
+        for line in &region.lines {
+            confidence_sum += line.confidence;
+            confidence_count += 1;
+        }
+        blocks.push(block);
+    }
+
+    let text = blocks.join("\n\n");
     let line_count = text_line_count(&text);
-    let confidence = if lines.is_empty() {
+    let region_count = blocks.len();
+    let confidence = if confidence_count == 0 {
         0.0
     } else {
-        lines.iter().map(|(_, _, _, c)| *c).sum::<f32>() / lines.len() as f32
+        confidence_sum / confidence_count as f32
     };
     RecognizedText {
         text,
         confidence,
         line_count,
+        region_count,
+        layout_applied: region_count > 1,
     }
 }
 
@@ -485,7 +589,185 @@ fn recognized_from_candidate(candidate: RecCandidate) -> RecognizedText {
         text: candidate.text,
         confidence: candidate.confidence,
         line_count,
+        region_count: if line_count == 0 { 0 } else { 1 },
+        layout_applied: false,
     }
+}
+
+impl LayoutRegion {
+    fn from_line(line: TextLine) -> Self {
+        Self {
+            bbox: line.bbox,
+            lines: vec![line],
+        }
+    }
+
+    fn add_line(&mut self, line: TextLine) {
+        self.bbox = union_box(self.bbox, line.bbox);
+        self.lines.push(line);
+    }
+}
+
+fn group_text_lines_into_regions(lines: &[TextLine]) -> Vec<LayoutRegion> {
+    let mut regions: Vec<LayoutRegion> = Vec::new();
+    for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
+        let mut best: Option<(usize, f32)> = None;
+        for (idx, region) in regions.iter().enumerate() {
+            if let Some(score) = region_line_score(region, line) {
+                if best.map_or(true, |(_, best_score)| score > best_score) {
+                    best = Some((idx, score));
+                }
+            }
+        }
+
+        if let Some((idx, _)) = best {
+            regions[idx].add_line(line.clone());
+        } else {
+            regions.push(LayoutRegion::from_line(line.clone()));
+        }
+    }
+    merge_layout_regions(regions)
+}
+
+fn merge_layout_regions(mut regions: Vec<LayoutRegion>) -> Vec<LayoutRegion> {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..regions.len() {
+            for j in (i + 1)..regions.len() {
+                if regions_should_merge(&regions[i], &regions[j]) {
+                    let other = regions.remove(j);
+                    for line in other.lines {
+                        regions[i].add_line(line);
+                    }
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    regions
+}
+
+fn region_line_score(region: &LayoutRegion, line: &TextLine) -> Option<f32> {
+    let overlap = horizontal_overlap(region.bbox, line.bbox) as f32;
+    let min_width = box_width(region.bbox).min(box_width(line.bbox)).max(1) as f32;
+    let overlap_ratio = overlap / min_width;
+    let y_gap = vertical_gap(region.bbox, line.bbox) as f32;
+    let x_gap = horizontal_gap(region.bbox, line.bbox) as f32;
+    let line_h = box_height(line.bbox).max(1) as f32;
+    let avg_h = region_average_line_height(region).max(line_h);
+    let same_row =
+        vertical_overlap(region.bbox, line.bbox) > 0 && x_gap <= (line_h * 3.0).max(24.0);
+    let max_y_gap = (avg_h * 4.0).clamp(48.0, 180.0);
+
+    if !same_row && y_gap > max_y_gap {
+        return None;
+    }
+
+    let region_w = box_width(region.bbox).max(1) as f32;
+    let line_w = box_width(line.bbox).max(1) as f32;
+    let width_ratio = region_w.max(line_w) / region_w.min(line_w);
+    if !same_row && y_gap > avg_h * 2.5 && width_ratio >= 1.75 {
+        return None;
+    }
+
+    let region_cx = box_center_x(region.bbox);
+    let line_cx = box_center_x(line.bbox);
+    let centers_close = (region_cx - line_cx).abs() <= min_width.max(64.0) * 0.55;
+    if overlap_ratio < 0.25 && !same_row && !centers_close {
+        return None;
+    }
+
+    Some(overlap_ratio * 100.0 + if same_row { 25.0 } else { 0.0 } - y_gap * 0.25 - x_gap * 0.02)
+}
+
+fn regions_should_merge(a: &LayoutRegion, b: &LayoutRegion) -> bool {
+    let overlap = horizontal_overlap(a.bbox, b.bbox) as f32;
+    let min_width = box_width(a.bbox).min(box_width(b.bbox)).max(1) as f32;
+    let overlap_ratio = overlap / min_width;
+    let y_gap = vertical_gap(a.bbox, b.bbox) as f32;
+    let avg_h = region_average_line_height(a).max(region_average_line_height(b));
+    let width_ratio = box_width(a.bbox).max(box_width(b.bbox)).max(1) as f32
+        / box_width(a.bbox).min(box_width(b.bbox)).max(1) as f32;
+
+    overlap_ratio >= 0.45 && y_gap <= (avg_h * 3.0).max(48.0) && width_ratio < 1.75
+}
+
+fn reading_line_order(a: &TextLine, b: &TextLine) -> std::cmp::Ordering {
+    (a.bbox.1 / 8, a.bbox.0).cmp(&(b.bbox.1 / 8, b.bbox.0))
+}
+
+fn reading_region_order(a: &LayoutRegion, b: &LayoutRegion) -> std::cmp::Ordering {
+    let y_close = vertical_overlap(a.bbox, b.bbox) > 0
+        || a.bbox.1.abs_diff(b.bbox.1) <= (box_height(a.bbox).min(box_height(b.bbox)) / 3).max(24);
+    if y_close {
+        a.bbox
+            .0
+            .cmp(&b.bbox.0)
+            .then_with(|| a.bbox.1.cmp(&b.bbox.1))
+    } else {
+        a.bbox
+            .1
+            .cmp(&b.bbox.1)
+            .then_with(|| a.bbox.0.cmp(&b.bbox.0))
+    }
+}
+
+fn union_box(a: BoxRect, b: BoxRect) -> BoxRect {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+fn box_width(b: BoxRect) -> u32 {
+    b.2.saturating_sub(b.0)
+}
+
+fn box_height(b: BoxRect) -> u32 {
+    b.3.saturating_sub(b.1)
+}
+
+fn box_center_x(b: BoxRect) -> f32 {
+    (b.0 as f32 + b.2 as f32) / 2.0
+}
+
+fn horizontal_overlap(a: BoxRect, b: BoxRect) -> u32 {
+    a.2.min(b.2).saturating_sub(a.0.max(b.0))
+}
+
+fn vertical_overlap(a: BoxRect, b: BoxRect) -> u32 {
+    a.3.min(b.3).saturating_sub(a.1.max(b.1))
+}
+
+fn horizontal_gap(a: BoxRect, b: BoxRect) -> u32 {
+    if a.2 < b.0 {
+        b.0 - a.2
+    } else if b.2 < a.0 {
+        a.0 - b.2
+    } else {
+        0
+    }
+}
+
+fn vertical_gap(a: BoxRect, b: BoxRect) -> u32 {
+    if a.3 < b.1 {
+        b.1 - a.3
+    } else if b.3 < a.1 {
+        a.1 - b.3
+    } else {
+        0
+    }
+}
+
+fn region_average_line_height(region: &LayoutRegion) -> f32 {
+    if region.lines.is_empty() {
+        return box_height(region.bbox).max(1) as f32;
+    }
+    region
+        .lines
+        .iter()
+        .map(|line| box_height(line.bbox).max(1) as f32)
+        .sum::<f32>()
+        / region.lines.len() as f32
 }
 
 fn recognition_fallback_label(base: &str, variant: RecVariant) -> String {
@@ -499,6 +781,8 @@ fn maybe_adopt_recognized(
     text: &mut String,
     confidence: &mut f32,
     line_count: &mut usize,
+    region_count: &mut usize,
+    layout_applied: &mut bool,
     fallback: &mut Option<String>,
     label: String,
     candidate: &RecognizedText,
@@ -511,6 +795,10 @@ fn maybe_adopt_recognized(
         *text = candidate.text.clone();
         *confidence = candidate.confidence;
         *line_count = candidate.line_count.max(text_line_count(text));
+        *region_count = candidate
+            .region_count
+            .max(if text.trim().is_empty() { 0 } else { 1 });
+        *layout_applied = candidate.layout_applied;
         *fallback = Some(label);
         return true;
     }
@@ -527,6 +815,10 @@ fn maybe_adopt_recognized(
         *text = candidate.text.clone();
         *confidence = candidate.confidence;
         *line_count = candidate.line_count.max(text_line_count(text));
+        *region_count = candidate
+            .region_count
+            .max(if text.trim().is_empty() { 0 } else { 1 });
+        *layout_applied = candidate.layout_applied;
         *fallback = Some(label);
         return true;
     }
@@ -542,6 +834,8 @@ fn maybe_adopt_recognized(
             candidate.line_count,
         );
         *line_count = text_line_count(text);
+        *region_count = (*region_count).max(candidate.region_count).max(1);
+        *layout_applied = *layout_applied || candidate.layout_applied || *region_count > 1;
         *fallback = Some(format!("merged:{label}"));
         return true;
     }
@@ -553,6 +847,10 @@ fn maybe_adopt_recognized(
         *text = candidate.text.clone();
         *confidence = candidate.confidence;
         *line_count = candidate.line_count.max(text_line_count(text));
+        *region_count = candidate
+            .region_count
+            .max(if text.trim().is_empty() { 0 } else { 1 });
+        *layout_applied = candidate.layout_applied;
         *fallback = Some(label);
         return true;
     }
@@ -1864,23 +2162,59 @@ mod tests {
         let mut text = "Header".to_string();
         let mut confidence = 0.44;
         let mut line_count = 1;
+        let mut region_count = 1;
+        let mut layout_applied = false;
         let mut fallback = None;
         let candidate = RecognizedText {
             text: "Header\nTotal 42".to_string(),
             confidence: 0.54,
             line_count: 2,
+            region_count: 1,
+            layout_applied: false,
         };
         assert!(maybe_adopt_recognized(
             &mut text,
             &mut confidence,
             &mut line_count,
+            &mut region_count,
+            &mut layout_applied,
             &mut fallback,
             "det-enhanced:contrast".to_string(),
             &candidate,
         ));
         assert_eq!(text, "Header\nTotal 42");
         assert_eq!(line_count, 2);
+        assert_eq!(region_count, 1);
+        assert!(!layout_applied);
         assert_eq!(fallback.as_deref(), Some("merged:det-enhanced:contrast"));
+    }
+
+    #[test]
+    fn layout_regions_keep_columns_separate() {
+        let mut lines = vec![
+            text_line((0, 0, 90, 12), "Left A", 0.80),
+            text_line((0, 18, 90, 30), "Left B", 0.82),
+            text_line((220, 0, 330, 12), "Right A", 0.81),
+            text_line((220, 18, 330, 30), "Right B", 0.83),
+        ];
+        let recognized = recognized_from_text_lines(&mut lines);
+        assert_eq!(recognized.text, "Left A\nLeft B\n\nRight A\nRight B");
+        assert_eq!(recognized.line_count, 4);
+        assert_eq!(recognized.region_count, 2);
+        assert!(recognized.layout_applied);
+    }
+
+    #[test]
+    fn layout_regions_do_not_merge_full_width_header_with_columns() {
+        let mut lines = vec![
+            text_line((0, 0, 320, 14), "Header", 0.90),
+            text_line((0, 56, 90, 68), "Menu", 0.80),
+            text_line((150, 56, 320, 68), "Content", 0.82),
+        ];
+        let recognized = recognized_from_text_lines(&mut lines);
+        assert_eq!(recognized.text, "Header\n\nMenu\n\nContent");
+        assert_eq!(recognized.region_count, 3);
+        assert!(recognized.layout_applied);
     }
 
     #[test]
@@ -1919,5 +2253,13 @@ mod tests {
         rgba.put_pixel(0, 0, image::Rgba([255, 255, 255, 0]));
         let gray = to_luma_on_background(&DynamicImage::ImageRgba8(rgba), 0);
         assert_eq!(gray.get_pixel(0, 0)[0], 0);
+    }
+
+    fn text_line(bbox: BoxRect, text: &str, confidence: f32) -> TextLine {
+        TextLine {
+            bbox,
+            text: text.to_string(),
+            confidence,
+        }
     }
 }

@@ -1282,6 +1282,14 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
     metadata.insert("image.ocr.confidence", format!("{:.4}", ocr.confidence));
     metadata.insert("image.ocr.box_count", ocr.diagnostics.det_box_count.to_string());
     metadata.insert("image.ocr.line_count", ocr.diagnostics.line_count.to_string());
+    metadata.insert(
+        "image.ocr.region_count",
+        ocr.diagnostics.region_count.to_string(),
+    );
+    metadata.insert(
+        "image.ocr.layout_applied",
+        ocr.diagnostics.layout_applied.to_string(),
+    );
     metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
     metadata.insert(
         "image.ocr.source_has_alpha",
@@ -3474,6 +3482,8 @@ mod tests {
             diagnostics: OcrDiagnostics {
                 det_box_count: 3,
                 line_count: 1,
+                region_count: 1,
+                layout_applied: false,
                 fallback: Some("whole-image".to_string()),
                 empty_result: false,
                 source_has_alpha: true,
@@ -3494,6 +3504,20 @@ mod tests {
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.region_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.layout_applied")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("false")
         );
         assert_eq!(
             metadata
@@ -3538,6 +3562,8 @@ mod tests {
             diagnostics: OcrDiagnostics {
                 det_box_count: 0,
                 line_count: 0,
+                region_count: 0,
+                layout_applied: false,
                 fallback: Some("line-crops".to_string()),
                 empty_result: true,
                 source_has_alpha: false,
