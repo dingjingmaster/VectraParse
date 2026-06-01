@@ -17,6 +17,7 @@ const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
+const MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
@@ -305,18 +306,14 @@ impl OrtOcrEngine {
             );
         }
 
-        let (candidate_count, candidate) = self.recognize_color_regions_limited(
+        let (candidate_count, candidate) = self.recognize_uncovered_color_regions(
             img,
             cfg,
+            &regions,
             MAX_EAGER_COLOR_REGION_RECOGNITIONS,
             "color-region:eager",
         );
         let mut color_region_count = candidate_count;
-        let candidate = if text.trim().is_empty() {
-            candidate
-        } else {
-            filter_non_overlapping_recognized(&candidate, &regions)
-        };
         maybe_adopt_recognized(
             &mut text,
             &mut confidence,
@@ -431,7 +428,7 @@ impl OrtOcrEngine {
         let trace_enabled = ocr_trace_enabled();
         if trace_enabled {
             eprintln!(
-                "[OCR_TRACE] det-pass source={} boxes={} crop_enhance_budget={} split_budget={}",
+                "[OCR_TRACE] det-pass source={} boxes={} crop_enhance_budget={} split_budget={} repair_budget={}",
                 source,
                 boxes.len(),
                 if allow_crop_enhancement {
@@ -441,6 +438,11 @@ impl OrtOcrEngine {
                 },
                 if source == "det" {
                     MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+                } else {
+                    0
+                },
+                if source == "det" {
+                    MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
                 } else {
                     0
                 }
@@ -454,6 +456,11 @@ impl OrtOcrEngine {
         };
         let mut split_line_rec_budget = if source == "det" {
             MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        } else {
+            0
+        };
+        let mut line_repair_rec_budget = if source == "det" {
+            MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
         } else {
             0
         };
@@ -480,6 +487,7 @@ impl OrtOcrEngine {
                 transform,
                 &mut crop_enhancement_budget,
                 &mut split_line_rec_budget,
+                &mut line_repair_rec_budget,
                 &mut lines,
             );
             if trace_enabled && (idx + 1) % 16 == 0 {
@@ -567,6 +575,7 @@ impl OrtOcrEngine {
         transform: BboxTransform,
         crop_enhancement_budget: &mut usize,
         split_line_rec_budget: &mut usize,
+        line_repair_rec_budget: &mut usize,
         lines: &mut Vec<TextLine>,
     ) {
         let using_alternatives =
@@ -596,12 +605,7 @@ impl OrtOcrEngine {
                 return;
             }
             if let Some(candidate) = direct_for_comparison {
-                lines.push(TextLine {
-                    bbox: transform.map_box(b),
-                    text: normalize_recognized_text(&candidate.text),
-                    confidence: candidate.confidence,
-                    source: source.to_string(),
-                });
+                lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
                 return;
             }
         }
@@ -620,14 +624,67 @@ impl OrtOcrEngine {
             direct = self.best_from_crop(&direct_crop, cfg).or(direct);
         };
 
-        if let Some(candidate) = direct {
-            lines.push(TextLine {
-                bbox: transform.map_box(b),
-                text: normalize_recognized_text(&candidate.text),
-                confidence: candidate.confidence,
-                source: source.to_string(),
-            });
+        if let Some(repaired) = self.repair_recognized_box_lines(
+            img,
+            cfg,
+            b,
+            direct.as_ref(),
+            source,
+            transform,
+            line_repair_rec_budget,
+        ) {
+            lines.extend(repaired);
+            return;
         }
+
+        if let Some(candidate) = direct {
+            lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
+        }
+    }
+
+    fn repair_recognized_box_lines(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        b: BoxRect,
+        direct: Option<&RecCandidate>,
+        source: &str,
+        transform: BboxTransform,
+        line_repair_rec_budget: &mut usize,
+    ) -> Option<Vec<TextLine>> {
+        if *line_repair_rec_budget == 0 {
+            return None;
+        }
+        if let Some(candidate) = direct {
+            let text = normalize_recognized_text(&candidate.text);
+            if !recognized_box_needs_repair(b, &text, candidate.confidence) {
+                return None;
+            }
+        }
+
+        let split_boxes = repair_split_boxes(img, b, *line_repair_rec_budget);
+        if split_boxes.len() >= 2 {
+            let split_source = format!("{source}:repair");
+            let split_lines =
+                self.recognize_split_line_boxes(img, cfg, &split_boxes, &split_source, transform);
+            if should_use_split_lines(direct, &split_lines) {
+                *line_repair_rec_budget =
+                    (*line_repair_rec_budget).saturating_sub(split_boxes.len());
+                return Some(split_lines);
+            }
+        }
+
+        if let Some(binary) = binarize_color_region_foreground(img, b)
+            && let Ok(candidate) = self.recognize_best(&binary, cfg)
+            && is_usable_recognition(&candidate)
+            && repair_candidate_is_better(direct, &candidate)
+        {
+            *line_repair_rec_budget = (*line_repair_rec_budget).saturating_sub(1);
+            let source = format!("{source}:binary");
+            return Some(candidate_text_lines(img, b, &candidate, &source, transform));
+        }
+
+        None
     }
 
     fn recognize_split_line_boxes(
@@ -648,12 +705,13 @@ impl OrtOcrEngine {
                     .filter(is_usable_recognition)
             });
             if let Some(candidate) = candidate {
-                lines.push(TextLine {
-                    bbox: transform.map_box(*split_box),
-                    text: normalize_recognized_text(&candidate.text),
-                    confidence: candidate.confidence,
-                    source: format!("{source}:split"),
-                });
+                lines.extend(candidate_text_lines(
+                    img,
+                    *split_box,
+                    &candidate,
+                    &format!("{source}:split"),
+                    transform,
+                ));
             }
         }
         lines
@@ -943,6 +1001,43 @@ impl OrtOcrEngine {
         (boxes.len(), recognized_from_text_lines(&mut lines))
     }
 
+    fn recognize_uncovered_color_regions(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        existing_regions: &[OcrTextRegion],
+        recognition_limit: usize,
+        source: &str,
+    ) -> (usize, RecognizedText) {
+        let boxes = color_region_boxes(img);
+        let mut lines = Vec::new();
+        let mut recognized = 0usize;
+        for b in &boxes {
+            if recognized >= recognition_limit {
+                break;
+            }
+            if color_region_box_covered_by_reliable_text(*b, existing_regions) {
+                continue;
+            }
+            let Some(binary) = binarize_color_region_foreground(img, *b) else {
+                continue;
+            };
+            recognized += 1;
+            if let Ok(candidate) = self.recognize_best(&binary, cfg)
+                && is_usable_recognition(&candidate)
+            {
+                lines.extend(candidate_text_lines(
+                    img,
+                    *b,
+                    &candidate,
+                    source,
+                    BboxTransform::Identity,
+                ));
+            }
+        }
+        (boxes.len(), recognized_from_text_lines(&mut lines))
+    }
+
     fn recognize_line_crops(&self, img: &DynamicImage, cfg: &OcrConfig) -> RecognizedText {
         let mut lines = Vec::new();
         for line_box in fallback_line_boxes(img) {
@@ -1133,6 +1228,46 @@ fn recognized_from_candidate(
         layout_applied: false,
         regions,
     }
+}
+
+fn candidate_text_lines(
+    img: &DynamicImage,
+    bbox: BoxRect,
+    candidate: &RecCandidate,
+    source: &str,
+    transform: BboxTransform,
+) -> Vec<TextLine> {
+    let text = normalize_recognized_text(&candidate.text);
+    let parts = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    if parts.len() == 1 {
+        return vec![TextLine {
+            bbox: transform.map_box(bbox),
+            text,
+            confidence: candidate.confidence,
+            source: source.to_string(),
+        }];
+    }
+
+    let line_boxes = split_recognized_multiline_box(img, bbox, parts.len());
+    let source = format!("{source}:multiline");
+    parts
+        .into_iter()
+        .zip(line_boxes)
+        .map(|(part, line_box)| TextLine {
+            bbox: transform.map_box(line_box),
+            text: part.to_string(),
+            confidence: candidate.confidence,
+            source: source.clone(),
+        })
+        .collect()
 }
 
 fn public_region_from_layout(region: &LayoutRegion, text: &str) -> OcrTextRegion {
@@ -2100,6 +2235,7 @@ fn maybe_adopt_recognized(
     false
 }
 
+#[cfg(test)]
 fn filter_non_overlapping_recognized(
     candidate: &RecognizedText,
     existing_regions: &[OcrTextRegion],
@@ -2579,6 +2715,80 @@ fn needs_quality_fallback(
 
 fn should_enhance_crop(b: BoxRect) -> bool {
     box_width(b) <= 480 && box_height(b) <= 96 && box_area(b) <= 48_000
+}
+
+fn recognized_box_needs_repair(b: BoxRect, text: &str, confidence: f32) -> bool {
+    let chars = recognized_char_count(text);
+    if chars == 0 {
+        return true;
+    }
+    if confidence < MIN_STRONG_REC_CONFIDENCE {
+        return true;
+    }
+    if chars >= 4
+        && (readable_ratio(text) < 0.65
+            || dominant_char_ratio(text) >= 0.72
+            || punctuation_ratio(text) >= 0.62)
+    {
+        return true;
+    }
+
+    let w = box_width(b);
+    let h = box_height(b).max(1);
+    let aspect = w as f32 / h as f32;
+    (w >= 480 || h >= 72 || aspect >= 16.0) && confidence < 0.75
+}
+
+fn repair_candidate_is_better(current: Option<&RecCandidate>, candidate: &RecCandidate) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    let current_text = normalize_recognized_text(&current.text);
+    let candidate_text = normalize_recognized_text(&candidate.text);
+    let current_chars = recognized_char_count(&current_text);
+    let candidate_chars = recognized_char_count(&candidate_text);
+    if candidate_chars == 0 {
+        return false;
+    }
+    if current_chars == 0 {
+        return true;
+    }
+
+    let current_quality = recognition_text_quality(&current_text, current.confidence);
+    let candidate_quality = recognition_text_quality(&candidate_text, candidate.confidence);
+    candidate_quality > current_quality + 4.0
+        || (candidate_chars > current_chars + 2
+            && candidate.confidence + 0.12 >= current.confidence)
+}
+
+fn recognition_text_quality(text: &str, confidence: f32) -> f32 {
+    let chars = recognized_char_count(text) as f32;
+    confidence * 100.0 + readable_ratio(text) * 14.0 + chars.min(32.0) * 0.25
+        - punctuation_ratio(text) * 9.0
+        - dominant_char_ratio(text) * 5.0
+}
+
+fn color_region_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
+    for region in regions {
+        if region.lines.is_empty() {
+            let line_box = box_from_array(region.bbox);
+            if boxes_significantly_overlap(b, line_box)
+                && !recognized_box_needs_repair(line_box, &region.text, region.confidence)
+            {
+                return true;
+            }
+            continue;
+        }
+        for line in &region.lines {
+            let line_box = box_from_array(line.bbox);
+            if boxes_significantly_overlap(b, line_box)
+                && !recognized_box_needs_repair(line_box, &line.text, line.confidence)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn recognized_char_count(text: &str) -> usize {
@@ -3718,6 +3928,80 @@ fn split_text_box_into_line_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<Bo
         .collect()
 }
 
+fn split_text_box_vertically(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
+    if box_height(bbox) < 18 || box_width(bbox) < 16 || max_boxes == 0 {
+        return Vec::new();
+    }
+
+    let crop = crop_box(image, bbox);
+    let local_boxes = foreground_line_boxes(&crop, max_boxes);
+    if local_boxes.len() < 2 {
+        return Vec::new();
+    }
+
+    let (img_w, img_h) = image.dimensions();
+    local_boxes
+        .into_iter()
+        .map(|b| {
+            clamp_box(
+                (
+                    bbox.0.saturating_add(b.0),
+                    bbox.1.saturating_add(b.1),
+                    bbox.0.saturating_add(b.2),
+                    bbox.1.saturating_add(b.3),
+                ),
+                img_w,
+                img_h,
+            )
+        })
+        .collect()
+}
+
+fn split_recognized_multiline_box(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    line_count: usize,
+) -> Vec<BoxRect> {
+    let vertical = split_text_box_vertically(image, bbox, line_count.saturating_add(2));
+    if vertical.len() == line_count {
+        return vertical;
+    }
+    estimated_multiline_boxes(bbox, line_count)
+}
+
+fn estimated_multiline_boxes(bbox: BoxRect, line_count: usize) -> Vec<BoxRect> {
+    if line_count == 0 {
+        return Vec::new();
+    }
+    let height = box_height(bbox).max(1);
+    (0..line_count)
+        .map(|idx| {
+            let y0 = bbox.1 + ((height as usize * idx) / line_count) as u32;
+            let y1 = bbox.1 + ((height as usize * (idx + 1)) / line_count) as u32;
+            (bbox.0, y0, bbox.2, y1.max(y0.saturating_add(1)).min(bbox.3))
+        })
+        .collect()
+}
+
+fn repair_split_boxes(image: &DynamicImage, bbox: BoxRect, budget: usize) -> Vec<BoxRect> {
+    if budget < 2 {
+        return Vec::new();
+    }
+    let mut split_boxes = split_text_box_into_line_boxes(image, bbox);
+    if split_boxes.len() < 2 || split_boxes.len() > budget {
+        split_boxes = split_text_box_into_color_region_boxes(image, bbox);
+    }
+    if split_boxes.len() >= 2 && split_boxes.len() <= budget {
+        split_boxes
+    } else {
+        Vec::new()
+    }
+}
+
 fn split_text_box_into_color_region_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRect> {
     if box_width(bbox) < 96 || box_height(bbox) < 24 {
         return Vec::new();
@@ -4836,6 +5120,56 @@ mod tests {
     }
 
     #[test]
+    fn candidate_text_lines_split_newlines_into_separate_boxes() {
+        let mut rgb = image::RgbImage::from_pixel(120, 48, image::Rgb([255, 255, 255]));
+        for y in 8..14 {
+            for x in 12..78 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        for y in 30..36 {
+            for x in 10..90 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        let candidate = RecCandidate {
+            text: "Alpha\nBeta".to_string(),
+            confidence: 0.82,
+            variant: RecVariant::Primary,
+        };
+
+        let lines = candidate_text_lines(
+            &DynamicImage::ImageRgb8(rgb),
+            (0, 0, 120, 48),
+            &candidate,
+            "det",
+            BboxTransform::Identity,
+        );
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Alpha");
+        assert_eq!(lines[1].text, "Beta");
+        assert_eq!(lines[0].source, "det:multiline");
+        assert!(lines[0].bbox.3 <= lines[1].bbox.1);
+    }
+
+    #[test]
+    fn recognized_box_repair_flags_low_quality_or_large_weak_lines() {
+        assert!(recognized_box_needs_repair((0, 0, 100, 24), "Alpha", 0.30));
+        assert!(recognized_box_needs_repair(
+            (0, 0, 620, 90),
+            "Alpha Beta",
+            0.70
+        ));
+        assert!(recognized_box_needs_repair((0, 0, 140, 24), "||||||", 0.90));
+        assert!(!recognized_box_needs_repair(
+            (0, 0, 160, 28),
+            "Alpha Beta",
+            0.86
+        ));
+    }
+
+    #[test]
     fn maybe_adopt_recognized_merges_unique_lines() {
         let mut text = "Header".to_string();
         let mut confidence = 0.44;
@@ -4985,6 +5319,43 @@ mod tests {
         assert_eq!(filtered.line_count, 1);
         assert_eq!(filtered.regions.len(), 1);
         assert_eq!(filtered.regions[0].bbox, [120, 10, 180, 26]);
+    }
+
+    #[test]
+    fn uncovered_color_region_filter_allows_repairable_overlap() {
+        let reliable = vec![OcrTextRegion {
+            bbox: [10, 10, 100, 32],
+            text: "Alpha".to_string(),
+            confidence: 0.86,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 100, 32],
+                text: "Alpha".to_string(),
+                confidence: 0.86,
+                source: "det".to_string(),
+            }],
+        }];
+        let weak = vec![OcrTextRegion {
+            bbox: [10, 10, 100, 32],
+            text: "||||||".to_string(),
+            confidence: 0.82,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [10, 10, 100, 32],
+                text: "||||||".to_string(),
+                confidence: 0.82,
+                source: "det".to_string(),
+            }],
+        }];
+
+        assert!(color_region_box_covered_by_reliable_text(
+            (12, 12, 98, 30),
+            &reliable
+        ));
+        assert!(!color_region_box_covered_by_reliable_text(
+            (12, 12, 98, 30),
+            &weak
+        ));
     }
 
     #[test]

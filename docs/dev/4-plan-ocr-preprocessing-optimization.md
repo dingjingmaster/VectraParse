@@ -557,6 +557,21 @@
   - 验证已执行 `python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、`cargo test -p vectraparse-ocr`、`cargo check -p vectraparse-ffi` 和 `git diff --check`。
   - 当前脚本不运行 OCR 模型，只比较已生成的 trace JSON；后续如要端到端生成 trace，需要单独接入 `extract-static` 或 Rust 测试入口。
 
+## 7.14 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮只修改 `crates/vectraparse-ocr/src/lib.rs` 的 OCR 候选、行拆分和颜色区域补充逻辑，不触碰 `ort.rs`、ONNX 模型、字典、FFI ABI 或构建链接。
+  - 新增测试只使用合成 `Alpha/Beta`、矩形色块和通用占位文本，不包含真实截图业务内容。
+- 高级产品：
+  - 已完成本轮要求的 1/2/3：对空识别或低质/大框行增加局部修复；将带换行的识别结果拆成多条 `OcrTextLine`；颜色区域补充先跳过可靠覆盖区域，再识别未覆盖/可修复重叠区域。
+  - 预期改善复杂截图中“整体结果够强但局部仍漏识别或粘行”的场景，尤其是浅色/彩色背景上的前景文字和跨行检测框。
+- 高级架构师：
+  - 行级修复复用现有 split、二值化和 rec 管线，只增加受限预算 `MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS`，避免无界增加复杂截图耗时。
+  - 颜色区域补充从“先识别前 N 个再过滤”调整为“先按可靠文本覆盖过滤再识别”，在不扩大默认识别上限的情况下提高未覆盖色块的命中概率。
+- 高级工程师：
+  - 单测覆盖换行候选拆成独立 line、低质/大弱框触发修复判断、以及颜色区域覆盖过滤允许修复低质重叠框。
+  - 验证已执行 `cargo test -p vectraparse-ocr`、`python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、`cargo check -p vectraparse-ffi`、`rustfmt --edition 2024 --check --config skip_children=true crates/vectraparse-ocr/src/lib.rs` 和 `git diff --check`。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -589,3 +604,4 @@
 | 2026-06-01 | 增加视觉布局页面区域候选 | 通过图像边缘/前景列投影生成多栏页面区域，降低初始 det 框漏检时的召回依赖 |
 | 2026-06-01 | 增加 OCR trace JSON | 输出行级 source/bbox/crop_size/confidence/text 诊断信息，为后续 golden 和候选仲裁提供依据 |
 | 2026-06-01 | 增加 OCR trace golden 入口 | 用 manifest + expected JSON 校验 trace 行级 source、bbox、crop_size、confidence 和 must-have/must-not-have 规则 |
+| 2026-06-01 | 增强 OCR 行级修复与颜色区域补充 | 对低质/大框行做局部二次识别，把换行识别结果拆成独立 line，并优先识别未被可靠文本覆盖的颜色背景区域 |
