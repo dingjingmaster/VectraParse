@@ -24,6 +24,8 @@ const MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 3;
 const MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS: usize = 3;
+const MAX_TILE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
+const MAX_TILE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 4;
@@ -731,6 +733,31 @@ impl OrtOcrEngine {
 
         let direct_crop = crop_box(img, b);
         let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
+        if large_text_box_needs_structured_split(b) {
+            let forced_budget = (*split_line_rec_budget)
+                .saturating_add(*line_repair_rec_budget)
+                .min(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS + MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS);
+            let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
+            if forced_boxes.len() >= 2 {
+                let forced_source = format!("{source}:forced");
+                let split_lines = self.recognize_split_line_boxes(
+                    img,
+                    cfg,
+                    &forced_boxes,
+                    &forced_source,
+                    transform,
+                );
+                if should_use_forced_split_lines(b, direct.as_ref(), &split_lines) {
+                    consume_recognition_budget(
+                        forced_boxes.len(),
+                        split_line_rec_budget,
+                        line_repair_rec_budget,
+                    );
+                    lines.extend(split_lines);
+                    return;
+                }
+            }
+        }
         let direct_is_strong = direct
             .as_ref()
             .is_some_and(|candidate| candidate.confidence >= MIN_STRONG_REC_CONFIDENCE);
@@ -2323,6 +2350,10 @@ fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<
 }
 
 fn binarize_low_contrast_foreground_from_rgb(rgb: &image::RgbImage) -> Option<DynamicImage> {
+    low_contrast_binary_luma_from_rgb(rgb).map(DynamicImage::ImageLuma8)
+}
+
+fn low_contrast_binary_luma_from_rgb(rgb: &image::RgbImage) -> Option<GrayImage> {
     let (w, h) = rgb.dimensions();
     if w < 8 || h < 6 {
         return None;
@@ -2331,7 +2362,7 @@ fn binarize_low_contrast_foreground_from_rgb(rgb: &image::RgbImage) -> Option<Dy
     let gray = DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
     let local = local_binary_luma(&gray, false);
     if binary_foreground_is_text_like(&local) {
-        return Some(DynamicImage::ImageLuma8(local));
+        return Some(local);
     }
 
     let stretched = contrast_stretch_luma(&gray);
@@ -2340,7 +2371,7 @@ fn binarize_low_contrast_foreground_from_rgb(rgb: &image::RgbImage) -> Option<Dy
     }
     let local = local_binary_luma(&stretched, false);
     if binary_foreground_is_text_like(&local) {
-        return Some(DynamicImage::ImageLuma8(local));
+        return Some(local);
     }
     None
 }
@@ -3053,6 +3084,51 @@ fn should_use_split_lines(direct: Option<&RecCandidate>, split_lines: &[TextLine
     keeps_most_content && confidence_is_close
 }
 
+fn should_use_forced_split_lines(
+    bbox: BoxRect,
+    direct: Option<&RecCandidate>,
+    split_lines: &[TextLine],
+) -> bool {
+    if should_use_split_lines(direct, split_lines) {
+        return true;
+    }
+
+    let Some(direct) = direct else {
+        return false;
+    };
+    let direct_text = normalize_recognized_text(&direct.text);
+    if !recognized_box_needs_repair(bbox, &direct_text, direct.confidence) {
+        return false;
+    }
+
+    let split_text = split_lines
+        .iter()
+        .map(|line| line.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let split_chars = recognized_char_count(&split_text);
+    if split_chars < 4 || readable_ratio(&split_text) < 0.60 {
+        return false;
+    }
+
+    let split_confidence = split_lines.iter().map(|line| line.confidence).sum::<f32>()
+        / split_lines.len().max(1) as f32;
+    let split_quality = recognition_text_quality(&split_text, split_confidence);
+    let direct_quality = recognition_text_quality(&direct_text, direct.confidence);
+    split_quality > direct_quality + 6.0
+}
+
+fn consume_recognition_budget(
+    count: usize,
+    split_line_rec_budget: &mut usize,
+    line_repair_rec_budget: &mut usize,
+) {
+    let split_used = (*split_line_rec_budget).min(count);
+    *split_line_rec_budget = (*split_line_rec_budget).saturating_sub(split_used);
+    *line_repair_rec_budget = (*line_repair_rec_budget).saturating_sub(count - split_used);
+}
+
 fn normalize_ocr_line(line: &str) -> String {
     line.chars()
         .filter(|ch| !ch.is_whitespace())
@@ -3198,8 +3274,7 @@ fn color_region_det_candidate_boxes(
 fn color_region_det_candidate_score(image: &DynamicImage, b: BoxRect) -> usize {
     let crop = crop_box(image, b);
     let rgb = to_rgb_on_white(&crop);
-    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
-    else {
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
         return 0;
     };
     mask.into_iter().filter(|active| *active).count()
@@ -3272,6 +3347,8 @@ fn split_line_recognition_budget(source: &str) -> usize {
         MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
     } else if source.starts_with("color-region-det:") {
         MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("tile-region:") {
+        MAX_TILE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
     } else {
         0
     }
@@ -3284,6 +3361,8 @@ fn line_repair_recognition_budget(source: &str) -> usize {
         MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS
     } else if source.starts_with("color-region-det:") {
         MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("tile-region:") {
+        MAX_TILE_REGION_REPAIR_RECOGNITIONS_PER_PASS
     } else {
         0
     }
@@ -3613,8 +3692,7 @@ fn tile_text_score(image: &DynamicImage, b: BoxRect) -> usize {
             return edge_count;
         }
     }
-    foreground_mask_from_rgb(&rgb)
-        .or_else(|| dark_luma_mask_from_rgb(&rgb))
+    text_foreground_mask_from_rgb(&rgb)
         .map(|mask| mask.iter().filter(|active| **active).count())
         .unwrap_or(0)
 }
@@ -4335,7 +4413,7 @@ fn tight_rec_crop(image: &DynamicImage) -> Option<DynamicImage> {
     if w < 12 || h < 8 {
         return None;
     }
-    let mask = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))?;
+    let mask = text_foreground_mask_from_rgb(&rgb)?;
     let mut min_x = w as usize;
     let mut min_y = h as usize;
     let mut max_x = 0usize;
@@ -4715,12 +4793,23 @@ fn fallback_line_boxes(image: &DynamicImage) -> Vec<BoxRect> {
 }
 
 fn split_text_box_into_line_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRect> {
+    split_text_box_into_line_boxes_limited(image, bbox, 8)
+}
+
+fn split_text_box_into_line_boxes_limited(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
     if box_height(bbox) < 18 || box_width(bbox) < 16 {
+        return Vec::new();
+    }
+    if max_boxes < 2 {
         return Vec::new();
     }
 
     let crop = crop_box(image, bbox);
-    let local_boxes = foreground_line_boxes(&crop, 8);
+    let local_boxes = foreground_line_boxes(&crop, max_boxes);
     if local_boxes.is_empty() {
         return Vec::new();
     }
@@ -4735,6 +4824,9 @@ fn split_text_box_into_line_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<Bo
         }
     }
     if split_boxes.len() < 2 {
+        return Vec::new();
+    }
+    if split_boxes.len() > max_boxes {
         return Vec::new();
     }
 
@@ -4754,6 +4846,40 @@ fn split_text_box_into_line_boxes(image: &DynamicImage, bbox: BoxRect) -> Vec<Bo
             )
         })
         .collect()
+}
+
+fn forced_structural_split_boxes(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
+    if !large_text_box_needs_structured_split(bbox) || max_boxes < 2 {
+        return Vec::new();
+    }
+
+    let line_boxes = split_text_box_into_line_boxes_limited(image, bbox, max_boxes);
+    if line_boxes.len() >= 2 {
+        return line_boxes;
+    }
+
+    let mut color_boxes = split_text_box_into_color_region_boxes(image, bbox);
+    if color_boxes.len() >= 2 && color_boxes.len() <= max_boxes {
+        color_boxes.sort_by(reading_box_order);
+        return color_boxes;
+    }
+
+    Vec::new()
+}
+
+fn large_text_box_needs_structured_split(b: BoxRect) -> bool {
+    let w = box_width(b);
+    let h = box_height(b).max(1);
+    let aspect = w as f32 / h as f32;
+    h >= 96
+        || (w >= 560 && h >= 48)
+        || (w >= 420 && h >= 72)
+        || (aspect >= 12.0 && h >= 40)
+        || box_area(b) >= 90_000
 }
 
 fn split_text_box_vertically(
@@ -4874,7 +5000,7 @@ fn split_text_box_into_color_region_boxes(image: &DynamicImage, bbox: BoxRect) -
 fn foreground_box_outside_boxes(image: &DynamicImage, excluded: &[BoxRect]) -> Option<BoxRect> {
     let rgb = to_rgb_on_white(image);
     let (w, h) = rgb.dimensions();
-    let mask = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))?;
+    let mask = text_foreground_mask_from_rgb(&rgb)?;
 
     let mut min_x = w as usize;
     let mut min_y = h as usize;
@@ -4924,8 +5050,7 @@ fn split_line_box_horizontally(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRe
     let crop = crop_box(image, bbox);
     let rgb = to_rgb_on_white(&crop);
     let (w, h) = rgb.dimensions();
-    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
-    else {
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
         return vec![bbox];
     };
     let local_segments = column_boxes_from_foreground_mask(
@@ -4975,8 +5100,7 @@ fn wide_line_segment_boxes(
     let (w_u32, h_u32) = rgb.dimensions();
     let w = w_u32 as usize;
     let h = h_u32 as usize;
-    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
-    else {
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
         return Vec::new();
     };
     let Some((min_x, min_y, max_x, max_y, foreground_count)) =
@@ -5114,11 +5238,21 @@ fn foreground_line_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect>
     if w == 0 || h == 0 {
         return Vec::new();
     }
-    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
-    else {
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
         return Vec::new();
     };
     line_boxes_from_foreground_mask(&mask, w as usize, h as usize, max_boxes)
+}
+
+fn text_foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    foreground_mask_from_rgb(rgb)
+        .or_else(|| low_contrast_foreground_mask_from_rgb(rgb))
+        .or_else(|| dark_luma_mask_from_rgb(rgb))
+}
+
+fn low_contrast_foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    let binary = low_contrast_binary_luma_from_rgb(rgb)?;
+    Some(binary.pixels().map(|pixel| pixel[0] < 128).collect())
 }
 
 fn foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
@@ -5946,8 +6080,14 @@ mod tests {
             line_repair_recognition_budget("color-region-det:eager:1"),
             MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS
         );
-        assert_eq!(split_line_recognition_budget("tile-region:1"), 0);
-        assert_eq!(line_repair_recognition_budget("tile-region:1"), 0);
+        assert_eq!(
+            split_line_recognition_budget("tile-region:1"),
+            MAX_TILE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            line_repair_recognition_budget("tile-region:1"),
+            MAX_TILE_REGION_REPAIR_RECOGNITIONS_PER_PASS
+        );
     }
 
     #[test]
@@ -6689,6 +6829,27 @@ mod tests {
     }
 
     #[test]
+    fn foreground_line_boxes_use_low_contrast_mask() {
+        let mut rgb = image::RgbImage::from_pixel(140, 72, image::Rgb([240, 240, 240]));
+        for y in 14..20 {
+            for x in 18..112 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+        for y in 46..52 {
+            for x in 24..120 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+
+        let boxes = foreground_line_boxes(&DynamicImage::ImageRgb8(rgb), 4);
+
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[0].1 <= 14 && boxes[0].3 >= 20);
+        assert!(boxes[1].1 <= 46 && boxes[1].3 >= 52);
+    }
+
+    #[test]
     fn split_text_box_into_line_boxes_splits_two_rows() {
         let mut rgb = image::RgbImage::from_pixel(96, 48, image::Rgb([255, 255, 255]));
         for y in 8..14 {
@@ -6706,6 +6867,40 @@ mod tests {
         assert_eq!(boxes.len(), 2);
         assert!(boxes[0].1 <= 8 && boxes[0].3 >= 14);
         assert!(boxes[1].1 <= 30 && boxes[1].3 >= 36);
+    }
+
+    #[test]
+    fn forced_structural_split_boxes_split_large_low_contrast_panel() {
+        let mut rgb = image::RgbImage::from_pixel(320, 140, image::Rgb([240, 240, 240]));
+        for y in 24..31 {
+            for x in 28..250 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+        for y in 66..73 {
+            for x in 32..280 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+        for y in 106..113 {
+            for x in 30..210 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+
+        let boxes =
+            forced_structural_split_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 320, 140), 6);
+
+        assert_eq!(boxes.len(), 3);
+        assert!(boxes[0].1 <= 24 && boxes[0].3 >= 31);
+        assert!(boxes[1].1 <= 66 && boxes[1].3 >= 73);
+        assert!(boxes[2].1 <= 106 && boxes[2].3 >= 113);
+    }
+
+    #[test]
+    fn forced_structural_split_skips_regular_single_line_box() {
+        assert!(!large_text_box_needs_structured_split((0, 0, 640, 35)));
+        assert!(large_text_box_needs_structured_split((0, 0, 640, 140)));
     }
 
     #[test]
