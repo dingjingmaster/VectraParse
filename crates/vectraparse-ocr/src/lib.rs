@@ -14,6 +14,7 @@ const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
 const MAX_COLOR_REGION_CANDIDATES: usize = 48;
 const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
+const MAX_EAGER_COLOR_REGION_DET_PASSES: usize = 4;
 const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
 const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
@@ -21,6 +22,8 @@ const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
 const MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS: usize = 8;
 const MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
+const MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 3;
+const MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS: usize = 3;
 const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 4;
@@ -357,6 +360,30 @@ impl OrtOcrEngine {
             &candidate,
         );
 
+        let (det_color_region_count, det_pass_count, candidate) = self
+            .recognize_uncovered_color_region_detections(
+                img,
+                cfg,
+                &regions,
+                MAX_EAGER_COLOR_REGION_DET_PASSES,
+                "color-region-det:eager",
+            );
+        color_region_count = color_region_count.max(det_color_region_count);
+        if det_pass_count > 0 {
+            trace.det_pass_count += det_pass_count;
+            maybe_adopt_recognized(
+                &mut text,
+                &mut confidence,
+                &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
+                &mut regions,
+                &mut fallback,
+                "color-region-det:eager".to_string(),
+                &candidate,
+            );
+        }
+
         if should_use_uncovered_visual_supplement(img, cfg, det_box_count, line_count, &regions) {
             let visual_candidate = self.recognize_uncovered_visual_regions(
                 img,
@@ -476,7 +503,9 @@ impl OrtOcrEngine {
         source: &str,
         transform: BboxTransform,
     ) -> Result<DetectedText, String> {
-        let boxes = self.detect_text_boxes(img, cfg, source == "det")?;
+        let include_raw_split_candidates =
+            source == "det" || source.starts_with("color-region-det:");
+        let boxes = self.detect_text_boxes(img, cfg, include_raw_split_candidates)?;
         let trace_enabled = ocr_trace_enabled();
         if trace_enabled {
             eprintln!(
@@ -1194,6 +1223,52 @@ impl OrtOcrEngine {
             }
         }
         (boxes.len(), recognized_from_text_lines(&mut lines))
+    }
+
+    fn recognize_uncovered_color_region_detections(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        existing_regions: &[OcrTextRegion],
+        recognition_limit: usize,
+        source: &str,
+    ) -> (usize, usize, RecognizedText) {
+        let (candidate_count, boxes) =
+            color_region_det_candidate_boxes(img, existing_regions, recognition_limit);
+        if boxes.is_empty() {
+            return (candidate_count, 0, RecognizedText::default());
+        }
+
+        let (img_w, img_h) = img.dimensions();
+        let mut lines = Vec::new();
+        let mut det_pass_count = 0usize;
+        for (idx, b) in boxes.iter().enumerate() {
+            let crop = crop_box(img, *b);
+            let source = format!("{source}:{}", idx + 1);
+            det_pass_count += 1;
+            if let Ok(detected) = self.recognize_detected_text(
+                &crop,
+                cfg,
+                false,
+                &source,
+                BboxTransform::Offset {
+                    dx: b.0,
+                    dy: b.1,
+                    max_w: img_w,
+                    max_h: img_h,
+                },
+            ) {
+                let supplement =
+                    filter_color_region_det_supplement(&detected.recognized, existing_regions);
+                lines.extend(text_lines_from_recognized(&supplement));
+            }
+        }
+
+        (
+            candidate_count,
+            det_pass_count,
+            recognized_from_text_lines(&mut lines),
+        )
     }
 
     fn recognize_uncovered_visual_regions(
@@ -2487,6 +2562,42 @@ fn filter_page_region_supplement(
             if !is_strong_page_region_supplement(line) {
                 continue;
             }
+            if !existing_keys.is_empty()
+                && page_region_line_is_existing_fragment(&line.text, &existing_keys)
+            {
+                continue;
+            }
+            let bbox = box_from_array(line.bbox);
+            if existing_boxes
+                .iter()
+                .any(|existing| boxes_significantly_overlap(bbox, *existing))
+            {
+                continue;
+            }
+            lines.push(TextLine {
+                bbox,
+                text: line.text.clone(),
+                confidence: line.confidence,
+                source: line.source.clone(),
+            });
+        }
+    }
+
+    recognized_from_text_lines(&mut lines)
+}
+
+fn filter_color_region_det_supplement(
+    candidate: &RecognizedText,
+    existing_regions: &[OcrTextRegion],
+) -> RecognizedText {
+    let existing_boxes = collect_region_line_boxes(existing_regions);
+    let existing_keys = collect_region_text_keys(existing_regions);
+    let mut lines = Vec::new();
+    for region in &candidate.regions {
+        for line in &region.lines {
+            if !is_strong_page_region_supplement(line) {
+                continue;
+            }
             if page_region_line_is_existing_fragment(&line.text, &existing_keys) {
                 continue;
             }
@@ -2998,6 +3109,79 @@ fn recognition_text_quality(text: &str, confidence: f32) -> f32 {
         - dominant_char_ratio(text) * 5.0
 }
 
+fn color_region_det_candidate_boxes(
+    image: &DynamicImage,
+    existing_regions: &[OcrTextRegion],
+    max_boxes: usize,
+) -> (usize, Vec<BoxRect>) {
+    let boxes = color_region_boxes(image);
+    let total = boxes.len();
+    if max_boxes == 0 || boxes.is_empty() {
+        return (total, Vec::new());
+    }
+
+    let mut scored = boxes
+        .into_iter()
+        .filter(|b| box_width(*b) >= 48 && box_height(*b) >= 16)
+        .filter(|b| !color_region_det_box_covered_by_reliable_text(*b, existing_regions))
+        .filter_map(|b| {
+            let score = color_region_det_candidate_score(image, b);
+            if score >= 4 { Some((b, score)) } else { None }
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    scored.truncate(max_boxes);
+    scored.sort_by(|a, b| reading_box_order(&a.0, &b.0));
+    (total, scored.into_iter().map(|(b, _)| b).collect())
+}
+
+fn color_region_det_candidate_score(image: &DynamicImage, b: BoxRect) -> usize {
+    let crop = crop_box(image, b);
+    let rgb = to_rgb_on_white(&crop);
+    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
+    else {
+        return 0;
+    };
+    mask.into_iter().filter(|active| *active).count()
+}
+
+fn color_region_det_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
+    let mut reliable_count = 0usize;
+    let mut max_line_h = 0u32;
+    let mut max_line_w = 0u32;
+    for region in regions {
+        if region.lines.is_empty() {
+            let line_box = box_from_array(region.bbox);
+            if boxes_significantly_overlap(b, line_box)
+                && !recognized_box_needs_repair(line_box, &region.text, region.confidence)
+            {
+                reliable_count += 1;
+                max_line_h = max_line_h.max(box_height(line_box));
+                max_line_w = max_line_w.max(box_width(line_box));
+            }
+            continue;
+        }
+
+        for line in &region.lines {
+            let line_box = box_from_array(line.bbox);
+            if boxes_significantly_overlap(b, line_box)
+                && !recognized_box_needs_repair(line_box, &line.text, line.confidence)
+            {
+                reliable_count += 1;
+                max_line_h = max_line_h.max(box_height(line_box));
+                max_line_w = max_line_w.max(box_width(line_box));
+            }
+        }
+    }
+    if reliable_count == 0 {
+        return false;
+    }
+
+    let line_like_h = max_line_h.saturating_mul(3).max(36);
+    let line_like_w = max_line_w.saturating_mul(4).max(160);
+    box_height(b) <= line_like_h && box_width(b) <= line_like_w
+}
+
 fn color_region_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
     for region in regions {
         if region.lines.is_empty() {
@@ -3026,6 +3210,8 @@ fn split_line_recognition_budget(source: &str) -> usize {
         MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS
     } else if source.starts_with("page-region:") {
         MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("color-region-det:") {
+        MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS
     } else {
         0
     }
@@ -3036,6 +3222,8 @@ fn line_repair_recognition_budget(source: &str) -> usize {
         MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
     } else if source.starts_with("page-region:") {
         MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS
+    } else if source.starts_with("color-region-det:") {
+        MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS
     } else {
         0
     }
@@ -5628,6 +5816,51 @@ mod tests {
     }
 
     #[test]
+    fn color_region_det_candidates_keep_large_partially_covered_panel() {
+        let mut rgb = image::RgbImage::from_pixel(320, 160, image::Rgb([255, 255, 255]));
+        fill_rect(&mut rgb, (20, 20, 220, 120), image::Rgb([232, 239, 248]));
+        draw_synthetic_text_texture_at(&mut rgb, 34, 150, 34, 4);
+        draw_synthetic_text_texture_at(&mut rgb, 34, 180, 82, 4);
+        let existing = vec![ocr_region_with_line(
+            [30, 32, 152, 54],
+            "Alpha Beta",
+            0.88,
+            "det",
+        )];
+
+        let (_, boxes) =
+            color_region_det_candidate_boxes(&DynamicImage::ImageRgb8(rgb), &existing, 16);
+
+        assert!(
+            boxes
+                .iter()
+                .any(|b| b.0 <= 24 && b.1 <= 24 && b.2 >= 216 && b.3 >= 116)
+        );
+    }
+
+    #[test]
+    fn color_region_det_candidates_skip_covered_line_like_panel() {
+        let mut rgb = image::RgbImage::from_pixel(240, 100, image::Rgb([255, 255, 255]));
+        fill_rect(&mut rgb, (20, 30, 200, 58), image::Rgb([232, 239, 248]));
+        draw_synthetic_text_texture_at(&mut rgb, 34, 150, 36, 4);
+        let existing = vec![ocr_region_with_line(
+            [30, 32, 152, 56],
+            "Alpha Beta",
+            0.88,
+            "det",
+        )];
+
+        let (_, boxes) =
+            color_region_det_candidate_boxes(&DynamicImage::ImageRgb8(rgb), &existing, 16);
+
+        assert!(
+            boxes
+                .iter()
+                .all(|b| !(b.0 <= 24 && b.1 <= 34 && b.2 >= 196 && b.3 >= 54))
+        );
+    }
+
+    #[test]
     fn page_region_sources_get_local_repair_budgets() {
         assert_eq!(
             split_line_recognition_budget("det"),
@@ -5644,6 +5877,14 @@ mod tests {
         assert_eq!(
             line_repair_recognition_budget("page-region:1"),
             MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            split_line_recognition_budget("color-region-det:eager:1"),
+            MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS
+        );
+        assert_eq!(
+            line_repair_recognition_budget("color-region-det:eager:1"),
+            MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS
         );
         assert_eq!(split_line_recognition_budget("tile-region:1"), 0);
         assert_eq!(line_repair_recognition_budget("tile-region:1"), 0);
@@ -6531,10 +6772,38 @@ mod tests {
         }
     }
 
+    fn ocr_region_with_line(
+        bbox: [u32; 4],
+        text: &str,
+        confidence: f32,
+        source: &str,
+    ) -> OcrTextRegion {
+        OcrTextRegion {
+            bbox,
+            text: text.to_string(),
+            confidence,
+            source: source.to_string(),
+            lines: vec![OcrTextLine {
+                bbox,
+                text: text.to_string(),
+                confidence,
+                source: source.to_string(),
+            }],
+        }
+    }
+
     fn detection_box(bbox: BoxRect) -> DetectionBox {
         DetectionBox {
             bbox,
             alternatives: Vec::new(),
+        }
+    }
+
+    fn fill_rect(rgb: &mut image::RgbImage, b: BoxRect, color: image::Rgb<u8>) {
+        for y in b.1..b.3.min(rgb.height()) {
+            for x in b.0..b.2.min(rgb.width()) {
+                rgb.put_pixel(x, y, color);
+            }
         }
     }
 
