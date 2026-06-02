@@ -33,6 +33,8 @@ const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 4;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
 const MAX_LOCAL_DET_UPSCALE_PASSES_PER_REGION: usize = 1;
+const CTC_BEAM_SIZE: usize = 4;
+const CTC_TOP_K: usize = 4;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
 
@@ -190,7 +192,27 @@ struct TextLine {
     bbox: BoxRect,
     text: String,
     confidence: f32,
+    avg_margin: f32,
+    min_margin: f32,
     source: String,
+}
+
+fn make_text_line(
+    bbox: BoxRect,
+    text: String,
+    confidence: f32,
+    avg_margin: f32,
+    min_margin: f32,
+    source: String,
+) -> TextLine {
+    TextLine {
+        bbox,
+        text,
+        confidence,
+        avg_margin,
+        min_margin,
+        source,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -856,12 +878,35 @@ impl OrtOcrEngine {
             }
         }
 
+        let forced_budget = (*split_line_rec_budget)
+            .saturating_add(*line_repair_rec_budget)
+            .min(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS + MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS);
+        if large_text_box_should_prioritize_split(b) && forced_budget >= 2 {
+            let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
+            if forced_boxes.len() >= 2 {
+                let forced_source = format!("{source}:forced");
+                let split_lines = self.recognize_split_line_boxes(
+                    img,
+                    cfg,
+                    &forced_boxes,
+                    &forced_source,
+                    transform,
+                );
+                if structured_split_lines_are_plausible(b, &split_lines) {
+                    consume_recognition_budget(
+                        forced_boxes.len(),
+                        split_line_rec_budget,
+                        line_repair_rec_budget,
+                    );
+                    lines.extend(split_lines);
+                    return;
+                }
+            }
+        }
+
         let direct_crop = crop_box(img, b);
         let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
         if large_text_box_needs_structured_split(b) {
-            let forced_budget = (*split_line_rec_budget)
-                .saturating_add(*line_repair_rec_budget)
-                .min(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS + MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS);
             let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
             if forced_boxes.len() >= 2 {
                 let forced_source = format!("{source}:forced");
@@ -983,7 +1028,7 @@ impl OrtOcrEngine {
             return None;
         }
         let segment_limit = (*line_repair_rec_budget).min(MAX_WIDE_LINE_SEGMENTS_PER_LINE);
-        let segment_boxes = wide_line_segment_boxes(img, b, segment_limit);
+        let segment_boxes = wide_line_recognition_boxes(img, b, segment_limit);
         if segment_boxes.len() < 2 {
             return None;
         }
@@ -1489,12 +1534,14 @@ impl OrtOcrEngine {
         for b in boxes.iter().take(recognition_limit) {
             let crop = crop_box(img, *b);
             if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg) {
-                lines.push(TextLine {
-                    bbox: *b,
-                    text: normalize_recognized_text(&candidate.text),
-                    confidence: candidate.confidence,
-                    source: source.to_string(),
-                });
+                lines.push(make_text_line(
+                    *b,
+                    normalize_recognized_text(&candidate.text),
+                    candidate.confidence,
+                    candidate.avg_margin,
+                    candidate.min_margin,
+                    source.to_string(),
+                ));
             }
         }
         (raw_boxes.len(), recognized_from_text_lines(&mut lines))
@@ -1674,12 +1721,14 @@ impl OrtOcrEngine {
             if let Ok(candidate) = self.recognize_best(&line, cfg)
                 && is_usable_recognition(&candidate)
             {
-                lines.push(TextLine {
-                    bbox: line_box,
-                    text: normalize_recognized_text(&candidate.text),
-                    confidence: candidate.confidence,
-                    source: "line-crops".to_string(),
-                });
+                lines.push(make_text_line(
+                    line_box,
+                    normalize_recognized_text(&candidate.text),
+                    candidate.confidence,
+                    candidate.avg_margin,
+                    candidate.min_margin,
+                    "line-crops".to_string(),
+                ));
             }
         }
         recognized_from_text_lines(&mut lines)
@@ -1787,8 +1836,7 @@ impl OrtOcrEngine {
         let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
         let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
         let logits = &output[0];
-        let (text, confidence, stats) =
-            ctc_greedy_decode_with_stats(logits, &out_shapes[0], alphabet);
+        let (text, confidence, stats) = ctc_decode_with_stats(logits, &out_shapes[0], alphabet);
         Ok(RecCandidate {
             text,
             confidence,
@@ -1819,7 +1867,11 @@ fn recognized_from_text_lines_with_context(
     let deduped = dedupe_text_lines(lines);
     let filtered = filter_low_value_text_lines(&deduped);
     let rgb = image.map(to_rgb_on_white);
-    let mut regions = group_text_lines_into_regions(&filtered, rgb.as_ref());
+    let mut regions = if let Some(rgb) = rgb.as_ref() {
+        group_text_lines_into_panel_regions(&filtered, rgb)
+    } else {
+        group_text_lines_into_regions(&filtered, None)
+    };
     regions.sort_by(reading_region_order);
 
     let mut blocks = Vec::new();
@@ -1916,12 +1968,14 @@ fn candidate_text_lines(
     }
 
     if parts.len() == 1 {
-        return vec![TextLine {
-            bbox: transform.map_box(bbox),
+        return vec![make_text_line(
+            transform.map_box(bbox),
             text,
-            confidence: candidate.confidence,
-            source: source.to_string(),
-        }];
+            candidate.confidence,
+            candidate.avg_margin,
+            candidate.min_margin,
+            source.to_string(),
+        )];
     }
 
     let line_boxes = split_recognized_multiline_box(img, bbox, parts.len());
@@ -1929,11 +1983,15 @@ fn candidate_text_lines(
     parts
         .into_iter()
         .zip(line_boxes)
-        .map(|(part, line_box)| TextLine {
-            bbox: transform.map_box(line_box),
-            text: part.to_string(),
-            confidence: candidate.confidence,
-            source: source.clone(),
+        .map(|(part, line_box)| {
+            make_text_line(
+                transform.map_box(line_box),
+                part.to_string(),
+                candidate.confidence,
+                candidate.avg_margin,
+                candidate.min_margin,
+                source.clone(),
+            )
         })
         .collect()
 }
@@ -2248,21 +2306,25 @@ fn text_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<TextLine> {
     let mut lines = Vec::new();
     for region in regions {
         if region.lines.is_empty() {
-            lines.push(TextLine {
-                bbox: box_from_array(region.bbox),
-                text: region.text.clone(),
-                confidence: region.confidence,
-                source: region.source.clone(),
-            });
+            lines.push(make_text_line(
+                box_from_array(region.bbox),
+                region.text.clone(),
+                region.confidence,
+                0.0,
+                0.0,
+                region.source.clone(),
+            ));
             continue;
         }
         for line in &region.lines {
-            lines.push(TextLine {
-                bbox: box_from_array(line.bbox),
-                text: line.text.clone(),
-                confidence: line.confidence,
-                source: line.source.clone(),
-            });
+            lines.push(make_text_line(
+                box_from_array(line.bbox),
+                line.text.clone(),
+                line.confidence,
+                0.0,
+                0.0,
+                line.source.clone(),
+            ));
         }
     }
     lines
@@ -2304,6 +2366,57 @@ fn group_text_lines_into_regions(
         }
     }
     merge_layout_regions(regions, rgb)
+}
+
+fn group_text_lines_into_panel_regions(
+    lines: &[TextLine],
+    rgb: &image::RgbImage,
+) -> Vec<LayoutRegion> {
+    let panels = visual_page_region_boxes(&DynamicImage::ImageRgb8(rgb.clone()));
+    if panels.len() < 2 {
+        return group_text_lines_into_regions(lines, Some(rgb));
+    }
+
+    let mut panel_lines = vec![Vec::<TextLine>::new(); panels.len()];
+    let mut unassigned = Vec::new();
+    for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
+        if let Some(idx) = best_panel_for_line(line.bbox, &panels) {
+            panel_lines[idx].push(line.clone());
+        } else {
+            unassigned.push(line.clone());
+        }
+    }
+
+    let mut regions = Vec::new();
+    for mut bucket in panel_lines {
+        if bucket.is_empty() {
+            continue;
+        }
+        bucket.sort_by(reading_line_order);
+        regions.extend(group_text_lines_into_regions(&bucket, Some(rgb)));
+    }
+    if !unassigned.is_empty() {
+        unassigned.sort_by(reading_line_order);
+        regions.extend(group_text_lines_into_regions(&unassigned, Some(rgb)));
+    }
+    regions
+}
+
+fn best_panel_for_line(line: BoxRect, panels: &[BoxRect]) -> Option<usize> {
+    let line_area = box_area(line).max(1) as f32;
+    let center = (box_center_x(line) as u32, (line.1 + line.3) / 2);
+    let mut best = None;
+    let mut best_score = 0.0f32;
+    for (idx, panel) in panels.iter().enumerate() {
+        let overlap = box_intersection_area(line, *panel) as f32 / line_area;
+        let contains_center = point_in_box(center.0, center.1, *panel);
+        let score = overlap + if contains_center { 0.35 } else { 0.0 };
+        if score > best_score {
+            best = Some(idx);
+            best_score = score;
+        }
+    }
+    if best_score >= 0.55 { best } else { None }
 }
 
 fn merge_layout_regions(
@@ -3174,12 +3287,14 @@ fn filter_non_overlapping_recognized(
             {
                 continue;
             }
-            lines.push(TextLine {
+            lines.push(make_text_line(
                 bbox,
-                text: line.text.clone(),
-                confidence: line.confidence,
-                source: line.source.clone(),
-            });
+                line.text.clone(),
+                line.confidence,
+                0.0,
+                0.0,
+                line.source.clone(),
+            ));
         }
     }
 
@@ -3214,12 +3329,14 @@ fn filter_page_region_supplement(
             {
                 continue;
             }
-            lines.push(TextLine {
+            lines.push(make_text_line(
                 bbox,
-                text: line.text.clone(),
-                confidence: line.confidence,
-                source: line.source.clone(),
-            });
+                line.text.clone(),
+                line.confidence,
+                0.0,
+                0.0,
+                line.source.clone(),
+            ));
         }
     }
 
@@ -3248,12 +3365,14 @@ fn filter_color_region_det_supplement(
             {
                 continue;
             }
-            lines.push(TextLine {
+            lines.push(make_text_line(
                 bbox,
-                text: line.text.clone(),
-                confidence: line.confidence,
-                source: line.source.clone(),
-            });
+                line.text.clone(),
+                line.confidence,
+                0.0,
+                0.0,
+                line.source.clone(),
+            ));
         }
     }
 
@@ -3451,6 +3570,8 @@ fn text_line_quality(line: &TextLine) -> f32 {
     let text = line.text.trim();
     let chars = recognized_char_count(text) as f32;
     line.confidence * 100.0
+        + line.avg_margin.clamp(0.0, 1.0) * 8.0
+        + line.min_margin.clamp(0.0, 1.0) * 3.0
         + readable_ratio(text) * 12.0
         + chars.min(32.0) * 0.35
         + source_quality_bonus(&line.source)
@@ -3522,9 +3643,44 @@ fn filter_low_value_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
     }
     lines
         .iter()
-        .filter(|line| !is_low_value_short_ocr_line(&line.text))
+        .filter(|line| !is_low_value_text_line(line, lines.len()))
         .cloned()
         .collect()
+}
+
+fn is_low_value_text_line(line: &TextLine, total_lines: usize) -> bool {
+    let text = line.text.trim();
+    if is_low_value_short_ocr_line(text) {
+        return true;
+    }
+    if total_lines < 10 {
+        return false;
+    }
+    if line.confidence < 0.68 && is_low_value_ascii_noise(text) {
+        return true;
+    }
+    let has_margin = line.avg_margin > 0.0 || line.min_margin > 0.0;
+    has_margin && line.confidence < 0.72 && line.avg_margin < 0.025 && readable_ratio(text) < 0.75
+}
+
+fn is_low_value_ascii_noise(text: &str) -> bool {
+    let chars = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    if chars.len() < 3 || chars.len() > 18 {
+        return false;
+    }
+    if !chars.iter().all(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    let uppercase_after_first = chars
+        .iter()
+        .skip(1)
+        .filter(|ch| ch.is_ascii_uppercase())
+        .count();
+    let lowercase = chars.iter().filter(|ch| ch.is_ascii_lowercase()).count();
+    chars.len() <= 3 || (uppercase_after_first > 0 && lowercase > 0)
 }
 
 fn is_low_value_short_ocr_line(text: &str) -> bool {
@@ -3875,12 +4031,32 @@ fn join_segment_recognition_text(segments: &[RecCandidate]) -> String {
         if text.is_empty() {
             continue;
         }
+        if let Some(overlap) = segment_text_overlap(&out, text) {
+            out.push_str(&text.chars().skip(overlap).collect::<String>());
+            continue;
+        }
         if should_insert_segment_space(&out, text) {
             out.push(' ');
         }
         out.push_str(text);
     }
     out
+}
+
+fn segment_text_overlap(left: &str, right: &str) -> Option<usize> {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let max_overlap = left_chars.len().min(right_chars.len()).min(12);
+    for len in (2..=max_overlap).rev() {
+        let left_tail = left_chars[left_chars.len() - len..]
+            .iter()
+            .collect::<String>();
+        let right_head = right_chars[..len].iter().collect::<String>();
+        if normalize_ocr_line(&left_tail) == normalize_ocr_line(&right_head) {
+            return Some(len);
+        }
+    }
+    None
 }
 
 fn should_insert_segment_space(left: &str, right: &str) -> bool {
@@ -4007,6 +4183,16 @@ fn layered_text_boxes_in_panel(
         .map(|b| offset_local_box(panel, b, img_w, img_h))
         .filter(|b| layered_text_line_box_is_plausible(panel, *b))
         .collect::<Vec<_>>();
+    if boxes.len() < max_boxes {
+        let remaining = max_boxes.saturating_sub(boxes.len());
+        boxes.extend(
+            foreground_component_text_boxes(&crop, remaining)
+                .into_iter()
+                .map(|b| offset_local_box(panel, b, img_w, img_h))
+                .filter(|b| layered_text_line_box_is_plausible(panel, *b)),
+        );
+        boxes = nms_boxes(boxes, 0.60);
+    }
 
     if depth < 2 && boxes.len() < max_boxes {
         let crop_area = box_area(image_box(&crop)).max(1);
@@ -4057,6 +4243,112 @@ fn layered_text_line_box_is_plausible(panel: BoxRect, b: BoxRect) -> bool {
         return false;
     }
     box_height(b).saturating_mul(100) <= box_height(panel).max(1).saturating_mul(75)
+}
+
+fn foreground_component_text_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect> {
+    if max_boxes == 0 {
+        return Vec::new();
+    }
+    let rgb = to_rgb_on_white(image);
+    let (w_u32, h_u32) = rgb.dimensions();
+    let w = w_u32 as usize;
+    let h = h_u32 as usize;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
+        return Vec::new();
+    };
+    let mut visited = vec![false; mask.len()];
+    let mut components = Vec::new();
+    for idx in 0..mask.len() {
+        if visited[idx] || !mask[idx] {
+            continue;
+        }
+        let mut stack = vec![idx];
+        visited[idx] = true;
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut count = 0usize;
+        while let Some(cur) = stack.pop() {
+            let x = cur % w;
+            let y = cur / w;
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let nidx = ny * w + nx;
+                if visited[nidx] || !mask[nidx] {
+                    continue;
+                }
+                visited[nidx] = true;
+                stack.push(nidx);
+            }
+        }
+        if count < 3 || max_x <= min_x || max_y <= min_y {
+            continue;
+        }
+        let b = (
+            min_x.saturating_sub(1) as u32,
+            min_y.saturating_sub(1) as u32,
+            (max_x + 2).min(w) as u32,
+            (max_y + 2).min(h) as u32,
+        );
+        if component_box_is_text_like(b, count) {
+            components.push(b);
+        }
+    }
+    let mut merged = merge_component_boxes_into_lines(components);
+    merged.retain(|b| box_width(*b) >= 8 && box_height(*b) >= 4);
+    merged.sort_by(reading_box_order);
+    merged.truncate(max_boxes);
+    merged
+}
+
+fn component_box_is_text_like(b: BoxRect, foreground_count: usize) -> bool {
+    let w = box_width(b);
+    let h = box_height(b);
+    if w < 2 || h < 2 {
+        return false;
+    }
+    if w > 220 || h > 96 {
+        return false;
+    }
+    let area = box_area(b).max(1);
+    let density = foreground_count as f32 / area as f32;
+    (0.04..=0.80).contains(&density) && w.saturating_mul(6) >= h && h.saturating_mul(20) >= w
+}
+
+fn merge_component_boxes_into_lines(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
+    boxes.sort_by(reading_box_order);
+    let mut merged: Vec<BoxRect> = Vec::new();
+    for b in boxes {
+        if let Some(last) = merged.last_mut() {
+            let y_overlap = vertical_overlap(*last, b);
+            let min_h = box_height(*last).min(box_height(b)).max(1);
+            let gap = horizontal_gap(*last, b);
+            if y_overlap.saturating_mul(100) >= min_h.saturating_mul(35)
+                && gap <= min_h.saturating_mul(3).max(12)
+            {
+                *last = union_box(*last, b);
+                continue;
+            }
+        }
+        merged.push(b);
+    }
+    merged
 }
 
 fn color_region_det_candidate_boxes(
@@ -6045,6 +6337,47 @@ fn large_text_box_needs_structured_split(b: BoxRect) -> bool {
         || box_area(b) >= 90_000
 }
 
+fn large_text_box_should_prioritize_split(b: BoxRect) -> bool {
+    let w = box_width(b);
+    let h = box_height(b).max(1);
+    let aspect = w as f32 / h as f32;
+    h >= 180 || box_area(b) >= 180_000 || (w >= 760 && h >= 72) || (aspect >= 18.0 && h >= 48)
+}
+
+fn structured_split_lines_are_plausible(b: BoxRect, split_lines: &[TextLine]) -> bool {
+    if split_lines.len() < 2 {
+        return false;
+    }
+    let split_text = split_lines
+        .iter()
+        .map(|line| line.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chars = recognized_char_count(&split_text);
+    if chars < split_lines.len().saturating_mul(2).max(6) {
+        return false;
+    }
+    let avg_confidence = split_lines.iter().map(|line| line.confidence).sum::<f32>()
+        / split_lines.len().max(1) as f32;
+    let avg_margin = split_lines.iter().map(|line| line.avg_margin).sum::<f32>()
+        / split_lines.len().max(1) as f32;
+    let margin_known = split_lines
+        .iter()
+        .any(|line| line.avg_margin > 0.0 || line.min_margin > 0.0);
+    let readable = readable_ratio(&split_text);
+    let covers_vertical_space = split_lines
+        .iter()
+        .map(|line| box_height(line.bbox) as u64)
+        .sum::<u64>()
+        .saturating_mul(100)
+        >= box_height(b).max(1) as u64 * 8;
+    readable >= 0.58
+        && avg_confidence >= 0.42
+        && (!margin_known || avg_margin >= 0.015)
+        && covers_vertical_space
+}
+
 fn split_text_box_vertically(
     image: &DynamicImage,
     bbox: BoxRect,
@@ -6243,6 +6576,18 @@ fn split_line_box_horizontally(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRe
         .collect()
 }
 
+fn wide_line_recognition_boxes(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_segments: usize,
+) -> Vec<BoxRect> {
+    let boxes = wide_line_segment_boxes(image, bbox, max_segments);
+    if boxes.len() >= 2 {
+        return boxes;
+    }
+    wide_line_sliding_window_boxes(image, bbox, max_segments)
+}
+
 fn wide_line_segment_boxes(
     image: &DynamicImage,
     bbox: BoxRect,
@@ -6362,6 +6707,78 @@ fn wide_line_segment_boxes(
             )
         })
         .collect()
+}
+
+fn wide_line_sliding_window_boxes(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_segments: usize,
+) -> Vec<BoxRect> {
+    if max_segments < 2 {
+        return Vec::new();
+    }
+    let bbox_w = box_width(bbox);
+    let bbox_h = box_height(bbox).max(1);
+    let aspect = bbox_w as f32 / bbox_h as f32;
+    if bbox_w < 720 && aspect < 18.0 {
+        return Vec::new();
+    }
+
+    let crop = crop_box(image, bbox);
+    let rgb = to_rgb_on_white(&crop);
+    let (w_u32, h_u32) = rgb.dimensions();
+    let w = w_u32 as usize;
+    let h = h_u32 as usize;
+    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
+        return Vec::new();
+    };
+    let Some((min_x, min_y, max_x, max_y, foreground_count)) =
+        foreground_bounds_from_mask(&mask, w, h)
+    else {
+        return Vec::new();
+    };
+    let text_w = max_x.saturating_sub(min_x).saturating_add(1);
+    let text_h = max_y.saturating_sub(min_y).saturating_add(1);
+    if foreground_count < 16 || text_w < 560 || text_h < 6 {
+        return Vec::new();
+    }
+
+    let target_window_w = (text_h.saturating_mul(15)).clamp(240, 420);
+    let segment_count = text_w.div_ceil(target_window_w).clamp(2, max_segments);
+    let overlap = (text_h.saturating_mul(2)).clamp(24, 64);
+    let (img_w, img_h) = image.dimensions();
+    let y_pad = (text_h / 4).clamp(1, 5);
+    let x_pad = (text_h / 3).clamp(2, 8);
+
+    let mut boxes = Vec::new();
+    for idx in 0..segment_count {
+        let start = min_x.saturating_add((text_w.saturating_mul(idx)) / segment_count);
+        let end = min_x.saturating_add((text_w.saturating_mul(idx + 1)) / segment_count);
+        let x0 = if idx == 0 {
+            start.saturating_sub(x_pad)
+        } else {
+            start.saturating_sub(overlap)
+        };
+        let x1 = if idx + 1 == segment_count {
+            end.saturating_add(x_pad)
+        } else {
+            end.saturating_add(overlap)
+        };
+        boxes.push(clamp_box(
+            (
+                bbox.0.saturating_add(x0.min(w) as u32),
+                bbox.1.saturating_add(min_y.saturating_sub(y_pad) as u32),
+                bbox.0.saturating_add(x1.min(w) as u32),
+                bbox.1
+                    .saturating_add(max_y.saturating_add(1).saturating_add(y_pad).min(h) as u32),
+            ),
+            img_w,
+            img_h,
+        ));
+    }
+
+    boxes.retain(|b| box_width(*b) >= text_h.saturating_mul(4).max(48) as u32);
+    if boxes.len() >= 2 { boxes } else { Vec::new() }
 }
 
 fn foreground_bounds_from_mask(
@@ -6668,13 +7085,42 @@ fn column_boxes_from_foreground_mask(
     boxes
 }
 
+fn ctc_decode_with_stats(
+    logits: &[f32],
+    out_shape: &[usize],
+    alphabet: &[String],
+) -> (String, f32, CtcDecodeStats) {
+    let greedy = ctc_greedy_decode_with_stats(logits, out_shape, alphabet);
+    let Some(beam) = ctc_path_beam_decode_with_stats(logits, out_shape, alphabet) else {
+        return greedy;
+    };
+    if beam.0 == greedy.0 {
+        return greedy;
+    }
+    let greedy_quality = recognition_text_quality_with_margin(
+        &greedy.0,
+        greedy.1,
+        greedy.2.avg_margin,
+        greedy.2.min_margin,
+    );
+    let beam_quality =
+        recognition_text_quality_with_margin(&beam.0, beam.1, beam.2.avg_margin, beam.2.min_margin);
+    if greedy.0.trim().is_empty()
+        || (beam_quality > greedy_quality + 5.0 && beam.1 + 0.04 >= greedy.1)
+    {
+        beam
+    } else {
+        greedy
+    }
+}
+
 fn ctc_greedy_decode_with_stats(
     logits: &[f32],
     out_shape: &[usize],
     alphabet: &[String],
 ) -> (String, f32, CtcDecodeStats) {
     let shape = g_outer_shape(logits, out_shape);
-    if shape.len() < 2 {
+    if shape.len() < 3 {
         return (String::new(), 0.0, CtcDecodeStats::default());
     }
 
@@ -6750,6 +7196,229 @@ fn ctc_greedy_decode_with_stats(
     (text, confidence, stats)
 }
 
+#[derive(Clone)]
+struct CtcPath {
+    ids: Vec<usize>,
+    score: f32,
+}
+
+fn ctc_path_beam_decode_with_stats(
+    logits: &[f32],
+    out_shape: &[usize],
+    alphabet: &[String],
+) -> Option<(String, f32, CtcDecodeStats)> {
+    let shape = g_outer_shape(logits, out_shape);
+    if shape.len() < 3 {
+        return None;
+    }
+    let (steps, classes, channel_first) = if shape[1] > shape[2] {
+        (shape[2], shape[1], true)
+    } else {
+        (shape[1], shape[2], false)
+    };
+    if steps == 0 || classes <= 1 {
+        return None;
+    }
+
+    let mut beams = vec![CtcPath {
+        ids: Vec::new(),
+        score: 0.0,
+    }];
+    for t in 0..steps {
+        let top = ctc_top_classes(logits, t, steps, classes, channel_first, CTC_TOP_K);
+        let mut next = Vec::with_capacity(beams.len().saturating_mul(top.len()));
+        for beam in &beams {
+            for &(class_id, value) in &top {
+                let mut ids = beam.ids.clone();
+                ids.push(class_id);
+                next.push(CtcPath {
+                    ids,
+                    score: beam.score + ctc_log_score(value),
+                });
+            }
+        }
+        next.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        next.truncate(CTC_BEAM_SIZE);
+        beams = next;
+    }
+
+    let mut collapsed: Vec<(String, f32, Vec<usize>)> = Vec::new();
+    for beam in beams {
+        let text = collapse_ctc_path(&beam.ids, alphabet);
+        if text.trim().is_empty() {
+            continue;
+        }
+        if collapsed
+            .iter()
+            .any(|(existing, score, _)| existing == &text && *score >= beam.score)
+        {
+            continue;
+        }
+        collapsed.retain(|(existing, score, _)| existing != &text || *score > beam.score);
+        collapsed.push((text, beam.score, beam.ids));
+    }
+    collapsed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (_, _, ids) = collapsed.first()?;
+    Some(ctc_stats_for_path(
+        logits,
+        ids,
+        steps,
+        classes,
+        channel_first,
+        alphabet,
+    ))
+}
+
+fn ctc_top_classes(
+    logits: &[f32],
+    t: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    let mut top = Vec::<(usize, f32)>::new();
+    for class_id in 0..classes {
+        let value = ctc_frame_value(logits, t, class_id, steps, classes, channel_first);
+        let pos = top
+            .iter()
+            .position(|(_, seen)| value > *seen)
+            .unwrap_or(top.len());
+        if pos < k {
+            top.insert(pos, (class_id, value));
+            top.truncate(k);
+        }
+    }
+    if !top.iter().any(|(class_id, _)| *class_id == 0) {
+        top.push((
+            0,
+            ctc_frame_value(logits, t, 0, steps, classes, channel_first),
+        ));
+    }
+    top
+}
+
+fn ctc_frame_value(
+    logits: &[f32],
+    t: usize,
+    class_id: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+) -> f32 {
+    let idx = if channel_first {
+        class_id.saturating_mul(steps).saturating_add(t)
+    } else {
+        t.saturating_mul(classes).saturating_add(class_id)
+    };
+    logits.get(idx).copied().unwrap_or(f32::NEG_INFINITY)
+}
+
+fn ctc_log_score(value: f32) -> f32 {
+    if value.is_finite() {
+        if (0.0..=1.0).contains(&value) {
+            value.max(1.0e-6).ln()
+        } else {
+            value
+        }
+    } else {
+        -1.0e9
+    }
+}
+
+fn collapse_ctc_path(ids: &[usize], alphabet: &[String]) -> String {
+    let mut prev = 0usize;
+    let mut text = String::new();
+    for id in ids {
+        if *id != 0 && *id != prev {
+            let idx = id.saturating_sub(1);
+            if let Some(ch) = alphabet.get(idx)
+                && ch != "\u{3000}"
+            {
+                text.push_str(ch);
+            }
+        }
+        prev = *id;
+    }
+    text
+}
+
+fn ctc_stats_for_path(
+    logits: &[f32],
+    ids: &[usize],
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+    alphabet: &[String],
+) -> (String, f32, CtcDecodeStats) {
+    let mut prev = 0usize;
+    let mut text = String::new();
+    let mut prob_sum = 0.0f32;
+    let mut margin_sum = 0.0f32;
+    let mut min_margin = f32::INFINITY;
+    let mut count = 0usize;
+    for (t, id) in ids.iter().copied().enumerate().take(steps) {
+        if id != 0 && id != prev {
+            let idx = id.saturating_sub(1);
+            if let Some(ch) = alphabet.get(idx) {
+                if ch == "\u{3000}" {
+                    prev = id;
+                    continue;
+                }
+                text.push_str(ch);
+                let value = ctc_frame_value(logits, t, id, steps, classes, channel_first);
+                let second = ctc_second_best_value(logits, t, id, steps, classes, channel_first);
+                prob_sum += value;
+                let margin = (value - second).max(0.0);
+                margin_sum += margin;
+                min_margin = min_margin.min(margin);
+                count += 1;
+            }
+        }
+        prev = id;
+    }
+    if count == 0 {
+        return (String::new(), 0.0, CtcDecodeStats::default());
+    }
+    (
+        text,
+        prob_sum / count as f32,
+        CtcDecodeStats {
+            avg_margin: margin_sum / count as f32,
+            min_margin,
+        },
+    )
+}
+
+fn ctc_second_best_value(
+    logits: &[f32],
+    t: usize,
+    selected: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+) -> f32 {
+    let mut second = f32::NEG_INFINITY;
+    for class_id in 0..classes {
+        if class_id == selected {
+            continue;
+        }
+        second = second.max(ctc_frame_value(
+            logits,
+            t,
+            class_id,
+            steps,
+            classes,
+            channel_first,
+        ));
+    }
+    if second.is_finite() { second } else { 0.0 }
+}
+
 fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCandidate {
     let Some(alt) = alt else {
         return primary;
@@ -6804,6 +7473,9 @@ fn is_usable_recognition(candidate: &RecCandidate) -> bool {
         return false;
     }
     if char_count >= 4 && punct >= 0.75 {
+        return false;
+    }
+    if candidate.confidence < 0.70 && is_low_value_ascii_noise(text) {
         return false;
     }
     true
@@ -8548,13 +9220,145 @@ mod tests {
         assert_eq!(gray.get_pixel(0, 0)[0], 0);
     }
 
-    fn text_line(bbox: BoxRect, text: &str, confidence: f32) -> TextLine {
-        TextLine {
-            bbox,
-            text: text.to_string(),
-            confidence,
-            source: "det".to_string(),
+    #[test]
+    fn voted_lines_use_margin_for_near_duplicate_quality() {
+        let mut weak_margin = text_line((10, 10, 180, 26), "Project status: ready", 0.73);
+        weak_margin.avg_margin = 0.01;
+        weak_margin.min_margin = 0.0;
+        let mut strong_margin = text_line((11, 10, 181, 26), "Project status: ready", 0.70);
+        strong_margin.avg_margin = 0.80;
+        strong_margin.min_margin = 0.45;
+
+        let selected = select_voted_text_line(&[weak_margin, strong_margin]).expect("line");
+
+        assert_eq!(selected.confidence, 0.70);
+        assert!(selected.avg_margin > 0.50);
+    }
+
+    #[test]
+    fn low_value_ascii_noise_requires_internal_mixed_case_or_short_token() {
+        assert!(is_low_value_ascii_noise("abCdef"));
+        assert!(is_low_value_ascii_noise("fox"));
+        assert!(!is_low_value_ascii_noise("Invoice"));
+        assert!(!is_low_value_ascii_noise("Alpha42"));
+    }
+
+    #[test]
+    fn usable_recognition_rejects_low_confidence_ascii_noise() {
+        let noisy = rec_candidate("abCdef", 0.65, RecVariant::Primary);
+        let ordinary = rec_candidate("Invoice", 0.65, RecVariant::Primary);
+
+        assert!(!is_usable_recognition(&noisy));
+        assert!(is_usable_recognition(&ordinary));
+    }
+
+    #[test]
+    fn large_boxes_can_prioritize_structural_split() {
+        assert!(large_text_box_should_prioritize_split((0, 0, 900, 120)));
+        assert!(large_text_box_should_prioritize_split((0, 0, 520, 420)));
+        assert!(!large_text_box_should_prioritize_split((0, 0, 640, 35)));
+    }
+
+    #[test]
+    fn structured_split_lines_require_readable_content() {
+        let good = vec![
+            text_line((0, 10, 220, 30), "Alpha row", 0.62),
+            text_line((0, 54, 240, 74), "Beta row", 0.64),
+        ];
+        let bad = vec![
+            text_line((0, 10, 20, 18), "x", 0.92),
+            text_line((0, 54, 20, 62), "+", 0.94),
+        ];
+
+        assert!(structured_split_lines_are_plausible(
+            (0, 0, 320, 120),
+            &good
+        ));
+        assert!(!structured_split_lines_are_plausible(
+            (0, 0, 320, 120),
+            &bad
+        ));
+    }
+
+    #[test]
+    fn wide_line_sliding_window_boxes_split_continuous_long_line() {
+        let mut rgb = image::RgbImage::from_pixel(900, 48, image::Rgb([255, 255, 255]));
+        for y in 14..32 {
+            for x in 20..880 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
         }
+        let img = DynamicImage::ImageRgb8(rgb);
+
+        assert!(wide_line_segment_boxes(&img, (0, 0, 900, 48), 4).is_empty());
+        let windows = wide_line_recognition_boxes(&img, (0, 0, 900, 48), 4);
+
+        assert!(windows.len() >= 2);
+        assert!(windows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(windows.windows(2).any(|pair| pair[0].2 > pair[1].0));
+    }
+
+    #[test]
+    fn segment_join_dedupes_overlap_between_windows() {
+        let segments = vec![
+            rec_candidate("AlphaBeta", 0.80, RecVariant::Primary),
+            rec_candidate("BetaGamma", 0.81, RecVariant::Primary),
+        ];
+
+        assert_eq!(join_segment_recognition_text(&segments), "AlphaBetaGamma");
+    }
+
+    #[test]
+    fn best_panel_for_line_uses_overlap_and_center() {
+        let panels = vec![(0, 0, 300, 200), (300, 0, 640, 200)];
+
+        assert_eq!(best_panel_for_line((40, 20, 160, 40), &panels), Some(0));
+        assert_eq!(best_panel_for_line((420, 20, 560, 40), &panels), Some(1));
+    }
+
+    #[test]
+    fn foreground_component_boxes_merge_text_like_components() {
+        let mut rgb = image::RgbImage::from_pixel(220, 80, image::Rgb([245, 245, 245]));
+        for x in [24, 48, 72, 120, 146, 172] {
+            for y in 28..42 {
+                for xx in x..x + 10 {
+                    rgb.put_pixel(xx, y, image::Rgb([20, 20, 20]));
+                }
+            }
+        }
+
+        let boxes = foreground_component_text_boxes(&DynamicImage::ImageRgb8(rgb), 4);
+
+        assert!(!boxes.is_empty());
+        assert!(boxes.iter().any(|b| box_width(*b) > 120));
+    }
+
+    #[test]
+    fn ctc_path_beam_decode_produces_candidate_with_stats() {
+        let alphabet = vec!["A".to_string(), "B".to_string()];
+        let logits = vec![
+            0.05, 0.70, 0.05, // blank
+            0.90, 0.10, 0.10, // A
+            0.20, 0.05, 0.80, // B
+        ];
+
+        let (text, confidence, stats) =
+            ctc_path_beam_decode_with_stats(&logits, &[1, 3, 3], &alphabet).expect("beam");
+
+        assert_eq!(text, "AB");
+        assert!(confidence > 0.70);
+        assert!(stats.avg_margin > 0.60);
+    }
+
+    fn text_line(bbox: BoxRect, text: &str, confidence: f32) -> TextLine {
+        make_text_line(
+            bbox,
+            text.to_string(),
+            confidence,
+            0.10,
+            0.06,
+            "det".to_string(),
+        )
     }
 
     fn rec_candidate(text: &str, confidence: f32, variant: RecVariant) -> RecCandidate {
