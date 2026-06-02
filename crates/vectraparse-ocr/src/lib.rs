@@ -14,6 +14,7 @@ const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
 const MAX_COLOR_REGION_CANDIDATES: usize = 48;
 const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
+const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
 const MAX_REC_IMG_W: usize = 640;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
@@ -354,6 +355,27 @@ impl OrtOcrEngine {
             "color-regions:eager".to_string(),
             &candidate,
         );
+
+        if should_use_uncovered_visual_supplement(img, cfg, det_box_count, line_count, &regions) {
+            let visual_candidate = self.recognize_uncovered_visual_regions(
+                img,
+                cfg,
+                &regions,
+                MAX_EAGER_VISUAL_REGION_RECOGNITIONS,
+                "visual-region:eager",
+            );
+            maybe_adopt_recognized(
+                &mut text,
+                &mut confidence,
+                &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
+                &mut regions,
+                &mut fallback,
+                "visual-regions:eager".to_string(),
+                &visual_candidate,
+            );
+        }
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
             self.apply_quality_fallbacks(
@@ -1105,6 +1127,36 @@ impl OrtOcrEngine {
         (boxes.len(), recognized_from_text_lines(&mut lines))
     }
 
+    fn recognize_uncovered_visual_regions(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        existing_regions: &[OcrTextRegion],
+        recognition_limit: usize,
+        source: &str,
+    ) -> RecognizedText {
+        let boxes = uncovered_visual_text_boxes(img, existing_regions);
+        let mut lines = Vec::new();
+        for b in boxes.iter().take(recognition_limit) {
+            let candidate = binarize_color_region_foreground(img, *b)
+                .and_then(|binary| self.best_from_crop_direct(&binary, cfg))
+                .or_else(|| {
+                    let crop = crop_box(img, *b);
+                    self.best_from_crop_direct(&crop, cfg)
+                });
+            if let Some(candidate) = candidate {
+                lines.extend(candidate_text_lines(
+                    img,
+                    *b,
+                    &candidate,
+                    source,
+                    BboxTransform::Identity,
+                ));
+            }
+        }
+        recognized_from_text_lines(&mut lines)
+    }
+
     fn recognize_line_crops(&self, img: &DynamicImage, cfg: &OcrConfig) -> RecognizedText {
         let mut lines = Vec::new();
         for line_box in fallback_line_boxes(img) {
@@ -1630,7 +1682,6 @@ fn merge_ocr_regions(current: &[OcrTextRegion], candidate: &[OcrTextRegion]) -> 
     out
 }
 
-#[cfg(test)]
 fn merge_recognized_line_sets(
     current_regions: &[OcrTextRegion],
     candidate: &RecognizedText,
@@ -2265,22 +2316,39 @@ fn maybe_adopt_recognized(
         return true;
     }
 
-    let merged = merge_unique_lines(text, &candidate.text);
-    let merged_chars = recognized_char_count(&merged);
-    if merged_chars > current_chars + 2 && candidate.confidence + 0.10 >= *confidence {
-        *text = merged;
-        *confidence = merge_confidence(
-            *confidence,
-            *line_count,
-            candidate.confidence,
-            candidate.line_count,
-        );
-        *line_count = text_line_count(text);
-        *region_count = (*region_count).max(candidate.region_count).max(1);
-        *layout_applied = *layout_applied || candidate.layout_applied || *region_count > 1;
-        *regions = merge_ocr_regions(regions, &candidate.regions);
-        *fallback = Some(format!("merged:{label}"));
-        return true;
+    if !regions.is_empty() && !candidate.regions.is_empty() {
+        let merged = merge_recognized_line_sets(regions, candidate);
+        let merged_chars = recognized_char_count(&merged.text);
+        if merged_chars > current_chars + 2 && candidate.confidence + 0.10 >= *confidence {
+            *text = merged.text;
+            *confidence = merged.confidence;
+            *line_count = merged.line_count.max(text_line_count(text));
+            *region_count = merged
+                .region_count
+                .max(if text.trim().is_empty() { 0 } else { 1 });
+            *layout_applied = merged.layout_applied;
+            *regions = merged.regions;
+            *fallback = Some(format!("merged:{label}"));
+            return true;
+        }
+    } else {
+        let merged = merge_unique_lines(text, &candidate.text);
+        let merged_chars = recognized_char_count(&merged);
+        if merged_chars > current_chars + 2 && candidate.confidence + 0.10 >= *confidence {
+            *text = merged;
+            *confidence = merge_confidence(
+                *confidence,
+                *line_count,
+                candidate.confidence,
+                candidate.line_count,
+            );
+            *line_count = text_line_count(text);
+            *region_count = (*region_count).max(candidate.region_count).max(1);
+            *layout_applied = *layout_applied || candidate.layout_applied || *region_count > 1;
+            *regions = merge_ocr_regions(regions, &candidate.regions);
+            *fallback = Some(format!("merged:{label}"));
+            return true;
+        }
     }
 
     let candidate_is_longer = candidate_chars > current_chars + 2;
@@ -2902,6 +2970,26 @@ fn should_use_high_res_tile_supplement(
     regions_have_repairable_lines(regions)
 }
 
+fn should_use_uncovered_visual_supplement(
+    img: &DynamicImage,
+    cfg: &OcrConfig,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    if regions.is_empty() {
+        return false;
+    }
+    let (w, h) = img.dimensions();
+    if w >= cfg.det_img_side as u32 || h >= cfg.det_img_side as u32 {
+        return true;
+    }
+    if det_box_count >= 4 && line_count < det_box_count {
+        return true;
+    }
+    regions_have_repairable_lines(regions)
+}
+
 fn regions_have_repairable_lines(regions: &[OcrTextRegion]) -> bool {
     for region in regions {
         if region.lines.is_empty() {
@@ -3110,6 +3198,48 @@ fn high_res_tile_boxes(image: &DynamicImage, det_img_side: usize) -> Vec<BoxRect
     scored.into_iter().map(|(b, _)| b).collect()
 }
 
+fn uncovered_visual_text_boxes(
+    image: &DynamicImage,
+    existing_regions: &[OcrTextRegion],
+) -> Vec<BoxRect> {
+    let (img_w, img_h) = image.dimensions();
+    if img_w == 0 || img_h == 0 {
+        return Vec::new();
+    }
+
+    let mut boxes = Vec::new();
+    for line_box in foreground_line_boxes(image, 96) {
+        let split = split_line_box_horizontally(image, line_box);
+        for b in split {
+            let b = clamp_box(
+                (
+                    b.0.saturating_sub(2),
+                    b.1.saturating_sub(1),
+                    b.2.saturating_add(2),
+                    b.3.saturating_add(1),
+                ),
+                img_w,
+                img_h,
+            );
+            if box_width(b) < 12 || box_height(b) < 6 {
+                continue;
+            }
+            if box_width(b).saturating_mul(100) > img_w.saturating_mul(92) {
+                continue;
+            }
+            if color_region_box_covered_by_reliable_text(b, existing_regions) {
+                continue;
+            }
+            boxes.push(b);
+        }
+    }
+
+    boxes = nms_boxes(boxes, 0.55);
+    boxes.sort_by(reading_box_order);
+    boxes.truncate(MAX_EAGER_VISUAL_REGION_RECOGNITIONS.saturating_mul(2));
+    boxes
+}
+
 fn tile_axis_starts(len: u32, tile_side: u32, overlap: u32) -> Vec<u32> {
     if len <= tile_side {
         return vec![0];
@@ -3172,7 +3302,14 @@ fn visual_page_region_boxes(image: &DynamicImage) -> Vec<BoxRect> {
     let Some(mask) = visual_layout_edge_mask_from_rgb(&work) else {
         return Vec::new();
     };
-    visual_page_region_boxes_from_mask(&mask, w as usize, h as usize)
+    let column_boxes = visual_page_region_boxes_from_mask(&mask, w as usize, h as usize);
+    let grid_boxes = visual_page_grid_region_boxes_from_mask(&mask, w as usize, h as usize);
+    let boxes = if grid_boxes.len() > column_boxes.len() {
+        grid_boxes
+    } else {
+        column_boxes
+    };
+    boxes
         .into_iter()
         .map(|b| {
             let x0 = ((b.0 as f32) * sx).floor().max(0.0) as u32;
@@ -3327,6 +3464,150 @@ fn visual_page_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) -> Vec<
     candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
     candidates.sort_by_key(|(b, _)| (b.0, b.1));
     candidates.into_iter().map(|(b, _)| b).collect()
+}
+
+fn visual_page_grid_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) -> Vec<BoxRect> {
+    if w < 160 || h < 160 || mask.len() != w.saturating_mul(h) {
+        return Vec::new();
+    }
+
+    let row_bands = projection_bands(
+        |idx| {
+            let mut count = 0usize;
+            for x in 0..w {
+                if mask[idx * w + x] {
+                    count += 1;
+                }
+            }
+            count
+        },
+        h,
+        ((w as f32) * 0.004).ceil().max(3.0) as usize,
+        (h / 30).clamp(16, 72),
+        (h / 16).clamp(44, 150),
+    );
+    if row_bands.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for (row_start, row_end) in row_bands {
+        let band_h = row_end.saturating_sub(row_start) + 1;
+        let col_bands = projection_bands(
+            |x| {
+                let mut count = 0usize;
+                for y in row_start..=row_end {
+                    if mask[y * w + x] {
+                        count += 1;
+                    }
+                }
+                count
+            },
+            w,
+            ((band_h as f32) * 0.06).ceil().max(2.0) as usize,
+            (w / 36).clamp(20, 90),
+            (w / 18).clamp(70, 220),
+        );
+        if col_bands.is_empty() {
+            continue;
+        }
+        for (col_start, col_end) in col_bands {
+            let mut score = 0usize;
+            for y in row_start..=row_end {
+                for x in col_start..=col_end {
+                    if mask[y * w + x] {
+                        score += 1;
+                    }
+                }
+            }
+            if score < 8 {
+                continue;
+            }
+            let pad_x = (w / 160).clamp(6, 18);
+            let pad_y = (h / 180).clamp(4, 14);
+            let b = clamp_box(
+                (
+                    col_start.saturating_sub(pad_x) as u32,
+                    row_start.saturating_sub(pad_y) as u32,
+                    (col_end + 1 + pad_x).min(w) as u32,
+                    (row_end + 1 + pad_y).min(h) as u32,
+                ),
+                w as u32,
+                h as u32,
+            );
+            if box_width(b) < 64 || box_height(b) < 32 {
+                continue;
+            }
+            if box_area(b).saturating_mul(100)
+                > (w as u64).saturating_mul(h as u64).saturating_mul(72)
+            {
+                continue;
+            }
+            candidates.push((b, score));
+        }
+    }
+
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    candidates.sort_by(|a, b| reading_box_order(&a.0, &b.0));
+    candidates.into_iter().map(|(b, _)| b).collect()
+}
+
+fn projection_bands<F>(
+    mut score_at: F,
+    len: usize,
+    active_threshold: usize,
+    bridge_gap: usize,
+    min_band_len: usize,
+) -> Vec<(usize, usize)>
+where
+    F: FnMut(usize) -> usize,
+{
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut scores = Vec::with_capacity(len);
+    for idx in 0..len {
+        scores.push(score_at(idx));
+    }
+    let max_score = scores.iter().copied().max().unwrap_or(0);
+    if max_score < active_threshold {
+        return Vec::new();
+    }
+    let active_threshold = active_threshold.max(((max_score as f32) * 0.06).ceil() as usize);
+    let bridge_threshold = (active_threshold / 2).max(1);
+
+    let mut bands = Vec::new();
+    let mut idx = 0usize;
+    while idx < len {
+        if scores[idx] < active_threshold {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        let mut end = idx;
+        let mut gap = 0usize;
+        idx += 1;
+        while idx < len {
+            if scores[idx] >= bridge_threshold {
+                end = idx;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > bridge_gap {
+                    break;
+                }
+            }
+            idx += 1;
+        }
+        if end.saturating_sub(start) + 1 >= min_band_len {
+            bands.push((start, end));
+        }
+    }
+    bands
 }
 
 fn page_region_boxes_from_detection_boxes(
@@ -5058,6 +5339,47 @@ mod tests {
     }
 
     #[test]
+    fn visual_page_region_boxes_can_split_two_dimensional_panels() {
+        let mut rgb = image::RgbImage::from_pixel(1000, 700, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture_at(&mut rgb, 60, 360, 54, 7);
+        draw_synthetic_text_texture_at(&mut rgb, 610, 930, 54, 7);
+        draw_synthetic_text_texture_at(&mut rgb, 60, 360, 430, 7);
+        draw_synthetic_text_texture_at(&mut rgb, 610, 930, 430, 7);
+
+        let regions = visual_page_region_boxes(&DynamicImage::ImageRgb8(rgb));
+
+        assert_eq!(regions.len(), 4);
+        assert!(regions.iter().any(|b| b.0 < 200 && b.1 < 200));
+        assert!(regions.iter().any(|b| b.0 > 500 && b.1 < 200));
+        assert!(regions.iter().any(|b| b.0 < 200 && b.1 > 350));
+        assert!(regions.iter().any(|b| b.0 > 500 && b.1 > 350));
+    }
+
+    #[test]
+    fn uncovered_visual_text_boxes_skip_reliably_covered_lines() {
+        let mut rgb = image::RgbImage::from_pixel(360, 120, image::Rgb([255, 255, 255]));
+        draw_synthetic_text_texture_at(&mut rgb, 24, 140, 24, 4);
+        draw_synthetic_text_texture_at(&mut rgb, 220, 340, 24, 4);
+        let existing = vec![OcrTextRegion {
+            bbox: [18, 18, 150, 100],
+            text: "Alpha Beta".to_string(),
+            confidence: 0.88,
+            source: "det".to_string(),
+            lines: vec![OcrTextLine {
+                bbox: [18, 18, 150, 100],
+                text: "Alpha Beta".to_string(),
+                confidence: 0.88,
+                source: "det".to_string(),
+            }],
+        }];
+
+        let boxes = uncovered_visual_text_boxes(&DynamicImage::ImageRgb8(rgb), &existing);
+
+        assert!(!boxes.is_empty());
+        assert!(boxes.iter().all(|b| b.0 > 180));
+    }
+
+    #[test]
     fn page_region_sources_get_local_repair_budgets() {
         assert_eq!(
             split_line_recognition_budget("det"),
@@ -5919,9 +6241,19 @@ mod tests {
     }
 
     fn draw_synthetic_text_texture(rgb: &mut image::RgbImage, x0: u32, x1: u32) {
+        draw_synthetic_text_texture_at(rgb, x0, x1, 24, 10);
+    }
+
+    fn draw_synthetic_text_texture_at(
+        rgb: &mut image::RgbImage,
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        rows: u32,
+    ) {
         let dark = image::Rgb([24, 24, 24]);
-        for row in 0..10u32 {
-            let y = 24 + row * 18;
+        for row in 0..rows {
+            let y = y0 + row * 18;
             let mut x = x0 + (row % 3) * 5;
             while x + 16 < x1 {
                 for yy in y..(y + 5).min(rgb.height()) {
