@@ -3546,6 +3546,9 @@ mod tests {
                 selected_source: Some("whole-image".to_string()),
                 det_pass_count: 2,
                 fallback_attempt_count: 3,
+                rec_primary_call_count: 1,
+                rec_alt_call_count: 0,
+                timing: vectraparse_ocr::OcrTraceTiming::default(),
                 lines: vec![vectraparse_ocr::OcrTraceLine {
                     region_index: 0,
                     line_index: 0,

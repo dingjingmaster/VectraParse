@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, GrayImage, Luma};
@@ -18,6 +20,8 @@ const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_EAGER_COLOR_REGION_DET_PASSES: usize = 4;
 const MAX_EAGER_LAYERED_REGION_RECOGNITIONS: usize = 10;
 const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
+const MAX_QUALITY_FALLBACK_FAMILIES_EMPTY: usize = 5;
+const MAX_QUALITY_FALLBACK_FAMILIES_PARTIAL: usize = 3;
 const MAX_REC_IMG_W: usize = 960;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
@@ -109,9 +113,26 @@ pub struct OcrTrace {
     pub selected_source: Option<String>,
     pub det_pass_count: usize,
     pub fallback_attempt_count: usize,
+    pub rec_primary_call_count: usize,
+    pub rec_alt_call_count: usize,
+    pub timing: OcrTraceTiming,
     pub lines: Vec<OcrTraceLine>,
     pub candidates: Vec<OcrTraceCandidate>,
     pub json: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTraceTiming {
+    pub total_ms: u64,
+    pub det_ms: u64,
+    pub page_region_ms: u64,
+    pub tile_ms: u64,
+    pub color_region_ms: u64,
+    pub layered_region_ms: u64,
+    pub visual_region_ms: u64,
+    pub fallback_ms: u64,
+    pub rec_primary_ms: u64,
+    pub rec_alt_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -228,6 +249,18 @@ struct TextLine {
     readable_ratio: f32,
     support_count: usize,
     source: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OcrRecPerf {
+    primary_call_count: usize,
+    alt_call_count: usize,
+    primary_ms: u64,
+    alt_ms: u64,
+}
+
+thread_local! {
+    static OCR_REC_PERF: RefCell<OcrRecPerf> = RefCell::new(OcrRecPerf::default());
 }
 
 fn make_text_line(
@@ -347,15 +380,19 @@ impl OrtOcrEngine {
     }
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
+        let total_start = Instant::now();
+        reset_ocr_rec_perf();
         let trace_enabled = ocr_trace_enabled();
         let source_has_alpha = has_non_opaque_alpha(img);
         if trace_enabled {
             let (w, h) = img.dimensions();
             eprintln!("[OCR_TRACE] start dims={w}x{h} alpha={source_has_alpha}");
         }
+        let det_start = Instant::now();
         let detected = self
             .recognize_detected_text(img, cfg, true, "det", BboxTransform::Identity)
             .map_err(|e| format!("detect: {e}"))?;
+        let det_ms = elapsed_ms(det_start);
         let det_box_count = detected.det_box_count;
         let detect_used_whole_image_box = det_box_count == 0;
         let mut text = detected.recognized.text.clone();
@@ -373,6 +410,12 @@ impl OrtOcrEngine {
             },
             det_pass_count: 1,
             fallback_attempt_count: 0,
+            rec_primary_call_count: 0,
+            rec_alt_call_count: 0,
+            timing: OcrTraceTiming {
+                det_ms,
+                ..OcrTraceTiming::default()
+            },
             lines: Vec::new(),
             candidates: Vec::new(),
             json: None,
@@ -380,8 +423,10 @@ impl OrtOcrEngine {
         let mut candidate_pool = Vec::new();
         push_recognition_candidate(&mut candidate_pool, "det".to_string(), &detected.recognized);
 
+        let page_region_start = Instant::now();
         let (page_region_count, page_region_candidate) =
             self.recognize_page_regions(img, cfg, &detected.boxes)?;
+        trace.timing.page_region_ms = elapsed_ms(page_region_start);
         if page_region_count > 0 {
             trace.det_pass_count += page_region_count;
             let candidate = if text.trim().is_empty() {
@@ -420,13 +465,16 @@ impl OrtOcrEngine {
         if should_use_high_res_tile_supplement(
             img,
             cfg,
+            &text,
             confidence,
             det_box_count,
             line_count,
             &regions,
         ) {
+            let tile_start = Instant::now();
             let (tile_region_count, tile_region_candidate) =
                 self.recognize_high_res_tiles(img, cfg, &regions)?;
+            trace.timing.tile_ms = elapsed_ms(tile_start);
             if tile_region_count > 0 {
                 trace.det_pass_count += tile_region_count;
                 maybe_adopt_recognized_traced(
@@ -458,52 +506,23 @@ impl OrtOcrEngine {
             }
         }
 
-        let (candidate_count, candidate) = self.recognize_uncovered_color_regions(
-            img,
-            cfg,
+        let mut color_region_count = 0usize;
+        let run_eager_color = should_use_eager_color_region_supplement(
+            &text,
+            confidence,
+            det_box_count,
+            line_count,
             &regions,
-            MAX_EAGER_COLOR_REGION_RECOGNITIONS,
-            "color-region:eager",
         );
-        let mut color_region_count = candidate_count;
-        maybe_adopt_recognized_traced(
-            &mut text,
-            &mut confidence,
-            &mut line_count,
-            &mut region_count,
-            &mut layout_applied,
-            &mut regions,
-            &mut fallback,
-            &mut trace,
-            "color-regions:eager".to_string(),
-            &candidate,
-        );
-        maybe_adopt_candidate_pool_traced(
-            &mut text,
-            &mut confidence,
-            &mut line_count,
-            &mut region_count,
-            &mut layout_applied,
-            &mut regions,
-            &mut fallback,
-            &mut candidate_pool,
-            Some(img),
-            &mut trace,
-            "color-regions:eager".to_string(),
-            &candidate,
-        );
-
-        let (det_color_region_count, det_pass_count, candidate) = self
-            .recognize_uncovered_color_region_detections(
+        if run_eager_color {
+            let color_region_start = Instant::now();
+            let (candidate_count, candidate) = self.recognize_uncovered_color_regions(
                 img,
                 cfg,
                 &regions,
-                MAX_EAGER_COLOR_REGION_DET_PASSES,
-                "color-region-det:eager",
+                MAX_EAGER_COLOR_REGION_RECOGNITIONS,
+                "color-region:eager",
             );
-        color_region_count = color_region_count.max(det_color_region_count);
-        if det_pass_count > 0 {
-            trace.det_pass_count += det_pass_count;
             maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
@@ -513,7 +532,7 @@ impl OrtOcrEngine {
                 &mut regions,
                 &mut fallback,
                 &mut trace,
-                "color-region-det:eager".to_string(),
+                "color-regions:eager".to_string(),
                 &candidate,
             );
             maybe_adopt_candidate_pool_traced(
@@ -527,47 +546,103 @@ impl OrtOcrEngine {
                 &mut candidate_pool,
                 Some(img),
                 &mut trace,
-                "color-region-det:eager".to_string(),
+                "color-regions:eager".to_string(),
                 &candidate,
+            );
+            color_region_count = candidate_count;
+            trace.timing.color_region_ms = elapsed_ms(color_region_start);
+
+            let det_color_region_start = Instant::now();
+            let (det_color_region_count, det_pass_count, candidate) = self
+                .recognize_uncovered_color_region_detections(
+                    img,
+                    cfg,
+                    &regions,
+                    MAX_EAGER_COLOR_REGION_DET_PASSES,
+                    "color-region-det:eager",
+                );
+            trace.timing.color_region_ms = trace
+                .timing
+                .color_region_ms
+                .saturating_add(elapsed_ms(det_color_region_start));
+            color_region_count = color_region_count.max(det_color_region_count);
+            if det_pass_count > 0 {
+                trace.det_pass_count += det_pass_count;
+                maybe_adopt_recognized_traced(
+                    &mut text,
+                    &mut confidence,
+                    &mut line_count,
+                    &mut region_count,
+                    &mut layout_applied,
+                    &mut regions,
+                    &mut fallback,
+                    &mut trace,
+                    "color-region-det:eager".to_string(),
+                    &candidate,
+                );
+                maybe_adopt_candidate_pool_traced(
+                    &mut text,
+                    &mut confidence,
+                    &mut line_count,
+                    &mut region_count,
+                    &mut layout_applied,
+                    &mut regions,
+                    &mut fallback,
+                    &mut candidate_pool,
+                    Some(img),
+                    &mut trace,
+                    "color-region-det:eager".to_string(),
+                    &candidate,
+                );
+            }
+
+            let layered_region_start = Instant::now();
+            let (layered_region_count, layered_candidate) = self.recognize_layered_color_regions(
+                img,
+                cfg,
+                &regions,
+                MAX_EAGER_LAYERED_REGION_RECOGNITIONS,
+                "layered-region:eager",
+            );
+            trace.timing.layered_region_ms = elapsed_ms(layered_region_start);
+            color_region_count = color_region_count.max(layered_region_count);
+            maybe_adopt_recognized_traced(
+                &mut text,
+                &mut confidence,
+                &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
+                &mut regions,
+                &mut fallback,
+                &mut trace,
+                "layered-regions:eager".to_string(),
+                &layered_candidate,
+            );
+            maybe_adopt_candidate_pool_traced(
+                &mut text,
+                &mut confidence,
+                &mut line_count,
+                &mut region_count,
+                &mut layout_applied,
+                &mut regions,
+                &mut fallback,
+                &mut candidate_pool,
+                Some(img),
+                &mut trace,
+                "layered-regions:eager".to_string(),
+                &layered_candidate,
             );
         }
 
-        let (layered_region_count, layered_candidate) = self.recognize_layered_color_regions(
+        if should_use_uncovered_visual_supplement(
             img,
             cfg,
+            &text,
+            det_box_count,
+            line_count,
             &regions,
-            MAX_EAGER_LAYERED_REGION_RECOGNITIONS,
-            "layered-region:eager",
-        );
-        color_region_count = color_region_count.max(layered_region_count);
-        maybe_adopt_recognized_traced(
-            &mut text,
-            &mut confidence,
-            &mut line_count,
-            &mut region_count,
-            &mut layout_applied,
-            &mut regions,
-            &mut fallback,
-            &mut trace,
-            "layered-regions:eager".to_string(),
-            &layered_candidate,
-        );
-        maybe_adopt_candidate_pool_traced(
-            &mut text,
-            &mut confidence,
-            &mut line_count,
-            &mut region_count,
-            &mut layout_applied,
-            &mut regions,
-            &mut fallback,
-            &mut candidate_pool,
-            Some(img),
-            &mut trace,
-            "layered-regions:eager".to_string(),
-            &layered_candidate,
-        );
-
-        if should_use_uncovered_visual_supplement(img, cfg, det_box_count, line_count, &regions) {
+        ) {
+            let visual_start = Instant::now();
             let visual_candidate = self.recognize_uncovered_visual_regions(
                 img,
                 cfg,
@@ -575,6 +650,7 @@ impl OrtOcrEngine {
                 MAX_EAGER_VISUAL_REGION_RECOGNITIONS,
                 "visual-region:eager",
             );
+            trace.timing.visual_region_ms = elapsed_ms(visual_start);
             maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
@@ -604,6 +680,7 @@ impl OrtOcrEngine {
         }
 
         if needs_quality_fallback(&text, confidence, det_box_count, line_count) {
+            let fallback_start = Instant::now();
             self.apply_quality_fallbacks(
                 img,
                 cfg,
@@ -619,6 +696,7 @@ impl OrtOcrEngine {
                 &mut fallback,
                 &mut candidate_pool,
             )?;
+            trace.timing.fallback_ms = elapsed_ms(fallback_start);
         }
 
         let warning = if self.alphabet.is_empty() {
@@ -634,6 +712,12 @@ impl OrtOcrEngine {
                 Some("det".to_string())
             }
         });
+        let rec_perf = read_ocr_rec_perf();
+        trace.rec_primary_call_count = rec_perf.primary_call_count;
+        trace.rec_alt_call_count = rec_perf.alt_call_count;
+        trace.timing.rec_primary_ms = rec_perf.primary_ms;
+        trace.timing.rec_alt_ms = rec_perf.alt_ms;
+        trace.timing.total_ms = elapsed_ms(total_start);
         trace.lines = ocr_trace_lines_from_regions(&regions);
         if ocr_trace_json_enabled() {
             let (w, h) = img.dimensions();
@@ -656,7 +740,7 @@ impl OrtOcrEngine {
         if trace_enabled {
             let (w, h) = img.dimensions();
             eprintln!(
-                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} source={} whole_image_box={} fallback={} empty={}",
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} rec_primary_calls={} rec_alt_calls={} source={} whole_image_box={} fallback={} empty={} total_ms={} det_ms={} page_region_ms={} tile_ms={} color_region_ms={} layered_region_ms={} visual_region_ms={} fallback_ms={} rec_primary_ms={} rec_alt_ms={}",
                 w,
                 h,
                 source_has_alpha,
@@ -667,10 +751,22 @@ impl OrtOcrEngine {
                 color_region_count,
                 trace.det_pass_count,
                 trace.fallback_attempt_count,
+                trace.rec_primary_call_count,
+                trace.rec_alt_call_count,
                 trace.selected_source.as_deref().unwrap_or("-"),
                 detect_used_whole_image_box,
                 fallback.as_deref().unwrap_or("-"),
-                empty_result
+                empty_result,
+                trace.timing.total_ms,
+                trace.timing.det_ms,
+                trace.timing.page_region_ms,
+                trace.timing.tile_ms,
+                trace.timing.color_region_ms,
+                trace.timing.layered_region_ms,
+                trace.timing.visual_region_ms,
+                trace.timing.fallback_ms,
+                trace.timing.rec_primary_ms,
+                trace.timing.rec_alt_ms
             );
         }
 
@@ -1246,6 +1342,10 @@ impl OrtOcrEngine {
         candidate_pool: &mut Vec<OcrCandidateEntry>,
     ) -> Result<(), String> {
         let image_bbox = image_box(img);
+        let mut family_budget = quality_fallback_family_budget(text);
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         trace.fallback_attempt_count += 1;
         match self.recognize_best(img, cfg) {
             Ok(candidate) if is_usable_recognition(&candidate) => {
@@ -1286,6 +1386,9 @@ impl OrtOcrEngine {
             return Ok(());
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         trace.fallback_attempt_count += 1;
         let (candidate_count, candidate) = self.recognize_color_regions(img, cfg);
         *color_region_count = (*color_region_count).max(candidate_count);
@@ -1319,6 +1422,9 @@ impl OrtOcrEngine {
             return Ok(());
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         for (name, enhanced) in enhancement_variants(img) {
             trace.fallback_attempt_count += 1;
             trace.det_pass_count += 1;
@@ -1400,6 +1506,9 @@ impl OrtOcrEngine {
             }
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         let (orig_w, orig_h) = img.dimensions();
         for (name, upscaled) in upscale_variants(img) {
             trace.fallback_attempt_count += 1;
@@ -1489,6 +1598,9 @@ impl OrtOcrEngine {
             }
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         for (name, deskewed) in deskew_variants(img) {
             trace.fallback_attempt_count += 1;
             if let Ok(candidate) = self.recognize_best(&deskewed, cfg)
@@ -1529,6 +1641,9 @@ impl OrtOcrEngine {
             }
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         for (name, rotated) in rotation_variants(img) {
             trace.fallback_attempt_count += 1;
             trace.det_pass_count += 1;
@@ -1625,6 +1740,9 @@ impl OrtOcrEngine {
             }
         }
 
+        if !consume_quality_fallback_family(&mut family_budget) {
+            return Ok(());
+        }
         trace.fallback_attempt_count += 1;
         let candidate = self.recognize_line_crops(img, cfg);
         maybe_adopt_recognized_traced(
@@ -1885,14 +2003,18 @@ impl OrtOcrEngine {
     ) -> Result<RecCandidate, String> {
         let primary =
             self.recognize_candidate(&self.rec, &self.alphabet, image, cfg, RecVariant::Primary)?;
-        let alt = if let Some(rec_alt) = &self.rec_alt {
-            Some(self.recognize_candidate(
-                rec_alt,
-                &self.alphabet_alt,
-                image,
-                cfg,
-                RecVariant::Alt,
-            )?)
+        let alt = if should_try_alt_recognition(&primary) {
+            if let Some(rec_alt) = &self.rec_alt {
+                Some(self.recognize_candidate(
+                    rec_alt,
+                    &self.alphabet_alt,
+                    image,
+                    cfg,
+                    RecVariant::Alt,
+                )?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1977,10 +2099,12 @@ impl OrtOcrEngine {
         variant: RecVariant,
         target_w: usize,
     ) -> Result<RecCandidate, String> {
+        let start = Instant::now();
         let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
         let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
         let logits = &output[0];
         let (text, confidence, stats) = ctc_decode_with_stats(logits, &out_shapes[0], alphabet);
+        record_ocr_rec_perf(variant, elapsed_ms(start));
         Ok(RecCandidate {
             text,
             confidence,
@@ -2270,6 +2394,13 @@ fn ocr_trace_json(
         trace.fallback_attempt_count,
         true,
     );
+    push_json_usize_field(
+        &mut out,
+        "rec_primary_call_count",
+        trace.rec_primary_call_count,
+        true,
+    );
+    push_json_usize_field(&mut out, "rec_alt_call_count", trace.rec_alt_call_count, true);
     push_json_usize_field(&mut out, "candidate_count", trace.candidates.len(), true);
     push_json_usize_field(
         &mut out,
@@ -2298,6 +2429,18 @@ fn ocr_trace_json(
     push_json_bool_field(&mut out, "empty_result", empty_result, true);
     push_json_f32_field(&mut out, "confidence", confidence, true);
     push_json_str_field(&mut out, "selected_source", selected_source, true);
+    out.push_str(",\"timing_ms\":{");
+    push_json_u64_field(&mut out, "total", trace.timing.total_ms, false);
+    push_json_u64_field(&mut out, "det", trace.timing.det_ms, true);
+    push_json_u64_field(&mut out, "page_region", trace.timing.page_region_ms, true);
+    push_json_u64_field(&mut out, "tile", trace.timing.tile_ms, true);
+    push_json_u64_field(&mut out, "color_region", trace.timing.color_region_ms, true);
+    push_json_u64_field(&mut out, "layered_region", trace.timing.layered_region_ms, true);
+    push_json_u64_field(&mut out, "visual_region", trace.timing.visual_region_ms, true);
+    push_json_u64_field(&mut out, "fallback", trace.timing.fallback_ms, true);
+    push_json_u64_field(&mut out, "rec_primary", trace.timing.rec_primary_ms, true);
+    push_json_u64_field(&mut out, "rec_alt", trace.timing.rec_alt_ms, true);
+    out.push('}');
     out.push('}');
 
     out.push_str(",\"regions\":[");
@@ -2422,6 +2565,16 @@ fn push_json_usize_field(out: &mut String, key: &str, value: usize, comma: bool)
 }
 
 fn push_json_u32_field(out: &mut String, key: &str, value: u32, comma: bool) {
+    if comma {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(&value.to_string());
+}
+
+fn push_json_u64_field(out: &mut String, key: &str, value: u64, comma: bool) {
     if comma {
         out.push(',');
     }
@@ -4507,6 +4660,22 @@ fn needs_quality_fallback(
     false
 }
 
+fn quality_fallback_family_budget(text: &str) -> usize {
+    if text.trim().is_empty() {
+        MAX_QUALITY_FALLBACK_FAMILIES_EMPTY
+    } else {
+        MAX_QUALITY_FALLBACK_FAMILIES_PARTIAL
+    }
+}
+
+fn consume_quality_fallback_family(budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    true
+}
+
 fn should_enhance_crop(b: BoxRect) -> bool {
     box_width(b) <= 480 && box_height(b) <= 96 && box_area(b) <= 48_000
 }
@@ -4578,6 +4747,27 @@ fn recognition_candidate_is_better(
     candidate_quality > current_quality + 2.0
         || (candidate_chars > current_chars + 1
             && candidate.confidence + 0.08 >= current.confidence)
+}
+
+fn should_try_alt_recognition(primary: &RecCandidate) -> bool {
+    let text = primary.text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    if !is_usable_recognition(primary) {
+        return true;
+    }
+    let ascii = ascii_ratio(text);
+    if ascii >= 0.35 {
+        return true;
+    }
+    if primary.confidence < 0.58 {
+        return true;
+    }
+    if primary.avg_margin < 0.05 || primary.min_margin < 0.02 {
+        return true;
+    }
+    false
 }
 
 fn join_segment_recognition_text(segments: &[RecCandidate]) -> String {
@@ -5171,6 +5361,7 @@ fn line_repair_recognition_budget(source: &str) -> usize {
 fn should_use_high_res_tile_supplement(
     img: &DynamicImage,
     cfg: &OcrConfig,
+    text: &str,
     confidence: f32,
     det_box_count: usize,
     line_count: usize,
@@ -5183,10 +5374,13 @@ fn should_use_high_res_tile_supplement(
     if line_count == 0 {
         return true;
     }
-    if confidence > 0.0 && confidence < 0.75 {
+    if confidence > 0.0 && confidence < 0.62 {
         return true;
     }
-    if det_box_count >= 8 && line_count * 2 <= det_box_count {
+    if det_box_count >= 10 && line_count * 2 <= det_box_count {
+        return true;
+    }
+    if recognized_char_count(text) < 8 && det_box_count >= 4 {
         return true;
     }
     regions_have_repairable_lines(regions)
@@ -5195,6 +5389,7 @@ fn should_use_high_res_tile_supplement(
 fn should_use_uncovered_visual_supplement(
     img: &DynamicImage,
     cfg: &OcrConfig,
+    text: &str,
     det_box_count: usize,
     line_count: usize,
     regions: &[OcrTextRegion],
@@ -5203,10 +5398,34 @@ fn should_use_uncovered_visual_supplement(
         return det_box_count == 0 || line_count == 0;
     }
     let (w, h) = img.dimensions();
-    if w >= cfg.det_img_side as u32 || h >= cfg.det_img_side as u32 {
+    if (w >= cfg.det_img_side as u32 || h >= cfg.det_img_side as u32)
+        && (line_count == 0 || recognized_char_count(text) < 8)
+    {
         return true;
     }
-    if det_box_count >= 4 && line_count < det_box_count {
+    if det_box_count >= 6 && line_count * 3 <= det_box_count * 2 {
+        return true;
+    }
+    regions_have_repairable_lines(regions)
+}
+
+fn should_use_eager_color_region_supplement(
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    if confidence > 0.0 && confidence < 0.58 {
+        return true;
+    }
+    if det_box_count >= 6 && line_count * 3 <= det_box_count * 2 {
+        return true;
+    }
+    if recognized_char_count(text) < 8 && det_box_count >= 3 {
         return true;
     }
     regions_have_repairable_lines(regions)
@@ -6150,6 +6369,36 @@ fn load_ort_session(path: Option<&str>, embedded: &[u8]) -> Result<OrtSession, S
         allocator_ptr,
         memory_info_ptr,
     })
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn reset_ocr_rec_perf() {
+    OCR_REC_PERF.with(|perf| {
+        *perf.borrow_mut() = OcrRecPerf::default();
+    });
+}
+
+fn record_ocr_rec_perf(variant: RecVariant, elapsed_ms: u64) {
+    OCR_REC_PERF.with(|perf| {
+        let mut perf = perf.borrow_mut();
+        match variant {
+            RecVariant::Primary => {
+                perf.primary_call_count += 1;
+                perf.primary_ms = perf.primary_ms.saturating_add(elapsed_ms);
+            }
+            RecVariant::Alt => {
+                perf.alt_call_count += 1;
+                perf.alt_ms = perf.alt_ms.saturating_add(elapsed_ms);
+            }
+        }
+    });
+}
+
+fn read_ocr_rec_perf() -> OcrRecPerf {
+    OCR_REC_PERF.with(|perf| *perf.borrow())
 }
 
 fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
@@ -9148,6 +9397,7 @@ mod tests {
         assert!(should_use_uncovered_visual_supplement(
             &img,
             &cfg,
+            "",
             0,
             0,
             &[]
@@ -9155,6 +9405,7 @@ mod tests {
         assert!(should_use_uncovered_visual_supplement(
             &img,
             &cfg,
+            "",
             2,
             0,
             &[]
@@ -9285,6 +9536,7 @@ mod tests {
         assert!(!should_use_high_res_tile_supplement(
             &small,
             &cfg,
+            "Alpha Beta",
             0.30,
             12,
             2,
@@ -9293,6 +9545,7 @@ mod tests {
         assert!(!should_use_high_res_tile_supplement(
             &large,
             &cfg,
+            "Alpha Beta",
             0.88,
             6,
             5,
@@ -9301,6 +9554,7 @@ mod tests {
         assert!(should_use_high_res_tile_supplement(
             &large,
             &cfg,
+            "Alpha Beta",
             0.88,
             6,
             5,
@@ -9309,6 +9563,7 @@ mod tests {
         assert!(should_use_high_res_tile_supplement(
             &large,
             &cfg,
+            "",
             0.0,
             0,
             0,
@@ -9527,6 +9782,9 @@ mod tests {
             selected_source: Some("det".to_string()),
             det_pass_count: 1,
             fallback_attempt_count: 0,
+            rec_primary_call_count: 1,
+            rec_alt_call_count: 0,
+            timing: OcrTraceTiming::default(),
             lines: ocr_trace_lines_from_regions(&regions),
             candidates: vec![OcrTraceCandidate {
                 label: "det".to_string(),
@@ -9688,6 +9946,24 @@ mod tests {
     }
 
     #[test]
+    fn alt_recognition_is_skipped_for_strong_non_ascii_primary() {
+        let mut primary = rec_candidate("测试文本", 0.84, RecVariant::Primary);
+        primary.avg_margin = 0.12;
+        primary.min_margin = 0.08;
+
+        assert!(!should_try_alt_recognition(&primary));
+    }
+
+    #[test]
+    fn alt_recognition_runs_for_ascii_like_primary() {
+        let mut primary = rec_candidate("Invoice 42", 0.71, RecVariant::Primary);
+        primary.avg_margin = 0.10;
+        primary.min_margin = 0.05;
+
+        assert!(should_try_alt_recognition(&primary));
+    }
+
+    #[test]
     fn usable_recognition_rejects_low_quality_text() {
         let repeated = RecCandidate {
             text: "||||||".to_string(),
@@ -9725,6 +10001,18 @@ mod tests {
         assert!(needs_quality_fallback("One line", 0.62, 6, 2));
         assert!(!needs_quality_fallback("Readable line", 0.62, 6, 1));
         assert!(!needs_quality_fallback("Invoice 42", 0.62, 2, 2));
+    }
+
+    #[test]
+    fn quality_fallback_budget_is_tighter_for_partial_text() {
+        assert_eq!(
+            quality_fallback_family_budget(""),
+            MAX_QUALITY_FALLBACK_FAMILIES_EMPTY
+        );
+        assert_eq!(
+            quality_fallback_family_budget("partial text"),
+            MAX_QUALITY_FALLBACK_FAMILIES_PARTIAL
+        );
     }
 
     #[test]
