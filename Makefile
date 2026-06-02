@@ -1,4 +1,4 @@
-.PHONY: debug release file-content check test abi-smoke golden fuzz-smoke bench-smoke pipeline ort-build ort-check ort-test
+.PHONY: debug release file-content bundle-static check test abi-smoke golden fuzz-smoke bench-smoke pipeline ort-build ort-check ort-test
 
 ORT_INSTALL_DIR := $(shell pwd)/build-build/install
 export ORT_INSTALL_DIR
@@ -16,7 +16,7 @@ test:
 	cargo test --workspace
 
 ort-build:
-	bash build-build/build_ort.sh
+	bash build-build/build_ort.sh --static
 
 ort-check:
 	cargo check --workspace
@@ -24,17 +24,24 @@ ort-check:
 ort-test:
 	cargo test --workspace
 
+bundle-static:
+	bash scripts/bundle_static_ffi.sh
+
 file-content:
-	gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a \
-		-Lbuild-build/install/lib -lonnxruntime -ldl -lpthread -lm \
-		-Wl,-rpath,'$$ORIGIN/../build-build/install/lib' -o target/extract-static
+	cargo build --release -p vectraparse-ffi
+	bash scripts/bundle_static_ffi.sh
+	g++ examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi_full.a \
+		-ldl -lpthread -lm -o target/extract-static
 
 abi-smoke:
 	cargo build --release -p vectraparse-ffi
-	gcc examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi \
-		-Lbuild-build/install/lib -lonnxruntime \
-		-Wl,-rpath,'$$ORIGIN/../target/release' -Wl,-rpath,'$$ORIGIN/../build-build/install/lib' -o target/smoke-c
+	bash scripts/bundle_static_ffi.sh
+	g++ examples/c/smoke.c -Iinclude -Ltarget/release -lvectraparse_ffi \
+		-Wl,-rpath,'$$ORIGIN/../target/release' -o target/smoke-c
 	./target/smoke-c
+	g++ examples/c/smoke.c -Iinclude target/release/libvectraparse_ffi_full.a \
+		-ldl -lpthread -lm -o target/smoke-static
+	./target/smoke-static
 
 golden:
 	bash scripts/golden_validate.sh tests/golden/manifest.tsv

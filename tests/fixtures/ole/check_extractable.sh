@@ -7,7 +7,9 @@ BIN="${1:-./target/extract-static}"
 if [[ ! -x "$BIN" ]]; then
   echo "FAIL: extract binary not found or not executable: $BIN"
   echo "hint: build with:"
-  echo "  gcc examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi.a -ldl -lpthread -lm -o target/extract-static"
+  echo "  cargo build --release -p vectraparse-ffi"
+  echo "  bash scripts/bundle_static_ffi.sh"
+  echo "  g++ examples/c/extract_static.c -Iinclude target/release/libvectraparse_ffi_full.a -ldl -lpthread -lm -o target/extract-static"
   exit 1
 fi
 

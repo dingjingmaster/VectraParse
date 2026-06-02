@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 THRDP_DIR="$PROJECT_ROOT/3thrd"
 ORT_SRC="$THRDP_DIR/onnxruntime"
-BUILD_DIR="$SCRIPT_DIR/ort_build"
 INSTALL_DIR="$SCRIPT_DIR/install"
 STATIC_MODE=false
 
@@ -14,6 +13,11 @@ for arg in "$@"; do
         --static) STATIC_MODE=true ;;
     esac
 done
+
+BUILD_DIR="$SCRIPT_DIR/ort_build"
+if $STATIC_MODE; then
+    BUILD_DIR="$SCRIPT_DIR/ort_build_static"
+fi
 
 echo "=== Building ONNX Runtime v$(cat "$ORT_SRC/VERSION_NUMBER") (static=$STATIC_MODE) ==="
 echo "Project root: $PROJECT_ROOT"
@@ -27,10 +31,13 @@ LOCAL_DEPS=(
     Protobuf
     re2
     Eigen3
+    date
     nlohmann_json
     GSL
     safeint
     flatbuffers
+    mp11
+    pytorch_cpuinfo
     onnx
 )
 
@@ -41,15 +48,19 @@ for dep in "${LOCAL_DEPS[@]}"; do
         Protobuf)     local_dir="$THRDP_DIR/protobuf" ;;
         re2)          local_dir="$THRDP_DIR/re2" ;;
         Eigen3)       local_dir="$THRDP_DIR/eigen" ;;
+        date)         local_dir="$THRDP_DIR/date" ;;
         nlohmann_json) local_dir="$THRDP_DIR/json" ;;
         GSL)          local_dir="$THRDP_DIR/GSL" ;;
         safeint)      local_dir="$THRDP_DIR/safeInt" ;;
         flatbuffers)  local_dir="$THRDP_DIR/flatbuffers" ;;
+        mp11)         local_dir="/usr" ;;
+        pytorch_cpuinfo) local_dir="$THRDP_DIR/cpuinfo" ;;
         onnx)         local_dir="$THRDP_DIR/onnx" ;;
     esac
     if [ -d "$local_dir" ]; then
-        CMAKE_DEPS_FLAGS+=("-DFETCHCONTENT_SOURCE_DIR_${dep}=${local_dir}")
-        echo "  Using local dep: $dep -> $local_dir"
+        dep_var_name="${dep^^}"
+        CMAKE_DEPS_FLAGS+=("-DFETCHCONTENT_SOURCE_DIR_${dep_var_name}=${local_dir}")
+        echo "  Using local dep: $dep (${dep_var_name}) -> $local_dir"
     fi
 done
 
@@ -82,13 +93,16 @@ cmake -S "$ORT_SRC/cmake" -B "$BUILD_DIR" \
     -Donnxruntime_USE_FULL_PROTOBUF=OFF \
     -Donnxruntime_ENABLE_CPUINFO=ON \
     "${CMAKE_DEPS_FLAGS[@]}" \
-    -DCMAKE_CXX_FLAGS="-march=native -O3 -static-libgcc -static-libstdc++" \
+    -DCMAKE_CXX_FLAGS="-march=native -O3 -static-libgcc -static-libstdc++ -Wno-error=maybe-uninitialized" \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 
 echo ""
 echo "=== Building ==="
 cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
+if $STATIC_MODE; then
+    cmake --build "$BUILD_DIR" --config Release --target re2 -j"$(nproc)"
+fi
 
 echo ""
 echo "=== Installing ==="
@@ -98,23 +112,37 @@ if $STATIC_MODE; then
     echo ""
     echo "=== Merging static libraries ==="
     STATIC_DIR="$INSTALL_DIR/static"
-    mkdir -p "$STATIC_DIR"
+    STATIC_LIB_DIR="$STATIC_DIR/lib"
+    mkdir -p "$STATIC_LIB_DIR"
+    rm -f "$STATIC_LIB_DIR/libonnxruntime_all.a"
     # Copy headers from install
+    rm -rf "$STATIC_DIR/include"
     cp -r "$INSTALL_DIR/include" "$STATIC_DIR/"
 
-    # Find all .a files and merge into one
-    MERGE_DIR="$BUILD_DIR/merge_objs"
-    rm -rf "$MERGE_DIR"
-    mkdir -p "$MERGE_DIR"
-    cd "$MERGE_DIR"
-    find "$BUILD_DIR" -name "*.a" | while read f; do
-        ar x "$f" 2>/dev/null || true
-    done
-    ar rcs "$STATIC_DIR/lib/libonnxruntime_all.a" *.o 2>/dev/null || true
-    cd "$SCRIPT_DIR"
+    mapfile -t archive_list < <(find "$BUILD_DIR" -name "*.a" ! -path "$STATIC_DIR/*" | sort)
+    if [ "${#archive_list[@]}" -eq 0 ]; then
+        echo "no static archives found under $BUILD_DIR" >&2
+        exit 1
+    fi
 
-    echo "Static library: $STATIC_DIR/lib/libonnxruntime_all.a"
-    ls -lh "$STATIC_DIR/lib/libonnxruntime_all.a" 2>/dev/null || true
+    MRI_SCRIPT="$(mktemp)"
+    cleanup_mri() {
+        rm -f "$MRI_SCRIPT"
+    }
+    trap cleanup_mri EXIT
+    {
+        printf 'CREATE %s\n' "$STATIC_LIB_DIR/libonnxruntime_all.a"
+        for archive in "${archive_list[@]}"; do
+            printf 'ADDLIB %s\n' "$archive"
+        done
+        printf 'SAVE\n'
+        printf 'END\n'
+    } > "$MRI_SCRIPT"
+    ar -M < "$MRI_SCRIPT"
+    ranlib "$STATIC_LIB_DIR/libonnxruntime_all.a"
+
+    echo "Static library: $STATIC_LIB_DIR/libonnxruntime_all.a"
+    ls -lh "$STATIC_LIB_DIR/libonnxruntime_all.a"
 fi
 
 echo ""
