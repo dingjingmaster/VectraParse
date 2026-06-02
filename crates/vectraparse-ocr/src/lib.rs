@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use image::imageops::FilterType;
@@ -93,6 +94,8 @@ pub struct OcrTextLine {
     pub bbox: [u32; 4],
     pub text: String,
     pub confidence: f32,
+    pub avg_margin: f32,
+    pub min_margin: f32,
     pub source: String,
 }
 
@@ -113,6 +116,8 @@ pub struct OcrTraceLine {
     pub crop_size: [u32; 2],
     pub text: String,
     pub confidence: f32,
+    pub avg_margin: f32,
+    pub min_margin: f32,
     pub source: String,
 }
 
@@ -1876,7 +1881,7 @@ fn recognized_from_text_lines_with_context(
 
     let mut blocks = Vec::new();
     let mut confidence_sum = 0.0f32;
-    let mut confidence_count = 0usize;
+    let mut confidence_weight_sum = 0.0f32;
     let mut public_regions = Vec::new();
     for region in regions.iter_mut() {
         region.lines.sort_by(reading_line_order);
@@ -1891,8 +1896,9 @@ fn recognized_from_text_lines_with_context(
             continue;
         }
         for line in &region.lines {
-            confidence_sum += line.confidence;
-            confidence_count += 1;
+            let weight = line_confidence_weight(line);
+            confidence_sum += line.confidence * weight;
+            confidence_weight_sum += weight;
         }
         public_regions.push(public_region_from_layout(region, &block));
         blocks.push(block);
@@ -1901,10 +1907,10 @@ fn recognized_from_text_lines_with_context(
     let text = blocks.join("\n\n");
     let line_count = text_line_count(&text);
     let region_count = blocks.len();
-    let confidence = if confidence_count == 0 {
+    let confidence = if confidence_weight_sum <= 0.0 {
         0.0
     } else {
-        confidence_sum / confidence_count as f32
+        confidence_sum / confidence_weight_sum
     };
     RecognizedText {
         text,
@@ -1930,6 +1936,8 @@ fn recognized_from_candidate(
             bbox: box_to_array(bbox),
             text: text.clone(),
             confidence: candidate.confidence,
+            avg_margin: candidate.avg_margin,
+            min_margin: candidate.min_margin,
             source: source.to_string(),
         };
         vec![OcrTextRegion {
@@ -2004,13 +2012,26 @@ fn public_region_from_layout(region: &LayoutRegion, text: &str) -> OcrTextRegion
             bbox: box_to_array(line.bbox),
             text: line.text.clone(),
             confidence: line.confidence,
+            avg_margin: line.avg_margin,
+            min_margin: line.min_margin,
             source: line.source.clone(),
         })
         .collect::<Vec<_>>();
     let confidence = if region.lines.is_empty() {
         0.0
     } else {
-        region.lines.iter().map(|line| line.confidence).sum::<f32>() / region.lines.len() as f32
+        let mut sum = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        for line in &region.lines {
+            let weight = line_confidence_weight(line);
+            sum += line.confidence * weight;
+            weight_sum += weight;
+        }
+        if weight_sum <= 0.0 {
+            0.0
+        } else {
+            sum / weight_sum
+        }
     };
     OcrTextRegion {
         bbox: box_to_array(region.bbox),
@@ -2033,6 +2054,8 @@ fn ocr_trace_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<OcrTraceLine> 
                 crop_size: bbox_size(bbox),
                 text: region.text.clone(),
                 confidence: region.confidence,
+                avg_margin: 0.0,
+                min_margin: 0.0,
                 source: region.source.clone(),
             });
             continue;
@@ -2045,6 +2068,8 @@ fn ocr_trace_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<OcrTraceLine> 
                 crop_size: bbox_size(line.bbox),
                 text: line.text.clone(),
                 confidence: line.confidence,
+                avg_margin: line.avg_margin,
+                min_margin: line.min_margin,
                 source: line.source.clone(),
             });
         }
@@ -2125,6 +2150,8 @@ fn ocr_trace_json(
             push_json_bbox_field(&mut out, "bbox", line.bbox, true);
             push_json_size_field(&mut out, "crop_size", bbox_size(line.bbox), true);
             push_json_f32_field(&mut out, "confidence", line.confidence, true);
+            push_json_f32_field(&mut out, "avg_margin", line.avg_margin, true);
+            push_json_f32_field(&mut out, "min_margin", line.min_margin, true);
             push_json_str_field(&mut out, "source", &line.source, true);
             push_json_str_field(&mut out, "text", &line.text, true);
             out.push('}');
@@ -2142,6 +2169,8 @@ fn ocr_trace_json(
         push_json_bbox_field(&mut out, "bbox", line.bbox, true);
         push_json_size_field(&mut out, "crop_size", line.crop_size, true);
         push_json_f32_field(&mut out, "confidence", line.confidence, true);
+        push_json_f32_field(&mut out, "avg_margin", line.avg_margin, true);
+        push_json_f32_field(&mut out, "min_margin", line.min_margin, true);
         push_json_str_field(&mut out, "source", &line.source, true);
         push_json_str_field(&mut out, "text", &line.text, true);
         out.push('}');
@@ -2321,8 +2350,8 @@ fn text_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<TextLine> {
                 box_from_array(line.bbox),
                 line.text.clone(),
                 line.confidence,
-                0.0,
-                0.0,
+                line.avg_margin,
+                line.min_margin,
                 line.source.clone(),
             ));
         }
@@ -2348,24 +2377,107 @@ fn group_text_lines_into_regions(
     lines: &[TextLine],
     rgb: Option<&image::RgbImage>,
 ) -> Vec<LayoutRegion> {
-    let mut regions: Vec<LayoutRegion> = Vec::new();
-    for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
-        let mut best: Option<(usize, f32)> = None;
-        for (idx, region) in regions.iter().enumerate() {
-            if let Some(score) = region_line_score(region, line, rgb) {
-                if best.map_or(true, |(_, best_score)| score > best_score) {
-                    best = Some((idx, score));
-                }
+    let graph_regions = group_text_lines_into_graph_regions(lines, rgb);
+    merge_layout_regions(graph_regions, rgb)
+}
+
+fn group_text_lines_into_graph_regions(
+    lines: &[TextLine],
+    rgb: Option<&image::RgbImage>,
+) -> Vec<LayoutRegion> {
+    let mut candidates = lines
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(reading_line_order);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut parents = (0..candidates.len()).collect::<Vec<_>>();
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            if line_graph_edge(&candidates[i], &candidates[j], rgb) {
+                union_parent(&mut parents, i, j);
             }
         }
+    }
 
-        if let Some((idx, _)) = best {
-            regions[idx].add_line(line.clone());
+    let mut groups: Vec<(usize, Vec<TextLine>)> = Vec::new();
+    for (idx, line) in candidates.into_iter().enumerate() {
+        let root = find_parent(&mut parents, idx);
+        if let Some((_, bucket)) = groups.iter_mut().find(|(seen, _)| *seen == root) {
+            bucket.push(line);
         } else {
-            regions.push(LayoutRegion::from_line(line.clone()));
+            groups.push((root, vec![line]));
         }
     }
-    merge_layout_regions(regions, rgb)
+
+    let mut regions = groups
+        .into_iter()
+        .map(|(_, mut bucket)| {
+            bucket.sort_by(reading_line_order);
+            let first = bucket.remove(0);
+            let mut region = LayoutRegion::from_line(first);
+            for line in bucket {
+                region.add_line(line);
+            }
+            region
+        })
+        .collect::<Vec<_>>();
+    regions.sort_by(reading_region_order);
+    regions
+}
+
+fn find_parent(parents: &mut [usize], idx: usize) -> usize {
+    if parents[idx] != idx {
+        let root = find_parent(parents, parents[idx]);
+        parents[idx] = root;
+    }
+    parents[idx]
+}
+
+fn union_parent(parents: &mut [usize], a: usize, b: usize) {
+    let root_a = find_parent(parents, a);
+    let root_b = find_parent(parents, b);
+    if root_a != root_b {
+        parents[root_b] = root_a;
+    }
+}
+
+fn line_graph_edge(a: &TextLine, b: &TextLine, rgb: Option<&image::RgbImage>) -> bool {
+    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
+        return false;
+    }
+
+    let min_h = box_height(a.bbox).min(box_height(b.bbox)).max(1);
+    let avg_h = (box_height(a.bbox).max(1) + box_height(b.bbox).max(1)) as f32 / 2.0;
+    let y_overlap = vertical_overlap(a.bbox, b.bbox);
+    let x_overlap = horizontal_overlap(a.bbox, b.bbox);
+    let x_gap = horizontal_gap(a.bbox, b.bbox);
+    let y_gap = vertical_gap(a.bbox, b.bbox);
+    let min_w = box_width(a.bbox).min(box_width(b.bbox)).max(1);
+    let max_w = box_width(a.bbox).max(box_width(b.bbox)).max(1);
+    let overlap_ratio = x_overlap as f32 / min_w as f32;
+    let width_ratio = max_w as f32 / min_w as f32;
+    let center_close =
+        (box_center_x(a.bbox) - box_center_x(b.bbox)).abs() <= min_w.max(64) as f32 * 0.55;
+
+    let same_visual_row = y_overlap.saturating_mul(100) >= min_h.saturating_mul(35)
+        && x_gap <= min_h.saturating_mul(4).max(28);
+    if same_visual_row && width_ratio <= 4.0 {
+        return true;
+    }
+
+    if y_gap as f32 > (avg_h * 2.8).clamp(28.0, 96.0) {
+        return false;
+    }
+    if width_ratio >= 1.85 && y_gap as f32 > avg_h * 1.2 {
+        return false;
+    }
+
+    (overlap_ratio >= 0.42 || center_close) && width_ratio < 2.4
 }
 
 fn group_text_lines_into_panel_regions(
@@ -2440,46 +2552,6 @@ fn merge_layout_regions(
         }
     }
     regions
-}
-
-fn region_line_score(
-    region: &LayoutRegion,
-    line: &TextLine,
-    rgb: Option<&image::RgbImage>,
-) -> Option<f32> {
-    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, region.bbox, line.bbox)) {
-        return None;
-    }
-    let overlap = horizontal_overlap(region.bbox, line.bbox) as f32;
-    let min_width = box_width(region.bbox).min(box_width(line.bbox)).max(1) as f32;
-    let overlap_ratio = overlap / min_width;
-    let y_gap = vertical_gap(region.bbox, line.bbox) as f32;
-    let x_gap = horizontal_gap(region.bbox, line.bbox) as f32;
-    let line_h = box_height(line.bbox).max(1) as f32;
-    let avg_h = region_average_line_height(region).max(line_h);
-    let same_row =
-        vertical_overlap(region.bbox, line.bbox) > 0 && x_gap <= (line_h * 3.0).max(24.0);
-    let max_y_gap = (avg_h * 4.0).clamp(48.0, 180.0);
-
-    if !same_row && y_gap > max_y_gap {
-        return None;
-    }
-
-    let region_w = box_width(region.bbox).max(1) as f32;
-    let line_w = box_width(line.bbox).max(1) as f32;
-    let width_ratio = region_w.max(line_w) / region_w.min(line_w);
-    if !same_row && y_gap > avg_h * 2.5 && width_ratio >= 1.75 {
-        return None;
-    }
-
-    let region_cx = box_center_x(region.bbox);
-    let line_cx = box_center_x(line.bbox);
-    let centers_close = (region_cx - line_cx).abs() <= min_width.max(64.0) * 0.55;
-    if overlap_ratio < 0.25 && !same_row && !centers_close {
-        return None;
-    }
-
-    Some(overlap_ratio * 100.0 + if same_row { 25.0 } else { 0.0 } - y_gap * 0.25 - x_gap * 0.02)
 }
 
 fn regions_should_merge(a: &LayoutRegion, b: &LayoutRegion, rgb: Option<&image::RgbImage>) -> bool {
@@ -2940,7 +3012,14 @@ fn binary_foreground_is_text_like(gray: &GrayImage) -> bool {
     }
     let fg_w = max_x.saturating_sub(min_x).saturating_add(1);
     let fg_h = max_y.saturating_sub(min_y).saturating_add(1);
-    fg_w >= 4 && fg_h >= 2
+    if fg_w < 4 || fg_h < 2 {
+        return false;
+    }
+    let mask = gray
+        .pixels()
+        .map(|pixel| pixel[0] < 128)
+        .collect::<Vec<_>>();
+    foreground_glyph_textness_score(&mask, w as usize, h as usize).is_some_and(|score| score >= -20)
 }
 
 fn estimate_region_background_rgb(rgb: &image::RgbImage) -> [u8; 3] {
@@ -3147,10 +3226,27 @@ fn pooled_recognition_is_better(
     }
 
     let current_quality = recognition_text_quality(current_text, current_confidence);
-    let pooled_quality = recognition_text_quality(&pooled.text, pooled.confidence)
+    let pooled_quality = recognized_text_quality_score(pooled)
         + pooled.line_count.saturating_sub(current_line_count) as f32 * 1.5
         + source_support.saturating_sub(1) as f32 * 2.0;
     pooled_quality > current_quality + 5.0 && pooled_chars + 1 >= current_chars
+}
+
+fn recognized_text_quality_score(recognized: &RecognizedText) -> f32 {
+    let lines = text_lines_from_recognized(recognized);
+    if lines.is_empty() {
+        return recognition_text_quality(&recognized.text, recognized.confidence);
+    }
+    let quality_sum = lines.iter().map(text_line_quality).sum::<f32>();
+    let avg_quality = quality_sum / lines.len() as f32;
+    let chars = recognized_char_count(&recognized.text) as f32;
+    avg_quality + chars.min(80.0) * 0.12 + recognized.region_count.saturating_sub(1) as f32 * 0.8
+        - recognized
+            .text
+            .lines()
+            .filter(|line| is_low_value_short_ocr_line(line))
+            .count() as f32
+            * 2.0
 }
 
 fn pooled_source_family_count(pooled: &RecognizedText) -> usize {
@@ -3577,6 +3673,16 @@ fn text_line_quality(line: &TextLine) -> f32 {
         + source_quality_bonus(&line.source)
         - punctuation_ratio(text) * 8.0
         - dominant_char_ratio(text) * 4.0
+}
+
+fn line_confidence_weight(line: &TextLine) -> f32 {
+    let text = line.text.trim();
+    let chars = recognized_char_count(text) as f32;
+    let margin_bonus =
+        (line.avg_margin.clamp(0.0, 1.0) * 1.4 + line.min_margin.clamp(0.0, 1.0) * 0.6).min(1.2);
+    let readability = readable_ratio(text).clamp(0.0, 1.0);
+    let source = (source_quality_bonus(&line.source) / 8.0).clamp(-0.20, 0.50);
+    (0.45 + chars.min(24.0) / 24.0 + readability * 0.55 + margin_bonus + source).clamp(0.25, 3.0)
 }
 
 fn source_quality_bonus(source: &str) -> f32 {
@@ -4124,6 +4230,10 @@ fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option
     if text_w < 4 || text_h < 2 {
         return None;
     }
+    let glyph_score = foreground_glyph_textness_score(&mask, w as usize, h as usize)?;
+    if glyph_score < -20 {
+        return None;
+    }
 
     let density_score = (foreground_ratio * 12_000.0).round() as i64;
     let foreground_score = (foreground_count.min(4000) / 4) as i64;
@@ -4134,7 +4244,7 @@ fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option
         0
     };
     let area_penalty = (area / 12_000) as i64;
-    Some(density_score + foreground_score + extent_score + split_bonus - area_penalty)
+    Some(density_score + foreground_score + extent_score + split_bonus + glyph_score - area_penalty)
 }
 
 fn layered_color_region_text_boxes(
@@ -4329,6 +4439,101 @@ fn component_box_is_text_like(b: BoxRect, foreground_count: usize) -> bool {
     let area = box_area(b).max(1);
     let density = foreground_count as f32 / area as f32;
     (0.04..=0.80).contains(&density) && w.saturating_mul(6) >= h && h.saturating_mul(20) >= w
+}
+
+fn foreground_glyph_textness_score(mask: &[bool], w: usize, h: usize) -> Option<i64> {
+    if w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return None;
+    }
+    let mut visited = vec![false; mask.len()];
+    let mut component_count = 0usize;
+    let mut text_like_count = 0usize;
+    let mut largest_density = 0.0f32;
+    let mut largest_area = 0u64;
+    let mut largest_box = (0u32, 0u32);
+    for idx in 0..mask.len() {
+        if visited[idx] || !mask[idx] {
+            continue;
+        }
+        let mut stack = vec![idx];
+        visited[idx] = true;
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut count = 0usize;
+        while let Some(cur) = stack.pop() {
+            let x = cur % w;
+            let y = cur / w;
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let nidx = ny * w + nx;
+                if visited[nidx] || !mask[nidx] {
+                    continue;
+                }
+                visited[nidx] = true;
+                stack.push(nidx);
+            }
+        }
+        if count < 2 || max_x <= min_x || max_y <= min_y {
+            continue;
+        }
+        component_count += 1;
+        let b = (
+            min_x as u32,
+            min_y as u32,
+            (max_x + 1).min(w) as u32,
+            (max_y + 1).min(h) as u32,
+        );
+        let area = box_area(b).max(1);
+        let density = count as f32 / area as f32;
+        if area > largest_area {
+            largest_area = area;
+            largest_density = density;
+            largest_box = (box_width(b), box_height(b));
+        }
+        if component_box_is_text_like(b, count)
+            || (box_width(b) >= 5
+                && box_height(b) >= 2
+                && box_width(b).saturating_mul(16) >= box_height(b)
+                && (0.02..=0.88).contains(&density))
+            || (box_width(b) >= box_height(b).saturating_mul(4)
+                && box_height(b) >= 2
+                && density <= 1.0)
+        {
+            text_like_count += 1;
+        }
+    }
+    if component_count == 0 {
+        return None;
+    }
+
+    let mut score = text_like_count as i64 * 12 + component_count.min(12) as i64 * 2;
+    if text_like_count == 0 {
+        score -= 24;
+    }
+    if component_count <= 1
+        && largest_density > 0.86
+        && largest_box.0 < largest_box.1.saturating_mul(4)
+    {
+        score -= 32;
+    }
+    if component_count >= 3 {
+        score += 10;
+    }
+    Some(score.clamp(-48, 72))
 }
 
 fn merge_component_boxes_into_lines(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
@@ -5531,6 +5736,20 @@ fn collect_boxes_from_mask(
                 continue;
             }
 
+            let bbox_area = max_x
+                .saturating_sub(min_x)
+                .saturating_add(1)
+                .saturating_mul(max_y.saturating_sub(min_y).saturating_add(1))
+                .max(1);
+            let fill_ratio = positive_area as f32 / bbox_area as f32;
+            let refined = contour_refined_boxes_from_component(
+                raw_mask, min_x, min_y, max_x, max_y, w, h, min_area,
+            );
+            if refined.len() >= 2 && (fill_ratio < 0.45 || max_y.saturating_sub(min_y) >= 18) {
+                boxes.extend(refined);
+                continue;
+            }
+
             let score =
                 average_component_score(data, component_mask, min_x, min_y, max_x, max_y, w);
             if score < (thresh * 0.3) {
@@ -5540,6 +5759,55 @@ fn collect_boxes_from_mask(
             boxes.push(expand_box(min_x, min_y, max_x, max_y, w, h));
         }
     }
+    boxes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contour_refined_boxes_from_component(
+    raw_mask: &[bool],
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    w: usize,
+    h: usize,
+    min_area: usize,
+) -> Vec<BoxRect> {
+    let comp_w = max_x.saturating_sub(min_x).saturating_add(1);
+    let comp_h = max_y.saturating_sub(min_y).saturating_add(1);
+    if comp_w < 12 || comp_h < 12 || comp_w.saturating_mul(comp_h) < min_area.saturating_mul(2) {
+        return Vec::new();
+    }
+
+    let mut local = vec![false; comp_w.saturating_mul(comp_h)];
+    for y in 0..comp_h {
+        for x in 0..comp_w {
+            local[y * comp_w + x] = raw_mask[(min_y + y) * w + min_x + x];
+        }
+    }
+
+    let max_boxes = (comp_h / 6).clamp(2, 8);
+    let mut boxes = line_boxes_from_foreground_mask(&local, comp_w, comp_h, max_boxes)
+        .into_iter()
+        .filter(|b| box_area(*b) as usize >= min_area)
+        .map(|b| {
+            clamp_box(
+                (
+                    min_x.saturating_add(b.0 as usize) as u32,
+                    min_y.saturating_add(b.1 as usize) as u32,
+                    min_x.saturating_add(b.2 as usize) as u32,
+                    min_y.saturating_add(b.3 as usize) as u32,
+                ),
+                w as u32,
+                h as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    if boxes.len() < 2 {
+        return Vec::new();
+    }
+    boxes = nms_boxes(boxes, 0.40);
+    boxes.sort_by(reading_box_order);
     boxes
 }
 
@@ -7196,10 +7464,16 @@ fn ctc_greedy_decode_with_stats(
     (text, confidence, stats)
 }
 
+const CTC_LOG_ZERO: f32 = -1.0e9;
+
 #[derive(Clone)]
-struct CtcPath {
-    ids: Vec<usize>,
-    score: f32,
+struct CtcPrefixState {
+    p_blank: f32,
+    p_non_blank: f32,
+    best_blank_path: Vec<usize>,
+    best_blank_score: f32,
+    best_non_blank_path: Vec<usize>,
+    best_non_blank_score: f32,
 }
 
 fn ctc_path_beam_decode_with_stats(
@@ -7220,46 +7494,113 @@ fn ctc_path_beam_decode_with_stats(
         return None;
     }
 
-    let mut beams = vec![CtcPath {
-        ids: Vec::new(),
-        score: 0.0,
-    }];
+    let mut beams: HashMap<Vec<usize>, CtcPrefixState> = HashMap::new();
+    beams.insert(
+        Vec::new(),
+        CtcPrefixState {
+            p_blank: 0.0,
+            p_non_blank: CTC_LOG_ZERO,
+            best_blank_path: Vec::new(),
+            best_blank_score: 0.0,
+            best_non_blank_path: Vec::new(),
+            best_non_blank_score: CTC_LOG_ZERO,
+        },
+    );
     for t in 0..steps {
         let top = ctc_top_classes(logits, t, steps, classes, channel_first, CTC_TOP_K);
-        let mut next = Vec::with_capacity(beams.len().saturating_mul(top.len()));
-        for beam in &beams {
-            for &(class_id, value) in &top {
-                let mut ids = beam.ids.clone();
-                ids.push(class_id);
-                next.push(CtcPath {
-                    ids,
-                    score: beam.score + ctc_log_score(value),
-                });
-            }
-        }
-        next.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        let mut active = beams.into_iter().collect::<Vec<_>>();
+        active.sort_by(|a, b| {
+            ctc_prefix_total_score(&b.1)
+                .partial_cmp(&ctc_prefix_total_score(&a.1))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        next.truncate(CTC_BEAM_SIZE);
-        beams = next;
+        active.truncate(CTC_BEAM_SIZE);
+
+        let mut next: HashMap<Vec<usize>, CtcPrefixState> = HashMap::new();
+        for (prefix, state) in active {
+            let total_score = ctc_prefix_total_score(&state);
+            let (best_path, best_path_score) = state.best_path_and_score();
+            for &(class_id, value) in &top {
+                let score = ctc_log_score(value);
+                if class_id == 0 {
+                    let mut path = best_path.clone();
+                    path.push(0);
+                    ctc_update_blank_state(
+                        next.entry(prefix.clone())
+                            .or_insert_with(CtcPrefixState::empty),
+                        total_score + score,
+                        path,
+                        best_path_score + score,
+                    );
+                    continue;
+                }
+
+                let last = prefix.last().copied();
+                if last == Some(class_id) {
+                    if state.p_non_blank > CTC_LOG_ZERO / 2.0 {
+                        let mut path = state.best_non_blank_path.clone();
+                        path.push(class_id);
+                        ctc_update_non_blank_state(
+                            next.entry(prefix.clone())
+                                .or_insert_with(CtcPrefixState::empty),
+                            state.p_non_blank + score,
+                            path,
+                            state.best_non_blank_score + score,
+                        );
+                    }
+                    if state.p_blank > CTC_LOG_ZERO / 2.0 {
+                        let mut extended = prefix.clone();
+                        extended.push(class_id);
+                        let mut path = state.best_blank_path.clone();
+                        path.push(class_id);
+                        ctc_update_non_blank_state(
+                            next.entry(extended).or_insert_with(CtcPrefixState::empty),
+                            state.p_blank + score,
+                            path,
+                            state.best_blank_score + score,
+                        );
+                    }
+                } else {
+                    let mut extended = prefix.clone();
+                    extended.push(class_id);
+                    let mut path = best_path.clone();
+                    path.push(class_id);
+                    ctc_update_non_blank_state(
+                        next.entry(extended).or_insert_with(CtcPrefixState::empty),
+                        total_score + score,
+                        path,
+                        best_path_score + score,
+                    );
+                }
+            }
+        }
+        let mut kept = next.into_iter().collect::<Vec<_>>();
+        kept.sort_by(|a, b| {
+            ctc_prefix_total_score(&b.1)
+                .partial_cmp(&ctc_prefix_total_score(&a.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        kept.truncate(CTC_BEAM_SIZE);
+        beams = kept.into_iter().collect();
     }
 
     let mut collapsed: Vec<(String, f32, Vec<usize>)> = Vec::new();
-    for beam in beams {
-        let text = collapse_ctc_path(&beam.ids, alphabet);
+    for (prefix, state) in beams {
+        let text = ctc_prefix_to_text(&prefix, alphabet);
         if text.trim().is_empty() {
             continue;
         }
+        let score = ctc_prefix_total_score(&state);
+        let (path, _) = state.best_path_and_score();
         if collapsed
             .iter()
-            .any(|(existing, score, _)| existing == &text && *score >= beam.score)
+            .any(|(existing, existing_score, _)| existing == &text && *existing_score >= score)
         {
             continue;
         }
-        collapsed.retain(|(existing, score, _)| existing != &text || *score > beam.score);
-        collapsed.push((text, beam.score, beam.ids));
+        collapsed
+            .retain(|(existing, existing_score, _)| existing != &text || *existing_score > score);
+        collapsed.push((text, score, path));
     }
     collapsed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let (_, _, ids) = collapsed.first()?;
@@ -7271,6 +7612,81 @@ fn ctc_path_beam_decode_with_stats(
         channel_first,
         alphabet,
     ))
+}
+
+impl CtcPrefixState {
+    fn empty() -> Self {
+        Self {
+            p_blank: CTC_LOG_ZERO,
+            p_non_blank: CTC_LOG_ZERO,
+            best_blank_path: Vec::new(),
+            best_blank_score: CTC_LOG_ZERO,
+            best_non_blank_path: Vec::new(),
+            best_non_blank_score: CTC_LOG_ZERO,
+        }
+    }
+
+    fn best_path_and_score(&self) -> (Vec<usize>, f32) {
+        if self.best_blank_score >= self.best_non_blank_score {
+            (self.best_blank_path.clone(), self.best_blank_score)
+        } else {
+            (self.best_non_blank_path.clone(), self.best_non_blank_score)
+        }
+    }
+}
+
+fn ctc_prefix_total_score(state: &CtcPrefixState) -> f32 {
+    log_sum_exp2(state.p_blank, state.p_non_blank)
+}
+
+fn ctc_update_blank_state(
+    state: &mut CtcPrefixState,
+    score: f32,
+    path: Vec<usize>,
+    path_score: f32,
+) {
+    state.p_blank = log_sum_exp2(state.p_blank, score);
+    if path_score > state.best_blank_score {
+        state.best_blank_score = path_score;
+        state.best_blank_path = path;
+    }
+}
+
+fn ctc_update_non_blank_state(
+    state: &mut CtcPrefixState,
+    score: f32,
+    path: Vec<usize>,
+    path_score: f32,
+) {
+    state.p_non_blank = log_sum_exp2(state.p_non_blank, score);
+    if path_score > state.best_non_blank_score {
+        state.best_non_blank_score = path_score;
+        state.best_non_blank_path = path;
+    }
+}
+
+fn log_sum_exp2(a: f32, b: f32) -> f32 {
+    if a <= CTC_LOG_ZERO / 2.0 {
+        return b;
+    }
+    if b <= CTC_LOG_ZERO / 2.0 {
+        return a;
+    }
+    let max = a.max(b);
+    max + ((a - max).exp() + (b - max).exp()).ln()
+}
+
+fn ctc_prefix_to_text(prefix: &[usize], alphabet: &[String]) -> String {
+    let mut text = String::new();
+    for id in prefix {
+        let idx = id.saturating_sub(1);
+        if let Some(ch) = alphabet.get(idx)
+            && ch != "\u{3000}"
+        {
+            text.push_str(ch);
+        }
+    }
+    text
 }
 
 fn ctc_top_classes(
@@ -7328,23 +7744,6 @@ fn ctc_log_score(value: f32) -> f32 {
     } else {
         -1.0e9
     }
-}
-
-fn collapse_ctc_path(ids: &[usize], alphabet: &[String]) -> String {
-    let mut prev = 0usize;
-    let mut text = String::new();
-    for id in ids {
-        if *id != 0 && *id != prev {
-            let idx = id.saturating_sub(1);
-            if let Some(ch) = alphabet.get(idx)
-                && ch != "\u{3000}"
-            {
-                text.push_str(ch);
-            }
-        }
-        prev = *id;
-    }
-    text
 }
 
 fn ctc_stats_for_path(
@@ -7760,6 +8159,29 @@ mod tests {
     }
 
     #[test]
+    fn contour_refinement_splits_sparse_multiline_component() {
+        let w = 80usize;
+        let h = 48usize;
+        let mut mask = vec![false; w * h];
+        for y in 8..12 {
+            for x in 10..68 {
+                mask[y * w + x] = true;
+            }
+        }
+        for y in 30..34 {
+            for x in 14..72 {
+                mask[y * w + x] = true;
+            }
+        }
+
+        let boxes = contour_refined_boxes_from_component(&mask, 0, 0, 79, 47, w, h, 4);
+
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[0].1 <= 8 && boxes[0].3 >= 12);
+        assert!(boxes[1].1 <= 30 && boxes[1].3 >= 34);
+    }
+
+    #[test]
     fn nms_boxes_removes_overlapping_boxes() {
         let boxes = vec![(0, 0, 12, 12), (1, 1, 11, 11), (30, 0, 40, 10)];
         let kept = nms_boxes(boxes, 0.35);
@@ -7879,6 +8301,8 @@ mod tests {
                 bbox: [18, 18, 150, 100],
                 text: "Alpha Beta".to_string(),
                 confidence: 0.88,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -7984,6 +8408,8 @@ mod tests {
                 bbox: [10, 10, 180, 36],
                 text: "Alpha Beta".to_string(),
                 confidence: 0.88,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -7996,6 +8422,8 @@ mod tests {
                 bbox: [10, 10, 640, 92],
                 text: "Alpha Beta".to_string(),
                 confidence: 0.70,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -8101,6 +8529,8 @@ mod tests {
                 bbox: [10, 10, 120, 28],
                 text: "Header".to_string(),
                 confidence: 0.64,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -8129,6 +8559,8 @@ mod tests {
                     bbox: [10, 10, 120, 28],
                     text: "Header".to_string(),
                     confidence: 0.64,
+                    avg_margin: 0.10,
+                    min_margin: 0.06,
                     source: "det".to_string(),
                 }],
             },
@@ -8141,6 +8573,8 @@ mod tests {
                     bbox: [10, 40, 220, 60],
                     text: "WidgetSuite2408".to_string(),
                     confidence: 0.70,
+                    avg_margin: 0.10,
+                    min_margin: 0.06,
                     source: "det".to_string(),
                 }],
             },
@@ -8172,12 +8606,16 @@ mod tests {
                     bbox: [10, 20, 80, 36],
                     text: "Alpha".to_string(),
                     confidence: 0.70,
+                    avg_margin: 0.10,
+                    min_margin: 0.06,
                     source: "det".to_string(),
                 },
                 OcrTextLine {
                     bbox: [12, 42, 120, 60],
                     text: "Beta".to_string(),
                     confidence: 0.76,
+                    avg_margin: 0.12,
+                    min_margin: 0.07,
                     source: "page-region:1".to_string(),
                 },
             ],
@@ -8190,6 +8628,8 @@ mod tests {
         assert_eq!(lines[0].line_index, 0);
         assert_eq!(lines[0].bbox, [10, 20, 80, 36]);
         assert_eq!(lines[0].crop_size, [70, 16]);
+        assert_eq!(lines[0].avg_margin, 0.10);
+        assert_eq!(lines[0].min_margin, 0.06);
         assert_eq!(lines[1].source, "page-region:1");
     }
 
@@ -8204,6 +8644,8 @@ mod tests {
                 bbox: [0, 0, 80, 24],
                 text: "A \"quoted\" line".to_string(),
                 confidence: 0.82,
+                avg_margin: 0.11,
+                min_margin: 0.05,
                 source: "det".to_string(),
             }],
         }];
@@ -8221,6 +8663,8 @@ mod tests {
         assert!(json.contains("\"width\":100"));
         assert!(json.contains("\"source\":\"det\""));
         assert!(json.contains("\"crop_size\":[80,24]"));
+        assert!(json.contains("\"avg_margin\":0.1100"));
+        assert!(json.contains("\"min_margin\":0.0500"));
         assert!(json.contains("A \\\"quoted\\\" line"));
         assert_eq!(trace.json.as_deref(), Some(json.as_str()));
     }
@@ -8511,6 +8955,8 @@ mod tests {
                 bbox: [10, 10, 100, 26],
                 text: "Alpha".to_string(),
                 confidence: 0.72,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -8660,6 +9106,8 @@ mod tests {
                 bbox: [10, 10, 70, 26],
                 text: "Header".to_string(),
                 confidence: 0.78,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -8687,6 +9135,8 @@ mod tests {
                 bbox: [10, 10, 100, 32],
                 text: "Alpha".to_string(),
                 confidence: 0.86,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: "det".to_string(),
             }],
         }];
@@ -8699,6 +9149,8 @@ mod tests {
                 bbox: [10, 10, 100, 32],
                 text: "||||||".to_string(),
                 confidence: 0.82,
+                avg_margin: 0.01,
+                min_margin: 0.0,
                 source: "det".to_string(),
             }],
         }];
@@ -8874,6 +9326,21 @@ mod tests {
         assert_eq!(recognized.text, "Header\n\nMenu\n\nContent");
         assert_eq!(recognized.region_count, 3);
         assert!(recognized.layout_applied);
+    }
+
+    #[test]
+    fn layout_graph_merges_same_row_but_not_cross_column_header() {
+        let mut lines = vec![
+            text_line((0, 0, 320, 14), "Header", 0.90),
+            text_line((0, 44, 70, 58), "Left", 0.82),
+            text_line((86, 44, 150, 58), "Item", 0.81),
+            text_line((210, 44, 310, 58), "Right", 0.83),
+        ];
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.text, "Header\n\nLeft\nItem\n\nRight");
+        assert_eq!(recognized.region_count, 3);
     }
 
     #[test]
@@ -9334,6 +9801,30 @@ mod tests {
     }
 
     #[test]
+    fn glyph_textness_penalizes_solid_icon_but_keeps_text_texture() {
+        let mut solid = vec![false; 32 * 32];
+        for y in 8..24 {
+            for x in 8..24 {
+                solid[y * 32 + x] = true;
+            }
+        }
+        let mut text = vec![false; 96 * 24];
+        for x in [8, 18, 28, 48, 58, 68] {
+            for y in 8..16 {
+                for xx in x..x + 5 {
+                    text[y * 96 + xx] = true;
+                }
+            }
+        }
+
+        let solid_score = foreground_glyph_textness_score(&solid, 32, 32).expect("solid score");
+        let text_score = foreground_glyph_textness_score(&text, 96, 24).expect("text score");
+
+        assert!(solid_score < 0);
+        assert!(text_score > solid_score);
+    }
+
+    #[test]
     fn ctc_path_beam_decode_produces_candidate_with_stats() {
         let alphabet = vec!["A".to_string(), "B".to_string()];
         let logits = vec![
@@ -9348,6 +9839,21 @@ mod tests {
         assert_eq!(text, "AB");
         assert!(confidence > 0.70);
         assert!(stats.avg_margin > 0.60);
+    }
+
+    #[test]
+    fn ctc_prefix_beam_aggregates_same_text_probability() {
+        let alphabet = vec!["A".to_string(), "B".to_string()];
+        let logits = vec![
+            0.05, 0.45, 0.50, // step 1
+            0.46, 0.45, 0.09, // step 2
+        ];
+
+        let greedy = ctc_greedy_decode_with_stats(&logits, &[1, 2, 3], &alphabet);
+        let beam = ctc_path_beam_decode_with_stats(&logits, &[1, 2, 3], &alphabet).expect("beam");
+
+        assert_eq!(greedy.0, "B");
+        assert_eq!(beam.0, "A");
     }
 
     fn text_line(bbox: BoxRect, text: &str, confidence: f32) -> TextLine {
@@ -9386,6 +9892,8 @@ mod tests {
                 bbox,
                 text: text.to_string(),
                 confidence,
+                avg_margin: 0.10,
+                min_margin: 0.06,
                 source: source.to_string(),
             }],
         }

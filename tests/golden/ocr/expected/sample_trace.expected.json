@@ -6,6 +6,19 @@
   "region_count": {
     "eq": 1
   },
+  "confidence": {
+    "min": 0.80
+  },
+  "avg_line_margin": {
+    "min": 0.09
+  },
+  "min_line_margin": {
+    "min": 0.04
+  },
+  "low_margin_threshold": 0.02,
+  "low_margin_line_count": {
+    "eq": 0
+  },
   "full_text": "Alpha\nBeta",
   "text_contains": ["Alpha", "Beta"],
   "text_not_contains": ["Noise"],
@@ -15,7 +28,9 @@
       "source": "det",
       "bbox": [10, 20, 90, 38],
       "crop_size": [80, 18],
-      "min_confidence": 0.85
+      "min_confidence": 0.85,
+      "min_avg_margin": 0.10,
+      "min_min_margin": 0.05
     },
     {
       "contains": "Bet",

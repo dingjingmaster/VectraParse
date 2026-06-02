@@ -3521,6 +3521,8 @@ mod tests {
                     crop_size: [10, 20],
                     text: "abc".to_string(),
                     confidence: 0.2,
+                    avg_margin: 0.0,
+                    min_margin: 0.0,
                     source: "whole-image".to_string(),
                 }],
                 json: Some("{\"lines\":[]}".to_string()),

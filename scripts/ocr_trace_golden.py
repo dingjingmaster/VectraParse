@@ -56,6 +56,11 @@ def check_case(case_id: str, trace_path: Path, expected_path: Path) -> list[str]
     summary = trace.get("summary", {})
     failures.extend(check_count(case_id, "line_count", len(lines), expected.get("line_count")))
     failures.extend(check_count(case_id, "region_count", len(trace.get("regions", [])), expected.get("region_count")))
+    failures.extend(check_float(case_id, "confidence", float(summary.get("confidence", 0.0)), expected.get("confidence")))
+    failures.extend(check_float(case_id, "avg_line_confidence", average_field(lines, "confidence"), expected.get("avg_line_confidence")))
+    failures.extend(check_float(case_id, "avg_line_margin", average_field(lines, "avg_margin"), expected.get("avg_line_margin")))
+    failures.extend(check_float(case_id, "min_line_margin", min_field(lines, "min_margin"), expected.get("min_line_margin")))
+    failures.extend(check_count(case_id, "low_margin_line_count", low_margin_line_count(lines, expected), expected.get("low_margin_line_count")))
     if "selected_source" in expected and summary.get("selected_source") != expected["selected_source"]:
         failures.append(
             f"{case_id}: selected_source expected {expected['selected_source']!r}, got {summary.get('selected_source')!r}"
@@ -135,6 +140,43 @@ def check_count(case_id: str, name: str, actual: int, rule) -> list[str]:
     return failures
 
 
+def check_float(case_id: str, name: str, actual: float, rule) -> list[str]:
+    if rule is None:
+        return []
+    if isinstance(rule, (int, float)):
+        return [] if actual == float(rule) else [f"{case_id}: {name} expected {float(rule)}, got {actual:.4f}"]
+    if not isinstance(rule, dict):
+        return [f"{case_id}: {name} rule must be number or object"]
+
+    failures = []
+    if "eq" in rule and actual != float(rule["eq"]):
+        failures.append(f"{case_id}: {name} expected {float(rule['eq'])}, got {actual:.4f}")
+    if "min" in rule and actual < float(rule["min"]):
+        failures.append(f"{case_id}: {name} expected >= {float(rule['min'])}, got {actual:.4f}")
+    if "max" in rule and actual > float(rule["max"]):
+        failures.append(f"{case_id}: {name} expected <= {float(rule['max'])}, got {actual:.4f}")
+    return failures
+
+
+def average_field(lines: list[dict], name: str) -> float:
+    values = [float(line.get(name, 0.0)) for line in lines if isinstance(line.get(name, 0.0), (int, float))]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def min_field(lines: list[dict], name: str) -> float:
+    values = [float(line.get(name, 0.0)) for line in lines if isinstance(line.get(name, 0.0), (int, float))]
+    if not values:
+        return 0.0
+    return min(values)
+
+
+def low_margin_line_count(lines: list[dict], expected: dict) -> int:
+    threshold = float(expected.get("low_margin_threshold", 0.02))
+    return sum(1 for line in lines if float(line.get("min_margin", 0.0)) < threshold)
+
+
 def line_matches(line: dict, rule: dict) -> bool:
     text = str(line.get("text", ""))
     if "text" in rule and text != rule["text"]:
@@ -150,6 +192,14 @@ def line_matches(line: dict, rule: dict) -> bool:
     if "min_confidence" in rule and float(line.get("confidence", 0.0)) < float(rule["min_confidence"]):
         return False
     if "max_confidence" in rule and float(line.get("confidence", 0.0)) > float(rule["max_confidence"]):
+        return False
+    if "min_avg_margin" in rule and float(line.get("avg_margin", 0.0)) < float(rule["min_avg_margin"]):
+        return False
+    if "max_avg_margin" in rule and float(line.get("avg_margin", 0.0)) > float(rule["max_avg_margin"]):
+        return False
+    if "min_min_margin" in rule and float(line.get("min_margin", 0.0)) < float(rule["min_min_margin"]):
+        return False
+    if "max_min_margin" in rule and float(line.get("min_margin", 0.0)) > float(rule["max_min_margin"]):
         return False
     return True
 

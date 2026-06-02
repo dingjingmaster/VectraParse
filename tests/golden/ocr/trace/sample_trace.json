@@ -29,6 +29,8 @@
           "bbox": [10, 20, 90, 38],
           "crop_size": [80, 18],
           "confidence": 0.8800,
+          "avg_margin": 0.1200,
+          "min_margin": 0.0600,
           "source": "det",
           "text": "Alpha"
         },
@@ -37,6 +39,8 @@
           "bbox": [12, 48, 180, 70],
           "crop_size": [168, 22],
           "confidence": 0.8000,
+          "avg_margin": 0.0900,
+          "min_margin": 0.0400,
           "source": "page-region:1",
           "text": "Beta"
         }
@@ -50,6 +54,8 @@
       "bbox": [10, 20, 90, 38],
       "crop_size": [80, 18],
       "confidence": 0.8800,
+      "avg_margin": 0.1200,
+      "min_margin": 0.0600,
       "source": "det",
       "text": "Alpha"
     },
@@ -59,6 +65,8 @@
       "bbox": [12, 48, 180, 70],
       "crop_size": [168, 22],
       "confidence": 0.8000,
+      "avg_margin": 0.0900,
+      "min_margin": 0.0400,
       "source": "page-region:1",
       "text": "Beta"
     }
