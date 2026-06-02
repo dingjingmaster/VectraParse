@@ -6,6 +6,9 @@
   "region_count": {
     "eq": 1
   },
+  "candidate_count": {
+    "eq": 2
+  },
   "confidence": {
     "min": 0.80
   },
@@ -41,6 +44,23 @@
   "must_not_have": [
     {
       "contains": "Noise"
+    }
+  ],
+  "must_have_candidate": [
+    {
+      "label": "det",
+      "mode": "single",
+      "action": "adopted",
+      "reason": "adopted",
+      "min_score": 90,
+      "min_line_count": 2
+    },
+    {
+      "label": "visual-regions:eager",
+      "mode": "pool",
+      "action": "rejected",
+      "reason": "not-better",
+      "max_line_count": 1
     }
   ]
 }

@@ -18,7 +18,7 @@ const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_EAGER_COLOR_REGION_DET_PASSES: usize = 4;
 const MAX_EAGER_LAYERED_REGION_RECOGNITIONS: usize = 10;
 const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
-const MAX_REC_IMG_W: usize = 640;
+const MAX_REC_IMG_W: usize = 960;
 const MAX_CROP_ENHANCEMENT_ATTEMPTS_PER_PASS: usize = 4;
 const MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 6;
 const MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS: usize = 8;
@@ -30,7 +30,7 @@ const MAX_TILE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_TILE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
-const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 4;
+const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 6;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
 const MAX_LOCAL_DET_UPSCALE_PASSES_PER_REGION: usize = 1;
@@ -105,6 +105,7 @@ pub struct OcrTrace {
     pub det_pass_count: usize,
     pub fallback_attempt_count: usize,
     pub lines: Vec<OcrTraceLine>,
+    pub candidates: Vec<OcrTraceCandidate>,
     pub json: Option<String>,
 }
 
@@ -119,6 +120,20 @@ pub struct OcrTraceLine {
     pub avg_margin: f32,
     pub min_margin: f32,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OcrTraceCandidate {
+    pub label: String,
+    pub mode: String,
+    pub action: String,
+    pub reason: String,
+    pub score: f32,
+    pub confidence: f32,
+    pub char_count: usize,
+    pub line_count: usize,
+    pub region_count: usize,
+    pub source_family_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -342,6 +357,7 @@ impl OrtOcrEngine {
             det_pass_count: 1,
             fallback_attempt_count: 0,
             lines: Vec::new(),
+            candidates: Vec::new(),
             json: None,
         };
         let mut candidate_pool = Vec::new();
@@ -356,7 +372,7 @@ impl OrtOcrEngine {
             } else {
                 filter_page_region_supplement(&page_region_candidate, &regions)
             };
-            maybe_adopt_recognized(
+            maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -364,10 +380,11 @@ impl OrtOcrEngine {
                 &mut layout_applied,
                 &mut regions,
                 &mut fallback,
+                &mut trace,
                 "det-page-regions".to_string(),
                 &candidate,
             );
-            maybe_adopt_candidate_pool(
+            maybe_adopt_candidate_pool_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -377,6 +394,7 @@ impl OrtOcrEngine {
                 &mut fallback,
                 &mut candidate_pool,
                 Some(img),
+                &mut trace,
                 "det-page-regions".to_string(),
                 &candidate,
             );
@@ -394,7 +412,7 @@ impl OrtOcrEngine {
                 self.recognize_high_res_tiles(img, cfg, &regions)?;
             if tile_region_count > 0 {
                 trace.det_pass_count += tile_region_count;
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     &mut text,
                     &mut confidence,
                     &mut line_count,
@@ -402,10 +420,11 @@ impl OrtOcrEngine {
                     &mut layout_applied,
                     &mut regions,
                     &mut fallback,
+                    &mut trace,
                     "det-high-res-tiles".to_string(),
                     &tile_region_candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     &mut text,
                     &mut confidence,
                     &mut line_count,
@@ -415,6 +434,7 @@ impl OrtOcrEngine {
                     &mut fallback,
                     &mut candidate_pool,
                     Some(img),
+                    &mut trace,
                     "det-high-res-tiles".to_string(),
                     &tile_region_candidate,
                 );
@@ -429,7 +449,7 @@ impl OrtOcrEngine {
             "color-region:eager",
         );
         let mut color_region_count = candidate_count;
-        maybe_adopt_recognized(
+        maybe_adopt_recognized_traced(
             &mut text,
             &mut confidence,
             &mut line_count,
@@ -437,10 +457,11 @@ impl OrtOcrEngine {
             &mut layout_applied,
             &mut regions,
             &mut fallback,
+            &mut trace,
             "color-regions:eager".to_string(),
             &candidate,
         );
-        maybe_adopt_candidate_pool(
+        maybe_adopt_candidate_pool_traced(
             &mut text,
             &mut confidence,
             &mut line_count,
@@ -450,6 +471,7 @@ impl OrtOcrEngine {
             &mut fallback,
             &mut candidate_pool,
             Some(img),
+            &mut trace,
             "color-regions:eager".to_string(),
             &candidate,
         );
@@ -465,7 +487,7 @@ impl OrtOcrEngine {
         color_region_count = color_region_count.max(det_color_region_count);
         if det_pass_count > 0 {
             trace.det_pass_count += det_pass_count;
-            maybe_adopt_recognized(
+            maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -473,10 +495,11 @@ impl OrtOcrEngine {
                 &mut layout_applied,
                 &mut regions,
                 &mut fallback,
+                &mut trace,
                 "color-region-det:eager".to_string(),
                 &candidate,
             );
-            maybe_adopt_candidate_pool(
+            maybe_adopt_candidate_pool_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -486,6 +509,7 @@ impl OrtOcrEngine {
                 &mut fallback,
                 &mut candidate_pool,
                 Some(img),
+                &mut trace,
                 "color-region-det:eager".to_string(),
                 &candidate,
             );
@@ -499,7 +523,7 @@ impl OrtOcrEngine {
             "layered-region:eager",
         );
         color_region_count = color_region_count.max(layered_region_count);
-        maybe_adopt_recognized(
+        maybe_adopt_recognized_traced(
             &mut text,
             &mut confidence,
             &mut line_count,
@@ -507,10 +531,11 @@ impl OrtOcrEngine {
             &mut layout_applied,
             &mut regions,
             &mut fallback,
+            &mut trace,
             "layered-regions:eager".to_string(),
             &layered_candidate,
         );
-        maybe_adopt_candidate_pool(
+        maybe_adopt_candidate_pool_traced(
             &mut text,
             &mut confidence,
             &mut line_count,
@@ -520,6 +545,7 @@ impl OrtOcrEngine {
             &mut fallback,
             &mut candidate_pool,
             Some(img),
+            &mut trace,
             "layered-regions:eager".to_string(),
             &layered_candidate,
         );
@@ -532,7 +558,7 @@ impl OrtOcrEngine {
                 MAX_EAGER_VISUAL_REGION_RECOGNITIONS,
                 "visual-region:eager",
             );
-            maybe_adopt_recognized(
+            maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -540,10 +566,11 @@ impl OrtOcrEngine {
                 &mut layout_applied,
                 &mut regions,
                 &mut fallback,
+                &mut trace,
                 "visual-regions:eager".to_string(),
                 &visual_candidate,
             );
-            maybe_adopt_candidate_pool(
+            maybe_adopt_candidate_pool_traced(
                 &mut text,
                 &mut confidence,
                 &mut line_count,
@@ -553,6 +580,7 @@ impl OrtOcrEngine {
                 &mut fallback,
                 &mut candidate_pool,
                 Some(img),
+                &mut trace,
                 "visual-regions:eager".to_string(),
                 &visual_candidate,
             );
@@ -728,10 +756,16 @@ impl OrtOcrEngine {
             );
         }
 
+        let recognized = if matches!(transform, BboxTransform::Identity) {
+            recognized_from_text_lines_with_context(&mut lines, Some(img))
+        } else {
+            recognized_from_text_lines(&mut lines)
+        };
+
         Ok(DetectedText {
             det_box_count: boxes.len(),
             boxes,
-            recognized: recognized_from_text_lines(&mut lines),
+            recognized,
         })
     }
 
@@ -1032,7 +1066,7 @@ impl OrtOcrEngine {
         if *line_repair_rec_budget < 2 {
             return None;
         }
-        let segment_limit = (*line_repair_rec_budget).min(MAX_WIDE_LINE_SEGMENTS_PER_LINE);
+        let segment_limit = wide_line_segment_limit(b, *line_repair_rec_budget);
         let segment_boxes = wide_line_recognition_boxes(img, b, segment_limit);
         if segment_boxes.len() < 2 {
             return None;
@@ -1132,7 +1166,7 @@ impl OrtOcrEngine {
             Ok(candidate) if is_usable_recognition(&candidate) => {
                 let label = recognition_fallback_label("whole-image", candidate.variant);
                 let candidate = recognized_from_candidate(candidate, image_bbox, &label);
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1140,10 +1174,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1153,6 +1188,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate,
                 );
@@ -1168,7 +1204,7 @@ impl OrtOcrEngine {
         trace.fallback_attempt_count += 1;
         let (candidate_count, candidate) = self.recognize_color_regions(img, cfg);
         *color_region_count = (*color_region_count).max(candidate_count);
-        maybe_adopt_recognized(
+        maybe_adopt_recognized_traced(
             text,
             confidence,
             line_count,
@@ -1176,10 +1212,11 @@ impl OrtOcrEngine {
             layout_applied,
             regions,
             fallback,
+            trace,
             "color-regions".to_string(),
             &candidate,
         );
-        maybe_adopt_candidate_pool(
+        maybe_adopt_candidate_pool_traced(
             text,
             confidence,
             line_count,
@@ -1189,6 +1226,7 @@ impl OrtOcrEngine {
             fallback,
             candidate_pool,
             Some(img),
+            trace,
             "color-regions".to_string(),
             &candidate,
         );
@@ -1207,7 +1245,7 @@ impl OrtOcrEngine {
                 BboxTransform::Identity,
             ) {
                 let label = format!("det-enhanced:{name}");
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1215,10 +1253,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate.recognized,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1228,6 +1267,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate.recognized,
                 );
@@ -1243,7 +1283,7 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("enhanced:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate, image_bbox, &label);
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1251,10 +1291,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1264,6 +1305,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate,
                 );
@@ -1292,7 +1334,7 @@ impl OrtOcrEngine {
                 transform,
             ) {
                 let label = format!("det-upscaled:{name}");
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1300,10 +1342,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate.recognized,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1313,6 +1356,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate.recognized,
                 );
@@ -1328,7 +1372,7 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("upscaled:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate, image_bbox, &label);
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1336,10 +1380,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1349,6 +1394,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate,
                 );
@@ -1366,7 +1412,7 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("deskew:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate, image_bbox, &label);
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1374,10 +1420,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1387,6 +1434,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate,
                 );
@@ -1422,7 +1470,7 @@ impl OrtOcrEngine {
                 transform,
             ) {
                 let label = format!("det-rotated:{name}");
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1430,10 +1478,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate.recognized,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1443,6 +1492,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate.recognized,
                 );
@@ -1458,7 +1508,7 @@ impl OrtOcrEngine {
                 let label =
                     recognition_fallback_label(&format!("rotated:{name}"), candidate.variant);
                 let candidate = recognized_from_candidate(candidate, image_bbox, &label);
-                maybe_adopt_recognized(
+                maybe_adopt_recognized_traced(
                     text,
                     confidence,
                     line_count,
@@ -1466,10 +1516,11 @@ impl OrtOcrEngine {
                     layout_applied,
                     regions,
                     fallback,
+                    trace,
                     label.clone(),
                     &candidate,
                 );
-                maybe_adopt_candidate_pool(
+                maybe_adopt_candidate_pool_traced(
                     text,
                     confidence,
                     line_count,
@@ -1479,6 +1530,7 @@ impl OrtOcrEngine {
                     fallback,
                     candidate_pool,
                     Some(img),
+                    trace,
                     label,
                     &candidate,
                 );
@@ -1490,7 +1542,7 @@ impl OrtOcrEngine {
 
         trace.fallback_attempt_count += 1;
         let candidate = self.recognize_line_crops(img, cfg);
-        maybe_adopt_recognized(
+        maybe_adopt_recognized_traced(
             text,
             confidence,
             line_count,
@@ -1498,10 +1550,11 @@ impl OrtOcrEngine {
             layout_applied,
             regions,
             fallback,
+            trace,
             "line-crops".to_string(),
             &candidate,
         );
-        maybe_adopt_candidate_pool(
+        maybe_adopt_candidate_pool_traced(
             text,
             confidence,
             line_count,
@@ -1511,6 +1564,7 @@ impl OrtOcrEngine {
             fallback,
             candidate_pool,
             Some(img),
+            trace,
             "line-crops".to_string(),
             &candidate,
         );
@@ -2118,6 +2172,7 @@ fn ocr_trace_json(
         trace.fallback_attempt_count,
         true,
     );
+    push_json_usize_field(&mut out, "candidate_count", trace.candidates.len(), true);
     push_json_bool_field(
         &mut out,
         "detect_used_whole_image_box",
@@ -2173,6 +2228,30 @@ fn ocr_trace_json(
         push_json_f32_field(&mut out, "min_margin", line.min_margin, true);
         push_json_str_field(&mut out, "source", &line.source, true);
         push_json_str_field(&mut out, "text", &line.text, true);
+        out.push('}');
+    }
+    out.push_str("],\"candidates\":[");
+    for (idx, candidate) in trace.candidates.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_json_usize_field(&mut out, "index", idx, false);
+        push_json_str_field(&mut out, "label", &candidate.label, true);
+        push_json_str_field(&mut out, "mode", &candidate.mode, true);
+        push_json_str_field(&mut out, "action", &candidate.action, true);
+        push_json_str_field(&mut out, "reason", &candidate.reason, true);
+        push_json_f32_field(&mut out, "score", candidate.score, true);
+        push_json_f32_field(&mut out, "confidence", candidate.confidence, true);
+        push_json_usize_field(&mut out, "char_count", candidate.char_count, true);
+        push_json_usize_field(&mut out, "line_count", candidate.line_count, true);
+        push_json_usize_field(&mut out, "region_count", candidate.region_count, true);
+        push_json_usize_field(
+            &mut out,
+            "source_family_count",
+            candidate.source_family_count,
+            true,
+        );
         out.push('}');
     }
     out.push_str("]}");
@@ -3192,6 +3271,67 @@ fn maybe_adopt_candidate_pool(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_adopt_candidate_pool_traced(
+    text: &mut String,
+    confidence: &mut f32,
+    line_count: &mut usize,
+    region_count: &mut usize,
+    layout_applied: &mut bool,
+    regions: &mut Vec<OcrTextRegion>,
+    fallback: &mut Option<String>,
+    candidate_pool: &mut Vec<OcrCandidateEntry>,
+    image: Option<&DynamicImage>,
+    trace: &mut OcrTrace,
+    label: String,
+    candidate: &RecognizedText,
+) -> bool {
+    let before_text = text.clone();
+    let before_confidence = *confidence;
+    let before_line_count = *line_count;
+    let before_pool_len = candidate_pool.len();
+    let adopted = maybe_adopt_candidate_pool(
+        text,
+        confidence,
+        line_count,
+        region_count,
+        layout_applied,
+        regions,
+        fallback,
+        candidate_pool,
+        image,
+        label.clone(),
+        candidate,
+    );
+    if candidate_pool.len() == before_pool_len {
+        trace.candidates.push(trace_candidate_event(
+            label, "pool", "ignored", "empty", candidate,
+        ));
+        return adopted;
+    }
+
+    let pooled = if let Some(image) = image {
+        recognized_from_candidate_pool_with_image(candidate_pool, image)
+    } else {
+        recognized_from_candidate_pool(candidate_pool)
+    };
+    let reason = pooled_candidate_decision_reason(
+        &before_text,
+        before_confidence,
+        before_line_count,
+        &pooled,
+        adopted,
+    );
+    trace.candidates.push(trace_candidate_event(
+        label,
+        "pool",
+        if adopted { "adopted" } else { "rejected" },
+        reason,
+        &pooled,
+    ));
+    adopted
+}
+
 fn pooled_recognition_is_better(
     current_text: &str,
     current_confidence: f32,
@@ -3361,6 +3501,138 @@ fn maybe_adopt_recognized(
     }
 
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_adopt_recognized_traced(
+    text: &mut String,
+    confidence: &mut f32,
+    line_count: &mut usize,
+    region_count: &mut usize,
+    layout_applied: &mut bool,
+    regions: &mut Vec<OcrTextRegion>,
+    fallback: &mut Option<String>,
+    trace: &mut OcrTrace,
+    label: String,
+    candidate: &RecognizedText,
+) -> bool {
+    let before_text = text.clone();
+    let before_confidence = *confidence;
+    let before_line_count = *line_count;
+    let adopted = maybe_adopt_recognized(
+        text,
+        confidence,
+        line_count,
+        region_count,
+        layout_applied,
+        regions,
+        fallback,
+        label.clone(),
+        candidate,
+    );
+    let reason = single_candidate_decision_reason(
+        &before_text,
+        before_confidence,
+        before_line_count,
+        candidate,
+        adopted,
+    );
+    trace.candidates.push(trace_candidate_event(
+        label,
+        "single",
+        if adopted { "adopted" } else { "rejected" },
+        reason,
+        candidate,
+    ));
+    adopted
+}
+
+fn trace_candidate_event(
+    label: String,
+    mode: &str,
+    action: &str,
+    reason: &str,
+    candidate: &RecognizedText,
+) -> OcrTraceCandidate {
+    OcrTraceCandidate {
+        label,
+        mode: mode.to_string(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        score: if candidate.text.trim().is_empty() {
+            0.0
+        } else {
+            recognized_text_quality_score(candidate)
+        },
+        confidence: candidate.confidence,
+        char_count: recognized_char_count(&candidate.text),
+        line_count: candidate.line_count,
+        region_count: candidate.region_count,
+        source_family_count: pooled_source_family_count(candidate),
+    }
+}
+
+fn single_candidate_decision_reason(
+    current_text: &str,
+    current_confidence: f32,
+    current_line_count: usize,
+    candidate: &RecognizedText,
+    adopted: bool,
+) -> &'static str {
+    if candidate.text.trim().is_empty() {
+        return "empty";
+    }
+    if adopted {
+        return "adopted";
+    }
+    candidate_rejection_reason(
+        current_text,
+        current_confidence,
+        current_line_count,
+        candidate,
+    )
+}
+
+fn pooled_candidate_decision_reason(
+    current_text: &str,
+    current_confidence: f32,
+    current_line_count: usize,
+    pooled: &RecognizedText,
+    adopted: bool,
+) -> &'static str {
+    if pooled.text.trim().is_empty() {
+        return "empty-pooled";
+    }
+    if adopted {
+        return "adopted";
+    }
+    candidate_rejection_reason(current_text, current_confidence, current_line_count, pooled)
+}
+
+fn candidate_rejection_reason(
+    current_text: &str,
+    current_confidence: f32,
+    current_line_count: usize,
+    candidate: &RecognizedText,
+) -> &'static str {
+    let current_chars = recognized_char_count(current_text);
+    let candidate_chars = recognized_char_count(&candidate.text);
+    if candidate_chars == 0 {
+        return "empty";
+    }
+    if current_chars == 0 {
+        return "current-empty";
+    }
+    if candidate.line_count > current_line_count && candidate_chars >= current_chars {
+        return "line-gain-threshold";
+    }
+    if candidate_chars <= current_chars + 2 && candidate.confidence <= current_confidence + 0.08 {
+        return "not-better";
+    }
+    if candidate.confidence + 0.16 < current_confidence {
+        return "lower-confidence";
+    }
+    "quality-threshold"
 }
 
 #[cfg(test)]
@@ -4304,6 +4576,17 @@ fn layered_text_boxes_in_panel(
         boxes = nms_boxes(boxes, 0.60);
     }
 
+    if boxes.len() < max_boxes {
+        let remaining = max_boxes.saturating_sub(boxes.len());
+        boxes.extend(
+            dominant_color_layer_text_boxes(&crop, remaining)
+                .into_iter()
+                .map(|b| offset_local_box(panel, b, img_w, img_h))
+                .filter(|b| layered_text_line_box_is_plausible(panel, *b)),
+        );
+        boxes = nms_boxes(boxes, 0.58);
+    }
+
     if depth < 2 && boxes.len() < max_boxes {
         let crop_area = box_area(image_box(&crop)).max(1);
         for child in color_region_boxes(&crop) {
@@ -4327,6 +4610,33 @@ fn layered_text_boxes_in_panel(
         }
     }
 
+    boxes.sort_by(reading_box_order);
+    boxes.truncate(max_boxes);
+    boxes
+}
+
+fn dominant_color_layer_text_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect> {
+    if max_boxes == 0 {
+        return Vec::new();
+    }
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let Some(mask) = soft_color_foreground_mask_from_rgb(&rgb) else {
+        return Vec::new();
+    };
+    let mut boxes = line_boxes_from_foreground_mask(&mask, w as usize, h as usize, max_boxes);
+    if boxes.len() < max_boxes {
+        boxes.extend(component_line_boxes_from_mask(
+            &mask,
+            w as usize,
+            h as usize,
+            max_boxes.saturating_sub(boxes.len()),
+        ));
+        boxes = nms_boxes(boxes, 0.60);
+    }
     boxes.sort_by(reading_box_order);
     boxes.truncate(max_boxes);
     boxes
@@ -4369,6 +4679,18 @@ fn foreground_component_text_boxes(image: &DynamicImage, max_boxes: usize) -> Ve
     let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
         return Vec::new();
     };
+    component_line_boxes_from_mask(&mask, w, h, max_boxes)
+}
+
+fn component_line_boxes_from_mask(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    max_boxes: usize,
+) -> Vec<BoxRect> {
+    if max_boxes == 0 || w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return Vec::new();
+    }
     let mut visited = vec![false; mask.len()];
     let mut components = Vec::new();
     for idx in 0..mask.len() {
@@ -4699,7 +5021,7 @@ fn should_use_uncovered_visual_supplement(
     regions: &[OcrTextRegion],
 ) -> bool {
     if regions.is_empty() {
-        return false;
+        return det_box_count == 0 || line_count == 0;
     }
     let (w, h) = img.dimensions();
     if w >= cfg.det_img_side as u32 || h >= cfg.det_img_side as u32 {
@@ -4811,12 +5133,18 @@ fn merge_nearby_detection_boxes(rgb: &image::RgbImage, mut boxes: Vec<BoxRect>) 
     let mut merged: Vec<BoxRect> = Vec::new();
     for b in boxes {
         if let Some(last) = merged.last_mut() {
-            let y_overlap = last.1 < b.3 && b.1 < last.3;
+            let y_overlap = vertical_overlap(*last, b);
             let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
             let line_h = (last.3 - last.1).min(b.3 - b.1);
             let new_w = last.2.max(b.2) - last.0.min(b.0);
-            if y_overlap
-                && x_gap <= (line_h * 3).max(20)
+            let enough_row_overlap = y_overlap.saturating_mul(100) >= line_h.saturating_mul(45);
+            let max_gap = if new_w >= 720 {
+                (line_h * 2).max(16)
+            } else {
+                (line_h * 3).max(20)
+            };
+            if enough_row_overlap
+                && x_gap <= max_gap
                 && new_w <= 1200
                 && !boxes_have_merge_separator(rgb, *last, b)
             {
@@ -4838,7 +5166,7 @@ fn boxes_have_merge_separator(rgb: &image::RgbImage, left: BoxRect, right: BoxRe
     }
     let gap = right.0 - left.2;
     let line_h = box_height(left).min(box_height(right)).max(1);
-    if gap < line_h.max(18) {
+    if gap < ((line_h * 2) / 3).max(10) {
         return false;
     }
 
@@ -6844,6 +7172,23 @@ fn split_line_box_horizontally(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRe
         .collect()
 }
 
+fn wide_line_segment_limit(bbox: BoxRect, budget: usize) -> usize {
+    let w = box_width(bbox);
+    let h = box_height(bbox).max(1);
+    let aspect = w as f32 / h as f32;
+    let desired = if w >= 1200 || aspect >= 28.0 {
+        6
+    } else if w >= 900 || aspect >= 22.0 {
+        5
+    } else {
+        4
+    };
+    budget
+        .min(MAX_WIDE_LINE_SEGMENTS_PER_LINE)
+        .min(desired)
+        .max(2)
+}
+
 fn wide_line_recognition_boxes(
     image: &DynamicImage,
     bbox: BoxRect,
@@ -7095,6 +7440,7 @@ fn foreground_line_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect>
 fn text_foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
     foreground_mask_from_rgb(rgb)
         .or_else(|| low_contrast_foreground_mask_from_rgb(rgb))
+        .or_else(|| soft_color_foreground_mask_from_rgb(rgb))
         .or_else(|| dark_luma_mask_from_rgb(rgb))
 }
 
@@ -7137,6 +7483,50 @@ fn foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
     let total = (w as usize).saturating_mul(h as usize).max(1);
     let foreground_ratio = foreground_count as f32 / total as f32;
     if foreground_count < 4 || !(0.001..=0.50).contains(&foreground_ratio) {
+        return None;
+    }
+    Some(mask)
+}
+
+fn soft_color_foreground_mask_from_rgb(rgb: &image::RgbImage) -> Option<Vec<bool>> {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let bg = estimate_region_background_rgb(rgb);
+    let mut distances = Vec::with_capacity((w as usize).saturating_mul(h as usize));
+    let mut max_distance = 0u8;
+    for pixel in rgb.pixels() {
+        let distance = color_distance_u8(pixel, bg);
+        max_distance = max_distance.max(distance);
+        distances.push(distance);
+    }
+    if max_distance < 8 {
+        return None;
+    }
+
+    let threshold = otsu_threshold_values(&distances).clamp(8, 64);
+    let mut foreground_count = 0usize;
+    let mask = distances
+        .into_iter()
+        .map(|distance| {
+            let foreground = distance >= threshold;
+            if foreground {
+                foreground_count += 1;
+            }
+            foreground
+        })
+        .collect::<Vec<_>>();
+
+    let total = (w as usize).saturating_mul(h as usize).max(1);
+    let foreground_ratio = foreground_count as f32 / total as f32;
+    if foreground_count < 4 || !(0.001..=0.58).contains(&foreground_ratio) {
+        return None;
+    }
+    if !foreground_glyph_textness_score(&mask, w as usize, h as usize)
+        .is_some_and(|score| score >= -20)
+    {
         return None;
     }
     Some(mask)
@@ -7411,23 +7801,8 @@ fn ctc_greedy_decode_with_stats(
     let mut count = 0usize;
 
     for t in 0..steps {
-        let mut best_id = 0usize;
-        let mut best_val = f32::NEG_INFINITY;
-        let mut second_val = f32::NEG_INFINITY;
-        for c in 0..classes {
-            let v = if channel_first {
-                logits[c * steps + t]
-            } else {
-                logits[t * classes + c]
-            };
-            if v > best_val {
-                second_val = best_val;
-                best_val = v;
-                best_id = c;
-            } else if v > second_val {
-                second_val = v;
-            }
-        }
+        let (best_id, best_prob, second_prob) =
+            ctc_frame_top2_probability(logits, t, steps, classes, channel_first);
         if best_id != blank_id && best_id != prev {
             let idx = best_id.saturating_sub(1);
             if let Some(ch) = alphabet.get(idx) {
@@ -7435,12 +7810,8 @@ fn ctc_greedy_decode_with_stats(
                     continue;
                 }
                 text.push_str(ch);
-                prob_sum += best_val;
-                let margin = if second_val.is_finite() {
-                    (best_val - second_val).max(0.0)
-                } else {
-                    0.0
-                };
+                prob_sum += best_prob;
+                let margin = (best_prob - second_prob).max(0.0);
                 margin_sum += margin;
                 min_margin = min_margin.min(margin);
                 count += 1;
@@ -7520,8 +7891,7 @@ fn ctc_path_beam_decode_with_stats(
         for (prefix, state) in active {
             let total_score = ctc_prefix_total_score(&state);
             let (best_path, best_path_score) = state.best_path_and_score();
-            for &(class_id, value) in &top {
-                let score = ctc_log_score(value);
+            for &(class_id, score) in &top {
                 if class_id == 0 {
                     let mut path = best_path.clone();
                     path.push(0);
@@ -7697,9 +8067,13 @@ fn ctc_top_classes(
     channel_first: bool,
     k: usize,
 ) -> Vec<(usize, f32)> {
+    let log_probs = ctc_frame_log_probabilities(logits, t, steps, classes, channel_first);
     let mut top = Vec::<(usize, f32)>::new();
     for class_id in 0..classes {
-        let value = ctc_frame_value(logits, t, class_id, steps, classes, channel_first);
+        let value = log_probs
+            .get(class_id)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY);
         let pos = top
             .iter()
             .position(|(_, seen)| value > *seen)
@@ -7710,12 +8084,116 @@ fn ctc_top_classes(
         }
     }
     if !top.iter().any(|(class_id, _)| *class_id == 0) {
-        top.push((
-            0,
-            ctc_frame_value(logits, t, 0, steps, classes, channel_first),
-        ));
+        top.push((0, log_probs.first().copied().unwrap_or(f32::NEG_INFINITY)));
     }
     top
+}
+
+fn ctc_frame_top2_probability(
+    logits: &[f32],
+    t: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+) -> (usize, f32, f32) {
+    let log_probs = ctc_frame_log_probabilities(logits, t, steps, classes, channel_first);
+    let mut best_id = 0usize;
+    let mut best_log = f32::NEG_INFINITY;
+    let mut second_log = f32::NEG_INFINITY;
+    for (class_id, value) in log_probs.iter().copied().enumerate() {
+        if value > best_log {
+            second_log = best_log;
+            best_log = value;
+            best_id = class_id;
+        } else if value > second_log {
+            second_log = value;
+        }
+    }
+    (
+        best_id,
+        if best_log.is_finite() {
+            best_log.exp()
+        } else {
+            0.0
+        },
+        if second_log.is_finite() {
+            second_log.exp()
+        } else {
+            0.0
+        },
+    )
+}
+
+fn ctc_frame_probability(
+    logits: &[f32],
+    t: usize,
+    class_id: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+) -> f32 {
+    ctc_frame_log_probabilities(logits, t, steps, classes, channel_first)
+        .get(class_id)
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(f32::exp)
+        .unwrap_or(0.0)
+}
+
+fn ctc_frame_log_probabilities(
+    logits: &[f32],
+    t: usize,
+    steps: usize,
+    classes: usize,
+    channel_first: bool,
+) -> Vec<f32> {
+    if classes == 0 {
+        return Vec::new();
+    }
+    let mut values = Vec::with_capacity(classes);
+    let mut sum = 0.0f32;
+    let mut all_probability_like = true;
+    let mut max_value = f32::NEG_INFINITY;
+    for class_id in 0..classes {
+        let value = ctc_frame_value(logits, t, class_id, steps, classes, channel_first);
+        if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+            all_probability_like = false;
+        }
+        if value.is_finite() {
+            sum += value.max(0.0);
+            max_value = max_value.max(value);
+        }
+        values.push(value);
+    }
+
+    if all_probability_like && sum > 1.0e-6 {
+        return values
+            .into_iter()
+            .map(|value| (value / sum).max(1.0e-6).ln())
+            .collect();
+    }
+    if !max_value.is_finite() {
+        return vec![CTC_LOG_ZERO; classes];
+    }
+
+    let mut exp_sum = 0.0f32;
+    let mut exp_values = Vec::with_capacity(classes);
+    for value in values {
+        let exp = if value.is_finite() {
+            (value - max_value).exp()
+        } else {
+            0.0
+        };
+        exp_sum += exp;
+        exp_values.push(exp);
+    }
+    if exp_sum <= 0.0 || !exp_sum.is_finite() {
+        return vec![CTC_LOG_ZERO; classes];
+    }
+    exp_values
+        .into_iter()
+        .map(|value| (value / exp_sum).max(1.0e-6).ln())
+        .collect()
 }
 
 fn ctc_frame_value(
@@ -7732,18 +8210,6 @@ fn ctc_frame_value(
         t.saturating_mul(classes).saturating_add(class_id)
     };
     logits.get(idx).copied().unwrap_or(f32::NEG_INFINITY)
-}
-
-fn ctc_log_score(value: f32) -> f32 {
-    if value.is_finite() {
-        if (0.0..=1.0).contains(&value) {
-            value.max(1.0e-6).ln()
-        } else {
-            value
-        }
-    } else {
-        -1.0e9
-    }
 }
 
 fn ctc_stats_for_path(
@@ -7769,8 +8235,9 @@ fn ctc_stats_for_path(
                     continue;
                 }
                 text.push_str(ch);
-                let value = ctc_frame_value(logits, t, id, steps, classes, channel_first);
-                let second = ctc_second_best_value(logits, t, id, steps, classes, channel_first);
+                let value = ctc_frame_probability(logits, t, id, steps, classes, channel_first);
+                let second =
+                    ctc_second_best_probability(logits, t, id, steps, classes, channel_first);
                 prob_sum += value;
                 let margin = (value - second).max(0.0);
                 margin_sum += margin;
@@ -7793,7 +8260,7 @@ fn ctc_stats_for_path(
     )
 }
 
-fn ctc_second_best_value(
+fn ctc_second_best_probability(
     logits: &[f32],
     t: usize,
     selected: usize,
@@ -7801,21 +8268,24 @@ fn ctc_second_best_value(
     classes: usize,
     channel_first: bool,
 ) -> f32 {
+    let log_probs = ctc_frame_log_probabilities(logits, t, steps, classes, channel_first);
     let mut second = f32::NEG_INFINITY;
     for class_id in 0..classes {
         if class_id == selected {
             continue;
         }
-        second = second.max(ctc_frame_value(
-            logits,
-            t,
-            class_id,
-            steps,
-            classes,
-            channel_first,
-        ));
+        second = second.max(
+            log_probs
+                .get(class_id)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY),
+        );
     }
-    if second.is_finite() { second } else { 0.0 }
+    if second.is_finite() {
+        second.exp()
+    } else {
+        0.0
+    }
 }
 
 fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCandidate {
@@ -8191,7 +8661,7 @@ mod tests {
     #[test]
     fn raw_split_detection_candidates_keep_merged_and_parts() {
         let rgb = image::RgbImage::from_pixel(128, 24, image::Rgb([255, 255, 255]));
-        let raw = vec![(0, 0, 40, 12), (54, 0, 104, 12)];
+        let raw = vec![(0, 0, 40, 12), (46, 0, 104, 12)];
         let boxes = merge_nearby_detection_boxes(&rgb, raw.clone());
         assert_eq!(boxes, vec![(0, 0, 104, 12)]);
 
@@ -8199,7 +8669,7 @@ mod tests {
 
         assert_eq!(alternatives.len(), 2);
         assert!(alternatives.contains(&(0, 0, 40, 12)));
-        assert!(alternatives.contains(&(54, 0, 104, 12)));
+        assert!(alternatives.contains(&(46, 0, 104, 12)));
     }
 
     #[test]
@@ -8210,6 +8680,16 @@ mod tests {
         let boxes = merge_nearby_detection_boxes(&rgb, raw);
 
         assert_eq!(boxes, vec![(0, 8, 42, 22), (74, 8, 120, 22)]);
+    }
+
+    #[test]
+    fn merge_nearby_detection_boxes_respects_small_panel_gap() {
+        let rgb = image::RgbImage::from_pixel(180, 32, image::Rgb([250, 250, 250]));
+        let raw = vec![(10, 8, 70, 22), (86, 8, 148, 22)];
+
+        let boxes = merge_nearby_detection_boxes(&rgb, raw);
+
+        assert_eq!(boxes, vec![(10, 8, 70, 22), (86, 8, 148, 22)]);
     }
 
     #[test]
@@ -8311,6 +8791,27 @@ mod tests {
 
         assert!(!boxes.is_empty());
         assert!(boxes.iter().all(|b| b.0 > 180));
+    }
+
+    #[test]
+    fn uncovered_visual_supplement_runs_when_no_regions_exist() {
+        let cfg = OcrConfig::default();
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(320, 80, Luma([255])));
+
+        assert!(should_use_uncovered_visual_supplement(
+            &img,
+            &cfg,
+            0,
+            0,
+            &[]
+        ));
+        assert!(should_use_uncovered_visual_supplement(
+            &img,
+            &cfg,
+            2,
+            0,
+            &[]
+        ));
     }
 
     #[test]
@@ -8654,6 +9155,18 @@ mod tests {
             det_pass_count: 1,
             fallback_attempt_count: 0,
             lines: ocr_trace_lines_from_regions(&regions),
+            candidates: vec![OcrTraceCandidate {
+                label: "det".to_string(),
+                mode: "single".to_string(),
+                action: "adopted".to_string(),
+                reason: "adopted".to_string(),
+                score: 92.0,
+                confidence: 0.82,
+                char_count: 13,
+                line_count: 1,
+                region_count: 1,
+                source_family_count: 1,
+            }],
             json: None,
         };
 
@@ -8665,6 +9178,10 @@ mod tests {
         assert!(json.contains("\"crop_size\":[80,24]"));
         assert!(json.contains("\"avg_margin\":0.1100"));
         assert!(json.contains("\"min_margin\":0.0500"));
+        assert!(json.contains("\"candidate_count\":1"));
+        assert!(json.contains("\"candidates\":["));
+        assert!(json.contains("\"label\":\"det\""));
+        assert!(json.contains("\"reason\":\"adopted\""));
         assert!(json.contains("A \\\"quoted\\\" line"));
         assert_eq!(trace.json.as_deref(), Some(json.as_str()));
     }
@@ -8677,7 +9194,7 @@ mod tests {
     #[test]
     fn dynamic_rec_target_width_grows_for_long_lines() {
         let long = DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 48, Luma([128])));
-        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 640);
+        assert_eq!(dynamic_rec_target_width(&long, 48, 320), 960);
         let narrow = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 48, Luma([128])));
         assert_eq!(dynamic_rec_target_width(&narrow, 48, 320), 320);
     }
@@ -8733,9 +9250,27 @@ mod tests {
             ctc_greedy_decode_with_stats(&logits, &[1, 4, 3], &alphabet);
 
         assert_eq!(text, "AB");
-        assert!((confidence - 0.85).abs() < 0.01);
-        assert!(stats.avg_margin > 0.65);
-        assert!(stats.min_margin > 0.60);
+        assert!((0.60..=1.0).contains(&confidence));
+        assert!(stats.avg_margin > 0.40);
+        assert!(stats.min_margin > 0.35);
+    }
+
+    #[test]
+    fn ctc_decode_calibrates_raw_logits_to_probability_confidence() {
+        let alphabet = vec!["A".to_string(), "B".to_string()];
+        let logits = vec![
+            0.0, 0.0, // blank
+            4.0, 0.2, // A
+            0.1, 3.5, // B
+        ];
+
+        let (text, confidence, stats) =
+            ctc_greedy_decode_with_stats(&logits, &[1, 3, 2], &alphabet);
+
+        assert_eq!(text, "AB");
+        assert!((0.0..=1.0).contains(&confidence));
+        assert!((0.0..=1.0).contains(&stats.avg_margin));
+        assert!(stats.avg_margin > 0.80);
     }
 
     #[test]
@@ -8996,6 +9531,53 @@ mod tests {
     }
 
     #[test]
+    fn traced_single_candidate_records_rejected_reason() {
+        let mut text = "Alpha Beta".to_string();
+        let mut confidence = 0.86;
+        let mut line_count = 1;
+        let mut region_count = 1;
+        let mut layout_applied = false;
+        let mut regions = vec![ocr_region_with_line(
+            [10, 10, 160, 30],
+            "Alpha Beta",
+            0.86,
+            "det",
+        )];
+        let mut fallback = None;
+        let mut trace = OcrTrace::default();
+        let candidate = RecognizedText {
+            text: "Alpha".to_string(),
+            confidence: 0.60,
+            line_count: 1,
+            region_count: 1,
+            layout_applied: false,
+            regions: vec![ocr_region_with_line(
+                [10, 10, 80, 30],
+                "Alpha",
+                0.60,
+                "visual-region",
+            )],
+        };
+
+        assert!(!maybe_adopt_recognized_traced(
+            &mut text,
+            &mut confidence,
+            &mut line_count,
+            &mut region_count,
+            &mut layout_applied,
+            &mut regions,
+            &mut fallback,
+            &mut trace,
+            "visual-regions:eager".to_string(),
+            &candidate,
+        ));
+
+        assert_eq!(trace.candidates.len(), 1);
+        assert_eq!(trace.candidates[0].action, "rejected");
+        assert_eq!(trace.candidates[0].reason, "not-better");
+    }
+
+    #[test]
     fn recognized_from_text_lines_dedupes_overlapping_similar_lines() {
         let mut lines = vec![
             text_line((10, 10, 180, 26), "Project status: ready", 0.62),
@@ -9214,6 +9796,23 @@ mod tests {
         assert!(boxes.iter().any(|b| b.1 <= 50 && b.3 >= 58));
         assert!(boxes.iter().any(|b| b.1 <= 88 && b.3 >= 96));
         assert!(boxes.iter().all(|b| box_height(*b) < 60));
+    }
+
+    #[test]
+    fn dominant_color_layer_boxes_keep_subtle_dark_foreground() {
+        let mut rgb = image::RgbImage::from_pixel(180, 70, image::Rgb([236, 238, 242]));
+        for y in 24..32 {
+            for x in [24, 44, 64, 104, 124, 144] {
+                for xx in x..x + 8 {
+                    rgb.put_pixel(xx, y, image::Rgb([208, 210, 214]));
+                }
+            }
+        }
+
+        let boxes = dominant_color_layer_text_boxes(&DynamicImage::ImageRgb8(rgb), 4);
+
+        assert!(!boxes.is_empty());
+        assert!(boxes.iter().any(|b| b.1 <= 24 && b.3 >= 32));
     }
 
     #[test]
@@ -9567,6 +10166,13 @@ mod tests {
 
         assert_eq!(boxes.len(), 3);
         assert!(boxes.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[test]
+    fn wide_line_segment_limit_grows_for_very_long_lines() {
+        assert_eq!(wide_line_segment_limit((0, 0, 640, 48), 8), 4);
+        assert_eq!(wide_line_segment_limit((0, 0, 960, 40), 8), 5);
+        assert_eq!(wide_line_segment_limit((0, 0, 1400, 42), 8), 6);
     }
 
     #[test]

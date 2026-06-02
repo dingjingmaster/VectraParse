@@ -52,10 +52,12 @@ def check_case(case_id: str, trace_path: Path, expected_path: Path) -> list[str]
         return [f"{case_id}: invalid expected json {expected_path}: {exc}"]
 
     lines = trace_lines(trace)
+    candidates = trace_candidates(trace)
     full_text = trace_text(trace, lines)
     summary = trace.get("summary", {})
     failures.extend(check_count(case_id, "line_count", len(lines), expected.get("line_count")))
     failures.extend(check_count(case_id, "region_count", len(trace.get("regions", [])), expected.get("region_count")))
+    failures.extend(check_count(case_id, "candidate_count", len(candidates), expected.get("candidate_count")))
     failures.extend(check_float(case_id, "confidence", float(summary.get("confidence", 0.0)), expected.get("confidence")))
     failures.extend(check_float(case_id, "avg_line_confidence", average_field(lines, "confidence"), expected.get("avg_line_confidence")))
     failures.extend(check_float(case_id, "avg_line_margin", average_field(lines, "avg_margin"), expected.get("avg_line_margin")))
@@ -87,6 +89,17 @@ def check_case(case_id: str, trace_path: Path, expected_path: Path) -> list[str]
                 f"{case_id}: must_not_have[{idx}] matched {len(matched)} line(s): {json.dumps(rule, ensure_ascii=False)}"
             )
 
+    for idx, rule in enumerate(expected.get("must_have_candidate", []), start=1):
+        if not any(candidate_matches(candidate, rule) for candidate in candidates):
+            failures.append(f"{case_id}: must_have_candidate[{idx}] not found: {json.dumps(rule, ensure_ascii=False)}")
+
+    for idx, rule in enumerate(expected.get("must_not_have_candidate", []), start=1):
+        matched = [candidate for candidate in candidates if candidate_matches(candidate, rule)]
+        if matched:
+            failures.append(
+                f"{case_id}: must_not_have_candidate[{idx}] matched {len(matched)} candidate(s): {json.dumps(rule, ensure_ascii=False)}"
+            )
+
     return failures
 
 
@@ -105,6 +118,13 @@ def trace_lines(trace: dict) -> list[dict]:
             item.setdefault("line_index", line_idx)
             out.append(item)
     return out
+
+
+def trace_candidates(trace: dict) -> list[dict]:
+    candidates = trace.get("candidates")
+    if isinstance(candidates, list):
+        return [candidate for candidate in candidates if isinstance(candidate, dict)]
+    return []
 
 
 def trace_text(trace: dict, lines: list[dict]) -> str:
@@ -201,6 +221,28 @@ def line_matches(line: dict, rule: dict) -> bool:
         return False
     if "max_min_margin" in rule and float(line.get("min_margin", 0.0)) > float(rule["max_min_margin"]):
         return False
+    return True
+
+
+def candidate_matches(candidate: dict, rule: dict) -> bool:
+    for key in ["label", "mode", "action", "reason"]:
+        if key in rule and candidate.get(key) != rule[key]:
+            return False
+    if "label_contains" in rule and rule["label_contains"] not in str(candidate.get("label", "")):
+        return False
+    if "min_score" in rule and float(candidate.get("score", 0.0)) < float(rule["min_score"]):
+        return False
+    if "max_score" in rule and float(candidate.get("score", 0.0)) > float(rule["max_score"]):
+        return False
+    if "min_confidence" in rule and float(candidate.get("confidence", 0.0)) < float(rule["min_confidence"]):
+        return False
+    if "max_confidence" in rule and float(candidate.get("confidence", 0.0)) > float(rule["max_confidence"]):
+        return False
+    for key in ["char_count", "line_count", "region_count", "source_family_count"]:
+        if f"min_{key}" in rule and int(candidate.get(key, 0)) < int(rule[f"min_{key}"]):
+            return False
+        if f"max_{key}" in rule and int(candidate.get(key, 0)) > int(rule[f"max_{key}"]):
+            return False
     return True
 
 

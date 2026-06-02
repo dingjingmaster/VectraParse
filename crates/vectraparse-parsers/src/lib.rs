@@ -1306,6 +1306,10 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
         metadata.insert("image.ocr.selected_source", source.clone());
     }
     metadata.insert("image.ocr.trace_line_count", ocr.trace.lines.len().to_string());
+    metadata.insert(
+        "image.ocr.trace_candidate_count",
+        ocr.trace.candidates.len().to_string(),
+    );
     if let Some(json) = &ocr.trace.json {
         metadata.insert("image.ocr.trace_json", json.clone());
     }
@@ -3525,6 +3529,18 @@ mod tests {
                     min_margin: 0.0,
                     source: "whole-image".to_string(),
                 }],
+                candidates: vec![vectraparse_ocr::OcrTraceCandidate {
+                    label: "whole-image".to_string(),
+                    mode: "single".to_string(),
+                    action: "adopted".to_string(),
+                    reason: "adopted".to_string(),
+                    score: 20.0,
+                    confidence: 0.2,
+                    char_count: 3,
+                    line_count: 1,
+                    region_count: 1,
+                    source_family_count: 1,
+                }],
                 json: Some("{\"lines\":[]}".to_string()),
             },
         };
@@ -3588,6 +3604,13 @@ mod tests {
         assert_eq!(
             metadata
                 .values("image.ocr.trace_line_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_candidate_count")
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("1")
