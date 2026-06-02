@@ -76,6 +76,7 @@
 ## 6. 实现记录
 
 - 修改文件：
+  - `3thrd/onnxruntime/onnxruntime/core/mlas/lib/x86_64/*.S`
   - `build-build/build_ort.sh`
   - `crates/vectraparse-ocr/build.rs`
   - `scripts/bundle_static_ffi.sh`
@@ -88,6 +89,7 @@
   - `3thrd/date/include/date/date.h`
   - `docs/dev/README.md`
 - 关键决策：
+  - 对 vendored ONNX Runtime 的 `mlas/lib/x86_64/*.S` 统一补 `.note.GNU-stack`，一次性消除 GNU ld 对可执行栈的告警。
   - 保留 `build-build/install/lib` 下既有 shared 产物，不做清理；静态消费统一走 `build-build/install/static/lib/libonnxruntime_all.a`。
   - 用 `ar -M` 归并 `libvectraparse_ffi.a` 与 `libonnxruntime_all.a`，输出单独的 `target/release/libvectraparse_ffi_full.a`，不覆盖 Cargo 默认 `staticlib`。
   - 静态 archive 消费侧统一改用 `g++` 链接，避免 C++ 运行时符号由下游手工补齐。
@@ -119,12 +121,12 @@
 | ABI matrix 脚本 | `bash scripts/abi_matrix_smoke.sh /tmp/abi-matrix-report.md` | 通过 | 产出报告并完成符号检查 |
 | 静态示例构建 | `make file-content` | 通过 | 生成 `target/extract-static` |
 | 静态示例运行 | `./target/extract-static /data/code/VectraParse/tests/fixtures/minimal.pdf` | 通过 | 输出 `application/pdf` 与 `%PDF-1.7` |
+| GNU-stack 告警回归 | `cmake --build build-build/ort_build_static --config Release --target onnxruntime_mlas_q4dq -j\"$(nproc)\"` | 通过 | 原 `QgemmU8S8KernelAmx.S.o` 告警消失，MLAS 目标链接无同类告警 |
 | 工作区格式检查 | `git diff --check` | 通过 | 无空白错误 |
 
 - 未执行验证项：
   - 未做跨平台矩阵验证（当前仅验证本机 Linux/x86_64）。
 - 残余风险：
-  - `libonnxruntime_all.a` 中部分汇编对象仍触发 `.note.GNU-stack` 链接告警，但不影响当前静态链接结果。
   - `build-build/install/lib` 下旧 shared 产物仍保留，若后续需要彻底移除动态路径，应单独做安装目录清理策略。
 
 ## 8. 总结

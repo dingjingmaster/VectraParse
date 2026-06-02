@@ -514,4 +514,5 @@ C_UNDERSCORE(MlasErfKernelFma3):
         add     rsp,ErfKernelFrame_ReturnAddress
         ret
 
+        .section .note.GNU-stack,"",@progbits
         .end

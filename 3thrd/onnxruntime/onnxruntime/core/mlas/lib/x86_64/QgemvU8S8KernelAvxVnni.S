@@ -341,4 +341,5 @@ C_UNDERSCORE(MlasGemvU8S8KernelAvxVnni):
         jnz     .LProcessColumnLoopSmallKBySmallN
         jmp     .LExitKernel
 
+        .section .note.GNU-stack,"",@progbits
         .end

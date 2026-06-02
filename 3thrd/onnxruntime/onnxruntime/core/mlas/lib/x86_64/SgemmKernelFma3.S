@@ -31,4 +31,5 @@ Abstract:
 
 FgemmKernelFma3Function MlasGemmFloatKernelFma3
 
+        .section .note.GNU-stack,"",@progbits
         .end

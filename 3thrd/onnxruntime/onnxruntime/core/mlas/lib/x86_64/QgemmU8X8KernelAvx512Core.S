@@ -706,4 +706,5 @@ Return Value:
 .LProcessCountM5:
         ProcessCountM 5
 
+        .section .note.GNU-stack,"",@progbits
         .end

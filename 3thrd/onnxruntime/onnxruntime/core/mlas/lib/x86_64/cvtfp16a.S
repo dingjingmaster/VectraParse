@@ -127,3 +127,5 @@ StoreLastElement:
 
 ExitRoutine:
         ret
+
+        .section .note.GNU-stack,"",@progbits

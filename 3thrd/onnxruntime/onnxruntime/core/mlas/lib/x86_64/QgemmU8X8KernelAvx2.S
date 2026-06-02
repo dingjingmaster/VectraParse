@@ -1134,4 +1134,5 @@ Return Value:
         mov     eax,-1
         MlasGemmInt8KernelAvx2 1, 0
 
+        .section .note.GNU-stack,"",@progbits
         .end

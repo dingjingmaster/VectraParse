@@ -303,4 +303,5 @@ Return Value:
         SpoolKernelFunction AverageExcludePad, Sse
         SpoolKernelFunction AverageIncludePad, Sse
 
+        .section .note.GNU-stack,"",@progbits
         .end

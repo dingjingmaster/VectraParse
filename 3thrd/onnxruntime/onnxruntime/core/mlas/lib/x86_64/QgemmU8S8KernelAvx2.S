@@ -779,4 +779,5 @@ Return Value:
         FUNCTION_ENTRY MlasGemmS8CopyPackBAvx2Vnni
         MlasGemmCopyPackBAvx2 1, 1
 
+        .section .note.GNU-stack,"",@progbits
         .end

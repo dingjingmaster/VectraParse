@@ -231,4 +231,5 @@ Implicit Arguments:
         SpoolKernelFunction AverageExcludePad, Avx
         SpoolKernelFunction AverageIncludePad, Avx
 
+        .section .note.GNU-stack,"",@progbits
         .end

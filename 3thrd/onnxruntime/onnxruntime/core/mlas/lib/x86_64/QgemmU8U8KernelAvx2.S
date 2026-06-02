@@ -596,4 +596,5 @@ Return Value:
         vmovdqu YMMWORD PTR [r9+32],ymm1
         jmp     .LCopyPackB.ExitRoutine
 
+        .section .note.GNU-stack,"",@progbits
         .end

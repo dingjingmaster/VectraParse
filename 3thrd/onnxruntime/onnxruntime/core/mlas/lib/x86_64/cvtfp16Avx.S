@@ -141,3 +141,5 @@ ConvertMaskedUpperVector:
         jmp ExitRoutine
 ExitRoutine:
         ret
+
+        .section .note.GNU-stack,"",@progbits

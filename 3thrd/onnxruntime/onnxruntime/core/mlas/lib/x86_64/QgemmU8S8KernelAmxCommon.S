@@ -231,4 +231,5 @@ Arguments:
 	tilecfgMacro 0x79, \BaseReg\()
 
         .endm
+        .section .note.GNU-stack,"",@progbits
 	

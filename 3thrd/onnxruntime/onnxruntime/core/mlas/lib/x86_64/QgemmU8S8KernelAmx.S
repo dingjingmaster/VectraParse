@@ -513,4 +513,5 @@ Return Value:
         ret
 
 
+        .section .note.GNU-stack,"",@progbits
         .end

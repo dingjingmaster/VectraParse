@@ -350,4 +350,5 @@ MlasConvPostProcessFloatSseFilter\FilterCount\()Output\OutputCount\():
         .endr
         .endr
 
+        .section .note.GNU-stack,"",@progbits
         .end

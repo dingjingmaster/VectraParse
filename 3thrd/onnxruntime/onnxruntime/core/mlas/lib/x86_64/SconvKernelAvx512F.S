@@ -521,4 +521,5 @@ MlasConvPostProcessFloatAvx512FFilter\FilterCount\()Output\OutputCount\():
         .endr
         .endr
 
+        .section .note.GNU-stack,"",@progbits
         .end

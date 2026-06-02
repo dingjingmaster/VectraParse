@@ -98,4 +98,5 @@ Return Value:
         vzeroupper
         ret
 
+        .section .note.GNU-stack,"",@progbits
         .end

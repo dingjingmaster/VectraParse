@@ -31,4 +31,5 @@ Abstract:
 
 FgemmKernelAvxFunction MlasGemmFloatKernelAvx
 
+        .section .note.GNU-stack,"",@progbits
         .end
