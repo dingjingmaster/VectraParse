@@ -69,6 +69,7 @@
   - `apply_quality_fallbacks` 改为 family budget 控制，空结果与部分结果使用不同预算。
   - 高分辨率 tile 与 visual supplement 的门槛收紧，但保留对可修复长行的补扫能力。
   - 对复杂截图进一步增加 eager supplement 总预算、链路中途早停和候选前置过滤，优先减少无效 OCR 工作量。
+  - 对 supplement 候选增加“主内容区 focus band”排序和边栏候选限额，优先保留已有 det 主文本区域附近的候选，限制左右侧栏继续扩张工作量。
 - 计划偏差：
   - `OcrTrace` 新字段影响到 parser 单测桩，已同步补齐。
 
@@ -76,11 +77,11 @@
 
 | 验证项 | 命令/步骤 | 结果 | 备注 |
 |--------|-----------|------|------|
-| OCR 单测 | `cargo test -p vectraparse-ocr` | 通过 | 116 tests passed |
+| OCR 单测 | `cargo test -p vectraparse-ocr` | 通过 | 120 tests passed |
 | Parser 定向回归 | `cargo test -p vectraparse-parsers ocr_success_metadata_records_fallback_and_low_confidence -- --nocapture` | 通过 | OCR metadata 回归通过 |
 | FFI 构建检查 | `cargo check -p vectraparse-ffi` | 通过 | 下游 crate 编译通过 |
 | 复杂截图补扫回归 | `cargo test -p vectraparse-ocr` | 通过 | 新增总预算/过滤后 OCR 单测仍全部通过 |
-| 真实样本耗时回归 | `time ./target/extract-static /home/dingjing/files/b.png` | 通过 | 未再触发排序 panic，实测约 `17m03s`，较用户先前的 `20m09s` 有下降 |
+| 真实样本耗时回归 | `time ./target/extract-static /home/dingjing/files/b.png` | 通过 | 未再触发排序 panic，本轮实测约 `17m02s`；相对最初 `20m09s` 已下降，但较上一轮 `17m03s` 基本持平 |
 | 工作区检查 | `git diff --check` | 通过 | 无空白错误 |
 
 ## 8. 总结
@@ -91,10 +92,11 @@
   - 单个 crop 的主/备模型识别改为按需触发，减少重复 ONNX 推理。
   - 质量 fallback 改为 family budget，避免全图 enhancement/upscale/rotation 长链路无上限展开。
   - 补充了 eager supplement 总预算、链路中途早停和候选前置过滤，进一步压缩复杂截图上的 work explosion。
-  - 在用户给出的复杂截图样本上，端到端运行时间从约 `20m09s` 降到约 `17m03s`。
+  - supplement 候选新增主内容区 focus band 排序与边栏限额，避免已有主文本区域明确时，侧栏候选在排序上继续吞掉预算。
+  - 在用户给出的复杂截图样本上，端到端运行时间从约 `20m09s` 降到约 `17m02s`；但本轮 focus-band 优化相对上一轮 `17m03s` 没有继续拉开差距。
 - 残余风险：
   - 当前只验证了功能回归，没有补真实样本的 OCR 耗时基准对比；速度收益需要你用现网截图再确认。
   - alt 按需触发会略微改变中英文混排边界样本的模型选择频率，后续应结合 trace 再做门槛微调。
-  - 复杂 IM/工作台截图仍然偏慢，说明 panel 优先级和候选统一池还没做完。
+  - 复杂 IM/工作台截图仍然偏慢，说明真正的长尾热点更可能在补扫候选统一池、crop 预处理重复和 fallback family 内部展开，而不是单纯侧栏排序。
 - 后续建议：
-  - 下一轮直接基于 trace 的 `timing_ms` 统计私有样本，按阶段占比继续砍最重路径。
+  - 下一轮优先做 supplement 候选统一池或 crop 分析缓存，再用 trace 的 `timing_ms` / `rec_*_call_count` 继续收缩长尾。

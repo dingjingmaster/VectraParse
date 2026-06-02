@@ -22,6 +22,7 @@ const MAX_EAGER_LAYERED_REGION_RECOGNITIONS: usize = 10;
 const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
 const MAX_EAGER_SUPPLEMENT_RECOGNITIONS_TOTAL: usize = 12;
 const MAX_EAGER_SUPPLEMENT_DET_PASSES_TOTAL: usize = 4;
+const MAX_SUPPLEMENT_OUTSIDE_FOCUS_CANDIDATES: usize = 3;
 const MAX_QUALITY_FALLBACK_FAMILIES_EMPTY: usize = 5;
 const MAX_QUALITY_FALLBACK_FAMILIES_PARTIAL: usize = 3;
 const MAX_REC_IMG_W: usize = 960;
@@ -519,11 +520,18 @@ impl OrtOcrEngine {
             &regions,
         );
         if run_eager_color
-            && should_continue_eager_supplements(&text, confidence, det_box_count, line_count, &regions)
+            && should_continue_eager_supplements(
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
+            )
             && remaining_supplement_rec_budget > 0
         {
             let color_region_start = Instant::now();
-            let color_limit = MAX_EAGER_COLOR_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
+            let color_limit =
+                MAX_EAGER_COLOR_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
             let (candidate_count, attempted, candidate) = self.recognize_uncovered_color_regions(
                 img,
                 cfg,
@@ -626,10 +634,10 @@ impl OrtOcrEngine {
             ) && remaining_supplement_rec_budget > 0
             {
                 let layered_region_start = Instant::now();
-                let layered_limit = MAX_EAGER_LAYERED_REGION_RECOGNITIONS
-                    .min(remaining_supplement_rec_budget);
-                let (layered_region_count, _attempted, layered_candidate) =
-                    self.recognize_layered_color_regions(
+                let layered_limit =
+                    MAX_EAGER_LAYERED_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
+                let (layered_region_count, _attempted, layered_candidate) = self
+                    .recognize_layered_color_regions(
                         img,
                         cfg,
                         &regions,
@@ -670,13 +678,14 @@ impl OrtOcrEngine {
         if should_continue_eager_supplements(&text, confidence, det_box_count, line_count, &regions)
             && remaining_supplement_rec_budget > 0
             && should_use_uncovered_visual_supplement(
-            img,
-            cfg,
-            &text,
-            det_box_count,
-            line_count,
-            &regions,
-        ) {
+                img,
+                cfg,
+                &text,
+                det_box_count,
+                line_count,
+                &regions,
+            )
+        {
             let visual_start = Instant::now();
             let visual_limit =
                 MAX_EAGER_VISUAL_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
@@ -2464,7 +2473,12 @@ fn ocr_trace_json(
         trace.rec_primary_call_count,
         true,
     );
-    push_json_usize_field(&mut out, "rec_alt_call_count", trace.rec_alt_call_count, true);
+    push_json_usize_field(
+        &mut out,
+        "rec_alt_call_count",
+        trace.rec_alt_call_count,
+        true,
+    );
     push_json_usize_field(&mut out, "candidate_count", trace.candidates.len(), true);
     push_json_usize_field(
         &mut out,
@@ -2499,8 +2513,18 @@ fn ocr_trace_json(
     push_json_u64_field(&mut out, "page_region", trace.timing.page_region_ms, true);
     push_json_u64_field(&mut out, "tile", trace.timing.tile_ms, true);
     push_json_u64_field(&mut out, "color_region", trace.timing.color_region_ms, true);
-    push_json_u64_field(&mut out, "layered_region", trace.timing.layered_region_ms, true);
-    push_json_u64_field(&mut out, "visual_region", trace.timing.visual_region_ms, true);
+    push_json_u64_field(
+        &mut out,
+        "layered_region",
+        trace.timing.layered_region_ms,
+        true,
+    );
+    push_json_u64_field(
+        &mut out,
+        "visual_region",
+        trace.timing.visual_region_ms,
+        true,
+    );
     push_json_u64_field(&mut out, "fallback", trace.timing.fallback_ms, true);
     push_json_u64_field(&mut out, "rec_primary", trace.timing.rec_primary_ms, true);
     push_json_u64_field(&mut out, "rec_alt", trace.timing.rec_alt_ms, true);
@@ -4900,13 +4924,177 @@ fn prioritize_supplement_candidate_boxes(
     boxes: Vec<BoxRect>,
     existing_regions: &[OcrTextRegion],
 ) -> Vec<BoxRect> {
+    let focus_band = primary_content_focus_band(image, existing_regions);
     let mut scored = boxes
         .into_iter()
         .filter(|b| !color_region_box_covered_by_reliable_text(*b, existing_regions))
         .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
         .collect::<Vec<_>>();
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    sort_supplement_candidate_scores(&mut scored, focus_band);
+    scored = retain_focus_prioritized_candidates(scored, focus_band);
     scored.into_iter().map(|(b, _)| b).collect()
+}
+
+fn primary_content_focus_band(
+    image: &DynamicImage,
+    existing_regions: &[OcrTextRegion],
+) -> Option<(u32, u32)> {
+    if existing_regions.len() < 2 {
+        return None;
+    }
+    let (img_w, _) = image.dimensions();
+    if img_w < 240 {
+        return None;
+    }
+
+    let mut buckets: Vec<(u32, u64)> = Vec::new();
+    let mut samples: Vec<(BoxRect, u32)> = Vec::new();
+    for region in existing_regions {
+        if region.lines.is_empty() {
+            let b = box_from_array(region.bbox);
+            let bucket = supplement_focus_bucket(b);
+            let score = supplement_focus_sample_score(b);
+            if score > 0 {
+                buckets.push((bucket, score));
+                samples.push((b, bucket));
+            }
+            continue;
+        }
+        for line in &region.lines {
+            let b = box_from_array(line.bbox);
+            let bucket = supplement_focus_bucket(b);
+            let score = supplement_focus_sample_score(b);
+            if score > 0 {
+                buckets.push((bucket, score));
+                samples.push((b, bucket));
+            }
+        }
+    }
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let mut bucket_scores: Vec<(u32, u64)> = Vec::new();
+    for (bucket, score) in buckets {
+        if let Some((_, total)) = bucket_scores.iter_mut().find(|(seen, _)| *seen == bucket) {
+            *total += score;
+        } else {
+            bucket_scores.push((bucket, score));
+        }
+    }
+    let Some((best_bucket, _)) = bucket_scores.into_iter().max_by_key(|(_, score)| *score) else {
+        return None;
+    };
+
+    let mut focus_boxes = Vec::new();
+    let mut wide_count = 0usize;
+    for (b, bucket) in samples {
+        if bucket.abs_diff(best_bucket) > 1 {
+            continue;
+        }
+        if box_width(b) >= box_height(b).saturating_mul(3).max(72) {
+            wide_count += 1;
+        }
+        focus_boxes.push(b);
+    }
+    if focus_boxes.len() < 2 || wide_count == 0 {
+        return None;
+    }
+
+    let mut left = img_w;
+    let mut right = 0u32;
+    for b in &focus_boxes {
+        left = left.min(b.0);
+        right = right.max(b.2);
+    }
+    if right <= left {
+        return None;
+    }
+    let band_w = right.saturating_sub(left);
+    if band_w < (img_w / 6).max(96) {
+        return None;
+    }
+    let pad = (band_w / 6).max(48);
+    Some((
+        left.saturating_sub(pad),
+        right.saturating_add(pad).min(img_w),
+    ))
+}
+
+fn supplement_focus_bucket(b: BoxRect) -> u32 {
+    (box_center_x(b) / 96.0).floor() as u32
+}
+
+fn supplement_focus_sample_score(b: BoxRect) -> u64 {
+    let w = box_width(b);
+    let h = box_height(b);
+    if w < 32 || h < 8 {
+        return 0;
+    }
+    let area = box_area(b).min(24_000) as u64;
+    let wide_bonus = if w >= h.saturating_mul(3).max(72) {
+        area
+    } else {
+        area / 4
+    };
+    area + wide_bonus + w.min(600) as u64 * 24
+}
+
+fn supplement_focus_rank(b: BoxRect, focus_band: Option<(u32, u32)>) -> u8 {
+    if let Some((focus_left, focus_right)) = focus_band {
+        if box_intersects_focus_band(b, focus_left, focus_right) {
+            return 1;
+        }
+    }
+    0
+}
+
+fn sort_supplement_candidate_scores(scored: &mut [(BoxRect, i64)], focus_band: Option<(u32, u32)>) {
+    scored.sort_by(|a, b| {
+        supplement_focus_rank(b.0, focus_band)
+            .cmp(&supplement_focus_rank(a.0, focus_band))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| reading_box_order(&a.0, &b.0))
+    });
+}
+
+fn retain_focus_prioritized_candidates(
+    scored: Vec<(BoxRect, i64)>,
+    focus_band: Option<(u32, u32)>,
+) -> Vec<(BoxRect, i64)> {
+    let Some((focus_left, focus_right)) = focus_band else {
+        return scored;
+    };
+    let focus_count = scored
+        .iter()
+        .filter(|(b, _)| box_intersects_focus_band(*b, focus_left, focus_right))
+        .count();
+    if focus_count < 2 {
+        return scored;
+    }
+
+    let mut outside_count = 0usize;
+    scored
+        .into_iter()
+        .filter(|(b, _)| {
+            if box_intersects_focus_band(*b, focus_left, focus_right) {
+                return true;
+            }
+            if outside_count >= MAX_SUPPLEMENT_OUTSIDE_FOCUS_CANDIDATES {
+                return false;
+            }
+            outside_count += 1;
+            true
+        })
+        .collect()
+}
+
+fn box_intersects_focus_band(b: BoxRect, focus_left: u32, focus_right: u32) -> bool {
+    if horizontal_overlap(b, (focus_left, b.1, focus_right, b.3)) > 0 {
+        return true;
+    }
+    let center_x = box_center_x(b);
+    center_x >= focus_left as f32 && center_x <= focus_right as f32
 }
 
 fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option<i64> {
@@ -9700,10 +9888,7 @@ mod tests {
         let mut regions = vec![c.clone(), a.clone(), b.clone()];
         regions.sort_by(reading_region_order);
 
-        let keys = regions
-            .iter()
-            .map(reading_region_key)
-            .collect::<Vec<_>>();
+        let keys = regions.iter().map(reading_region_key).collect::<Vec<_>>();
         assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(reading_region_order(&a, &a), std::cmp::Ordering::Equal);
         assert_eq!(reading_region_order(&b, &b), std::cmp::Ordering::Equal);
@@ -10646,6 +10831,127 @@ mod tests {
 
         assert_eq!(boxes[0], (0, 55, 140, 90));
         assert_eq!(boxes[1], (0, 10, 230, 50));
+    }
+
+    #[test]
+    fn primary_content_focus_band_prefers_wide_centered_regions() {
+        let rgb = image::RgbImage::from_pixel(480, 220, image::Rgb([248, 248, 248]));
+        let existing = vec![
+            OcrTextRegion {
+                bbox: [148, 24, 344, 38],
+                text: "主内容1".to_string(),
+                confidence: 0.82,
+                source: "det".to_string(),
+                lines: vec![OcrTextLine {
+                    bbox: [148, 24, 344, 38],
+                    text: "主内容1".to_string(),
+                    confidence: 0.82,
+                    avg_margin: 0.0,
+                    min_margin: 0.0,
+                    char_min_confidence: 0.82,
+                    readable_ratio: 1.0,
+                    support_count: 1,
+                    source: "det".to_string(),
+                }],
+            },
+            OcrTextRegion {
+                bbox: [144, 68, 340, 82],
+                text: "主内容2".to_string(),
+                confidence: 0.80,
+                source: "det".to_string(),
+                lines: vec![OcrTextLine {
+                    bbox: [144, 68, 340, 82],
+                    text: "主内容2".to_string(),
+                    confidence: 0.80,
+                    avg_margin: 0.0,
+                    min_margin: 0.0,
+                    char_min_confidence: 0.80,
+                    readable_ratio: 1.0,
+                    support_count: 1,
+                    source: "det".to_string(),
+                }],
+            },
+            OcrTextRegion {
+                bbox: [152, 112, 348, 126],
+                text: "主内容3".to_string(),
+                confidence: 0.81,
+                source: "det".to_string(),
+                lines: vec![OcrTextLine {
+                    bbox: [152, 112, 348, 126],
+                    text: "主内容3".to_string(),
+                    confidence: 0.81,
+                    avg_margin: 0.0,
+                    min_margin: 0.0,
+                    char_min_confidence: 0.81,
+                    readable_ratio: 1.0,
+                    support_count: 1,
+                    source: "det".to_string(),
+                }],
+            },
+        ];
+
+        let focus_band =
+            primary_content_focus_band(&DynamicImage::ImageRgb8(rgb), &existing).unwrap();
+        assert!(focus_band.0 <= 120);
+        assert!(focus_band.1 >= 370);
+        assert!(box_intersects_focus_band(
+            (132, 18, 360, 42),
+            focus_band.0,
+            focus_band.1
+        ));
+        assert!(!box_intersects_focus_band(
+            (0, 18, 96, 42),
+            focus_band.0,
+            focus_band.1
+        ));
+    }
+
+    #[test]
+    fn supplement_candidate_priority_caps_outside_focus_candidates() {
+        let focus_band = Some((120, 420));
+        let mut scored = vec![
+            ((0, 16, 96, 40), 140),
+            ((160, 16, 408, 40), 120),
+            ((0, 62, 98, 86), 138),
+            ((158, 62, 406, 86), 118),
+            ((0, 108, 100, 132), 136),
+            ((166, 108, 414, 132), 116),
+            ((0, 154, 96, 178), 134),
+            ((160, 154, 408, 178), 114),
+            ((444, 20, 540, 44), 132),
+            ((442, 66, 538, 90), 130),
+            ((448, 112, 544, 136), 128),
+            ((440, 158, 536, 182), 126),
+        ];
+        sort_supplement_candidate_scores(&mut scored, focus_band);
+        let boxes = retain_focus_prioritized_candidates(scored, focus_band)
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect::<Vec<_>>();
+
+        let outside = boxes.iter().filter(|b| b.2 <= 120 || b.0 >= 430).count();
+        assert!(outside <= MAX_SUPPLEMENT_OUTSIDE_FOCUS_CANDIDATES);
+        assert!(boxes[..4].iter().all(|b| b.0 >= 150 && b.2 <= 420));
+    }
+
+    #[test]
+    fn supplement_candidate_priority_prefers_focus_boxes_over_higher_scored_sidebar_boxes() {
+        let focus_band = Some((120, 420));
+        let mut scored = vec![
+            ((0, 16, 96, 40), 180),
+            ((160, 16, 408, 40), 120),
+            ((444, 20, 540, 44), 170),
+            ((158, 62, 406, 86), 118),
+            ((166, 108, 414, 132), 116),
+        ];
+        sort_supplement_candidate_scores(&mut scored, focus_band);
+        let boxes = scored.into_iter().map(|(b, _)| b).collect::<Vec<_>>();
+
+        assert_eq!(boxes[0], (160, 16, 408, 40));
+        assert_eq!(boxes[1], (158, 62, 406, 86));
+        assert_eq!(boxes[2], (166, 108, 414, 132));
+        assert_eq!(boxes[3], (0, 16, 96, 40));
+        assert_eq!(boxes[4], (444, 20, 540, 44));
     }
 
     #[test]
