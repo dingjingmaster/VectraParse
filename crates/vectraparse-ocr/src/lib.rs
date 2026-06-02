@@ -2297,7 +2297,7 @@ fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<
         distances.push(distance);
     }
     if max_distance < 18 {
-        return None;
+        return binarize_low_contrast_foreground_from_rgb(&rgb);
     }
 
     let threshold = otsu_threshold_values(&distances).clamp(18, 96);
@@ -2317,9 +2317,69 @@ fn binarize_color_region_foreground(image: &DynamicImage, b: BoxRect) -> Option<
     let total = (w as usize).saturating_mul(h as usize).max(1);
     let foreground_ratio = foreground_count as f32 / total as f32;
     if foreground_count < 4 || !(0.002..=0.45).contains(&foreground_ratio) {
-        return None;
+        return binarize_low_contrast_foreground_from_rgb(&rgb);
     }
     Some(DynamicImage::ImageLuma8(out))
+}
+
+fn binarize_low_contrast_foreground_from_rgb(rgb: &image::RgbImage) -> Option<DynamicImage> {
+    let (w, h) = rgb.dimensions();
+    if w < 8 || h < 6 {
+        return None;
+    }
+
+    let gray = DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
+    let local = local_binary_luma(&gray, false);
+    if binary_foreground_is_text_like(&local) {
+        return Some(DynamicImage::ImageLuma8(local));
+    }
+
+    let stretched = contrast_stretch_luma(&gray);
+    if stretched == gray {
+        return None;
+    }
+    let local = local_binary_luma(&stretched, false);
+    if binary_foreground_is_text_like(&local) {
+        return Some(DynamicImage::ImageLuma8(local));
+    }
+    None
+}
+
+fn binary_foreground_is_text_like(gray: &GrayImage) -> bool {
+    let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return false;
+    }
+
+    let mut count = 0usize;
+    let mut min_x = w as usize;
+    let mut min_y = h as usize;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if gray.get_pixel(x as u32, y as u32)[0] >= 128 {
+                continue;
+            }
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+
+    let total = (w as usize).saturating_mul(h as usize).max(1);
+    let ratio = count as f32 / total as f32;
+    if count < 4 || !(0.002..=0.38).contains(&ratio) {
+        return false;
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return false;
+    }
+    let fg_w = max_x.saturating_sub(min_x).saturating_add(1);
+    let fg_h = max_y.saturating_sub(min_y).saturating_add(1);
+    fg_w >= 4 && fg_h >= 2
 }
 
 fn estimate_region_background_rgb(rgb: &image::RgbImage) -> [u8; 3] {
@@ -6598,6 +6658,34 @@ mod tests {
         let gray = binary.to_luma8();
         assert_eq!(gray.get_pixel(2, 2)[0], 255);
         assert_eq!(gray.get_pixel(24, 10)[0], 0);
+    }
+
+    #[test]
+    fn color_region_binarization_handles_low_contrast_dark_text() {
+        let mut rgb = image::RgbImage::from_pixel(96, 32, image::Rgb([240, 240, 240]));
+        for y in 13..18 {
+            for x in 24..72 {
+                rgb.put_pixel(x, y, image::Rgb([228, 228, 228]));
+            }
+        }
+
+        let binary =
+            binarize_color_region_foreground(&DynamicImage::ImageRgb8(rgb), (0, 0, 96, 32))
+                .expect("low contrast binary region");
+        let gray = binary.to_luma8();
+
+        assert_eq!(gray.get_pixel(4, 4)[0], 255);
+        assert_eq!(gray.get_pixel(36, 15)[0], 0);
+    }
+
+    #[test]
+    fn color_region_binarization_rejects_flat_low_contrast_region() {
+        let rgb = image::RgbImage::from_pixel(96, 32, image::Rgb([240, 240, 240]));
+
+        let binary =
+            binarize_color_region_foreground(&DynamicImage::ImageRgb8(rgb), (0, 0, 96, 32));
+
+        assert!(binary.is_none());
     }
 
     #[test]
