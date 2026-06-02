@@ -52,6 +52,7 @@ def check_case(case_id: str, trace_path: Path, expected_path: Path) -> list[str]
         return [f"{case_id}: invalid expected json {expected_path}: {exc}"]
 
     lines = trace_lines(trace)
+    full_text = trace_text(trace, lines)
     summary = trace.get("summary", {})
     failures.extend(check_count(case_id, "line_count", len(lines), expected.get("line_count")))
     failures.extend(check_count(case_id, "region_count", len(trace.get("regions", [])), expected.get("region_count")))
@@ -59,6 +60,16 @@ def check_case(case_id: str, trace_path: Path, expected_path: Path) -> list[str]
         failures.append(
             f"{case_id}: selected_source expected {expected['selected_source']!r}, got {summary.get('selected_source')!r}"
         )
+    if "full_text" in expected and full_text != expected["full_text"]:
+        failures.append(f"{case_id}: full_text expected {expected['full_text']!r}, got {full_text!r}")
+
+    for idx, text in enumerate(expected.get("text_contains", []), start=1):
+        if text not in full_text:
+            failures.append(f"{case_id}: text_contains[{idx}] not found: {text!r}")
+
+    for idx, text in enumerate(expected.get("text_not_contains", []), start=1):
+        if text in full_text:
+            failures.append(f"{case_id}: text_not_contains[{idx}] matched: {text!r}")
 
     for idx, rule in enumerate(expected.get("must_have", []), start=1):
         if not any(line_matches(line, rule) for line in lines):
@@ -89,6 +100,21 @@ def trace_lines(trace: dict) -> list[dict]:
             item.setdefault("line_index", line_idx)
             out.append(item)
     return out
+
+
+def trace_text(trace: dict, lines: list[dict]) -> str:
+    regions = trace.get("regions", [])
+    if isinstance(regions, list) and regions:
+        parts = []
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            text = str(region.get("text", "")).strip()
+            if text:
+                parts.append(text)
+        if parts:
+            return "\n\n".join(parts)
+    return "\n".join(str(line.get("text", "")).strip() for line in lines if str(line.get("text", "")).strip())
 
 
 def check_count(case_id: str, name: str, actual: int, rule) -> list[str]:

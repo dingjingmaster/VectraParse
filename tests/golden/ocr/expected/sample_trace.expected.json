@@ -6,6 +6,9 @@
   "region_count": {
     "eq": 1
   },
+  "full_text": "Alpha\nBeta",
+  "text_contains": ["Alpha", "Beta"],
+  "text_not_contains": ["Noise"],
   "must_have": [
     {
       "text": "Alpha",

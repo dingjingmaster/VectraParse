@@ -146,6 +146,14 @@ struct RecCandidate {
     text: String,
     confidence: f32,
     variant: RecVariant,
+    avg_margin: f32,
+    min_margin: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CtcDecodeStats {
+    avg_margin: f32,
+    min_margin: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -341,6 +349,7 @@ impl OrtOcrEngine {
                 &mut regions,
                 &mut fallback,
                 &mut candidate_pool,
+                Some(img),
                 "det-page-regions".to_string(),
                 &candidate,
             );
@@ -378,6 +387,7 @@ impl OrtOcrEngine {
                     &mut regions,
                     &mut fallback,
                     &mut candidate_pool,
+                    Some(img),
                     "det-high-res-tiles".to_string(),
                     &tile_region_candidate,
                 );
@@ -412,6 +422,7 @@ impl OrtOcrEngine {
             &mut regions,
             &mut fallback,
             &mut candidate_pool,
+            Some(img),
             "color-regions:eager".to_string(),
             &candidate,
         );
@@ -447,6 +458,7 @@ impl OrtOcrEngine {
                 &mut regions,
                 &mut fallback,
                 &mut candidate_pool,
+                Some(img),
                 "color-region-det:eager".to_string(),
                 &candidate,
             );
@@ -480,6 +492,7 @@ impl OrtOcrEngine {
             &mut regions,
             &mut fallback,
             &mut candidate_pool,
+            Some(img),
             "layered-regions:eager".to_string(),
             &layered_candidate,
         );
@@ -512,6 +525,7 @@ impl OrtOcrEngine {
                 &mut regions,
                 &mut fallback,
                 &mut candidate_pool,
+                Some(img),
                 "visual-regions:eager".to_string(),
                 &visual_candidate,
             );
@@ -992,10 +1006,25 @@ impl OrtOcrEngine {
             .map(|candidate| candidate.confidence)
             .sum::<f32>()
             / segment_candidates.len() as f32;
+        let avg_margin = segment_candidates
+            .iter()
+            .map(|candidate| candidate.avg_margin)
+            .sum::<f32>()
+            / segment_candidates.len() as f32;
+        let min_margin = segment_candidates
+            .iter()
+            .map(|candidate| candidate.min_margin)
+            .fold(f32::INFINITY, f32::min);
         let candidate = RecCandidate {
             text: combined_text,
             confidence,
             variant: segment_candidates[0].variant,
+            avg_margin,
+            min_margin: if min_margin.is_finite() {
+                min_margin
+            } else {
+                0.0
+            },
         };
         if !is_usable_recognition(&candidate) || !repair_candidate_is_better(direct, &candidate) {
             return None;
@@ -1073,6 +1102,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate,
                 );
@@ -1108,6 +1138,7 @@ impl OrtOcrEngine {
             regions,
             fallback,
             candidate_pool,
+            Some(img),
             "color-regions".to_string(),
             &candidate,
         );
@@ -1146,6 +1177,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate.recognized,
                 );
@@ -1181,6 +1213,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate,
                 );
@@ -1229,6 +1262,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate.recognized,
                 );
@@ -1264,6 +1298,45 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
+                    label,
+                    &candidate,
+                );
+            }
+            if !needs_quality_fallback(text, *confidence, det_box_count, *line_count) {
+                return Ok(());
+            }
+        }
+
+        for (name, deskewed) in deskew_variants(img) {
+            trace.fallback_attempt_count += 1;
+            if let Ok(candidate) = self.recognize_best(&deskewed, cfg)
+                && is_usable_recognition(&candidate)
+            {
+                let label =
+                    recognition_fallback_label(&format!("deskew:{name}"), candidate.variant);
+                let candidate = recognized_from_candidate(candidate, image_bbox, &label);
+                maybe_adopt_recognized(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    regions,
+                    fallback,
+                    label.clone(),
+                    &candidate,
+                );
+                maybe_adopt_candidate_pool(
+                    text,
+                    confidence,
+                    line_count,
+                    region_count,
+                    layout_applied,
+                    regions,
+                    fallback,
+                    candidate_pool,
+                    Some(img),
                     label,
                     &candidate,
                 );
@@ -1319,6 +1392,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate.recognized,
                 );
@@ -1354,6 +1428,7 @@ impl OrtOcrEngine {
                     regions,
                     fallback,
                     candidate_pool,
+                    Some(img),
                     label,
                     &candidate,
                 );
@@ -1385,6 +1460,7 @@ impl OrtOcrEngine {
             regions,
             fallback,
             candidate_pool,
+            Some(img),
             "line-crops".to_string(),
             &candidate,
         );
@@ -1665,7 +1741,10 @@ impl OrtOcrEngine {
         cfg: &OcrConfig,
     ) -> Option<RecCandidate> {
         let mut best = self.best_from_crop_direct(image, cfg);
-        for (_, variant) in local_recognition_variants(image) {
+        if !should_try_local_recognition_variants(image, best.as_ref()) {
+            return best;
+        }
+        for (_, variant) in local_recognition_variants_adaptive(image, best.as_ref()) {
             if let Ok(candidate) = self.recognize_best(&variant, cfg)
                 && is_usable_recognition(&candidate)
                 && recognition_candidate_is_better(best.as_ref(), &candidate)
@@ -1708,20 +1787,39 @@ impl OrtOcrEngine {
         let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
         let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
         let logits = &output[0];
-        let (text, confidence) = ctc_greedy_decode(logits, &out_shapes[0], alphabet);
+        let (text, confidence, stats) =
+            ctc_greedy_decode_with_stats(logits, &out_shapes[0], alphabet);
         Ok(RecCandidate {
             text,
             confidence,
             variant,
+            avg_margin: stats.avg_margin,
+            min_margin: stats.min_margin,
         })
     }
 }
 
 fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
+    recognized_from_text_lines_with_context(lines, None)
+}
+
+#[cfg(test)]
+fn recognized_from_text_lines_with_image(
+    lines: &mut [TextLine],
+    image: &DynamicImage,
+) -> RecognizedText {
+    recognized_from_text_lines_with_context(lines, Some(image))
+}
+
+fn recognized_from_text_lines_with_context(
+    lines: &mut [TextLine],
+    image: Option<&DynamicImage>,
+) -> RecognizedText {
     lines.sort_by(reading_line_order);
     let deduped = dedupe_text_lines(lines);
     let filtered = filter_low_value_text_lines(&deduped);
-    let mut regions = group_text_lines_into_regions(&filtered);
+    let rgb = image.map(to_rgb_on_white);
+    let mut regions = group_text_lines_into_regions(&filtered, rgb.as_ref());
     regions.sort_by(reading_region_order);
 
     let mut blocks = Vec::new();
@@ -2184,12 +2282,15 @@ impl LayoutRegion {
     }
 }
 
-fn group_text_lines_into_regions(lines: &[TextLine]) -> Vec<LayoutRegion> {
+fn group_text_lines_into_regions(
+    lines: &[TextLine],
+    rgb: Option<&image::RgbImage>,
+) -> Vec<LayoutRegion> {
     let mut regions: Vec<LayoutRegion> = Vec::new();
     for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
         let mut best: Option<(usize, f32)> = None;
         for (idx, region) in regions.iter().enumerate() {
-            if let Some(score) = region_line_score(region, line) {
+            if let Some(score) = region_line_score(region, line, rgb) {
                 if best.map_or(true, |(_, best_score)| score > best_score) {
                     best = Some((idx, score));
                 }
@@ -2202,16 +2303,19 @@ fn group_text_lines_into_regions(lines: &[TextLine]) -> Vec<LayoutRegion> {
             regions.push(LayoutRegion::from_line(line.clone()));
         }
     }
-    merge_layout_regions(regions)
+    merge_layout_regions(regions, rgb)
 }
 
-fn merge_layout_regions(mut regions: Vec<LayoutRegion>) -> Vec<LayoutRegion> {
+fn merge_layout_regions(
+    mut regions: Vec<LayoutRegion>,
+    rgb: Option<&image::RgbImage>,
+) -> Vec<LayoutRegion> {
     let mut changed = true;
     while changed {
         changed = false;
         'outer: for i in 0..regions.len() {
             for j in (i + 1)..regions.len() {
-                if regions_should_merge(&regions[i], &regions[j]) {
+                if regions_should_merge(&regions[i], &regions[j], rgb) {
                     let other = regions.remove(j);
                     for line in other.lines {
                         regions[i].add_line(line);
@@ -2225,7 +2329,14 @@ fn merge_layout_regions(mut regions: Vec<LayoutRegion>) -> Vec<LayoutRegion> {
     regions
 }
 
-fn region_line_score(region: &LayoutRegion, line: &TextLine) -> Option<f32> {
+fn region_line_score(
+    region: &LayoutRegion,
+    line: &TextLine,
+    rgb: Option<&image::RgbImage>,
+) -> Option<f32> {
+    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, region.bbox, line.bbox)) {
+        return None;
+    }
     let overlap = horizontal_overlap(region.bbox, line.bbox) as f32;
     let min_width = box_width(region.bbox).min(box_width(line.bbox)).max(1) as f32;
     let overlap_ratio = overlap / min_width;
@@ -2258,7 +2369,10 @@ fn region_line_score(region: &LayoutRegion, line: &TextLine) -> Option<f32> {
     Some(overlap_ratio * 100.0 + if same_row { 25.0 } else { 0.0 } - y_gap * 0.25 - x_gap * 0.02)
 }
 
-fn regions_should_merge(a: &LayoutRegion, b: &LayoutRegion) -> bool {
+fn regions_should_merge(a: &LayoutRegion, b: &LayoutRegion, rgb: Option<&image::RgbImage>) -> bool {
+    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
+        return false;
+    }
     let overlap = horizontal_overlap(a.bbox, b.bbox) as f32;
     let min_width = box_width(a.bbox).min(box_width(b.bbox)).max(1) as f32;
     let overlap_ratio = overlap / min_width;
@@ -2821,6 +2935,20 @@ fn push_recognition_candidate(
 }
 
 fn recognized_from_candidate_pool(candidate_pool: &[OcrCandidateEntry]) -> RecognizedText {
+    recognized_from_candidate_pool_with_context(candidate_pool, None)
+}
+
+fn recognized_from_candidate_pool_with_image(
+    candidate_pool: &[OcrCandidateEntry],
+    image: &DynamicImage,
+) -> RecognizedText {
+    recognized_from_candidate_pool_with_context(candidate_pool, Some(image))
+}
+
+fn recognized_from_candidate_pool_with_context(
+    candidate_pool: &[OcrCandidateEntry],
+    image: Option<&DynamicImage>,
+) -> RecognizedText {
     let mut lines = Vec::new();
     for entry in candidate_pool {
         let mut entry_lines = text_lines_from_recognized(&entry.recognized);
@@ -2831,7 +2959,7 @@ fn recognized_from_candidate_pool(candidate_pool: &[OcrCandidateEntry]) -> Recog
         }
         lines.extend(entry_lines);
     }
-    recognized_from_text_lines(&mut lines)
+    recognized_from_text_lines_with_context(&mut lines, image)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2844,13 +2972,18 @@ fn maybe_adopt_candidate_pool(
     regions: &mut Vec<OcrTextRegion>,
     fallback: &mut Option<String>,
     candidate_pool: &mut Vec<OcrCandidateEntry>,
+    image: Option<&DynamicImage>,
     label: String,
     candidate: &RecognizedText,
 ) -> bool {
     if !push_recognition_candidate(candidate_pool, label.clone(), candidate) {
         return false;
     }
-    let pooled = recognized_from_candidate_pool(candidate_pool);
+    let pooled = if let Some(image) = image {
+        recognized_from_candidate_pool_with_image(candidate_pool, image)
+    } else {
+        recognized_from_candidate_pool(candidate_pool)
+    };
     if !pooled_recognition_is_better(text, *confidence, *line_count, &pooled) {
         return false;
     }
@@ -2882,14 +3015,17 @@ fn pooled_recognition_is_better(
         return true;
     }
 
+    let source_support = pooled_source_family_count(pooled);
     if pooled.line_count > current_line_count
         && pooled_chars >= current_chars
-        && pooled.confidence + 0.12 >= current_confidence
+        && (pooled.confidence + 0.12 >= current_confidence || source_support >= 3)
     {
         return true;
     }
     if pooled_chars > current_chars + 2
-        && (pooled.confidence + 0.16 >= current_confidence || pooled.confidence >= 0.42)
+        && (pooled.confidence + 0.16 >= current_confidence
+            || pooled.confidence >= 0.42
+            || source_support >= 3)
     {
         return true;
     }
@@ -2899,8 +3035,20 @@ fn pooled_recognition_is_better(
 
     let current_quality = recognition_text_quality(current_text, current_confidence);
     let pooled_quality = recognition_text_quality(&pooled.text, pooled.confidence)
-        + pooled.line_count.saturating_sub(current_line_count) as f32 * 1.5;
+        + pooled.line_count.saturating_sub(current_line_count) as f32 * 1.5
+        + source_support.saturating_sub(1) as f32 * 2.0;
     pooled_quality > current_quality + 5.0 && pooled_chars + 1 >= current_chars
+}
+
+fn pooled_source_family_count(pooled: &RecognizedText) -> usize {
+    let mut families: Vec<String> = Vec::new();
+    for line in text_lines_from_recognized(pooled) {
+        let family = source_family(&line.source).to_string();
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    families.len()
 }
 
 fn maybe_adopt_recognized(
@@ -3302,9 +3450,29 @@ fn text_lines_are_near_duplicates(a: &TextLine, b: &TextLine) -> bool {
 fn text_line_quality(line: &TextLine) -> f32 {
     let text = line.text.trim();
     let chars = recognized_char_count(text) as f32;
-    line.confidence * 100.0 + readable_ratio(text) * 12.0 + chars.min(32.0) * 0.35
+    line.confidence * 100.0
+        + readable_ratio(text) * 12.0
+        + chars.min(32.0) * 0.35
+        + source_quality_bonus(&line.source)
         - punctuation_ratio(text) * 8.0
         - dominant_char_ratio(text) * 4.0
+}
+
+fn source_quality_bonus(source: &str) -> f32 {
+    let family = source_family(source);
+    if family == "det" {
+        4.0
+    } else if family == "tile-region" || family == "page-region" {
+        2.5
+    } else if family == "color-region-det" || family == "layered-region" {
+        1.5
+    } else if family == "visual-region" || family == "color-region" {
+        0.5
+    } else if family == "line-crops" {
+        -1.0
+    } else {
+        0.0
+    }
 }
 
 fn normalized_text_similarity(a: &str, b: &str) -> f32 {
@@ -3667,8 +3835,8 @@ fn repair_candidate_is_better(current: Option<&RecCandidate>, candidate: &RecCan
         return true;
     }
 
-    let current_quality = recognition_text_quality(&current_text, current.confidence);
-    let candidate_quality = recognition_text_quality(&candidate_text, candidate.confidence);
+    let current_quality = recognition_candidate_model_score(current);
+    let candidate_quality = recognition_candidate_model_score(candidate);
     candidate_quality > current_quality + 4.0
         || (candidate_chars > current_chars + 2
             && candidate.confidence + 0.12 >= current.confidence)
@@ -3692,8 +3860,8 @@ fn recognition_candidate_is_better(
         return true;
     }
 
-    let current_quality = recognition_text_quality(&current_text, current.confidence);
-    let candidate_quality = recognition_text_quality(&candidate_text, candidate.confidence);
+    let current_quality = recognition_candidate_model_score(current);
+    let candidate_quality = recognition_candidate_model_score(candidate);
     candidate_quality > current_quality + 2.0
         || (candidate_chars > current_chars + 1
             && candidate.confidence + 0.08 >= current.confidence)
@@ -3726,8 +3894,21 @@ fn should_insert_segment_space(left: &str, right: &str) -> bool {
 }
 
 fn recognition_text_quality(text: &str, confidence: f32) -> f32 {
+    recognition_text_quality_with_margin(text, confidence, 0.0, 0.0)
+}
+
+fn recognition_text_quality_with_margin(
+    text: &str,
+    confidence: f32,
+    avg_margin: f32,
+    min_margin: f32,
+) -> f32 {
     let chars = recognized_char_count(text) as f32;
-    confidence * 100.0 + readable_ratio(text) * 14.0 + chars.min(32.0) * 0.25
+    confidence * 100.0
+        + readable_ratio(text) * 14.0
+        + chars.min(32.0) * 0.25
+        + avg_margin.clamp(0.0, 1.0) * 10.0
+        + min_margin.clamp(0.0, 1.0) * 4.0
         - punctuation_ratio(text) * 9.0
         - dominant_char_ratio(text) * 5.0
 }
@@ -4179,6 +4360,57 @@ fn boxes_have_merge_separator(rgb: &image::RgbImage, left: BoxRect, right: BoxRe
     gap_region_is_low_texture(rgb, gap_box) || gap_region_has_vertical_separator(rgb, gap_box)
 }
 
+fn visual_separator_between_boxes(rgb: &image::RgbImage, a: BoxRect, b: BoxRect) -> bool {
+    if a.2 <= b.0 && vertical_overlap(a, b) > 0 {
+        return boxes_have_merge_separator(rgb, a, b);
+    }
+    if b.2 <= a.0 && vertical_overlap(a, b) > 0 {
+        return boxes_have_merge_separator(rgb, b, a);
+    }
+    if a.3 <= b.1 && horizontal_overlap(a, b) > 0 {
+        return boxes_have_vertical_merge_separator(rgb, a, b);
+    }
+    if b.3 <= a.1 && horizontal_overlap(a, b) > 0 {
+        return boxes_have_vertical_merge_separator(rgb, b, a);
+    }
+    false
+}
+
+fn boxes_have_vertical_merge_separator(
+    rgb: &image::RgbImage,
+    upper: BoxRect,
+    lower: BoxRect,
+) -> bool {
+    if lower.1 <= upper.3 || upper.2 <= lower.0 || lower.2 <= upper.0 {
+        return false;
+    }
+    let gap = lower.1 - upper.3;
+    let line_h = box_height(upper).min(box_height(lower)).max(1);
+    if gap < (line_h / 2).max(12) {
+        return false;
+    }
+
+    let (w, h) = rgb.dimensions();
+    let overlap_x0 = upper.0.max(lower.0);
+    let overlap_x1 = upper.2.min(lower.2);
+    let x_pad = (box_width(upper).min(box_width(lower)) / 20).clamp(2, 12);
+    let gap_box = clamp_box(
+        (
+            overlap_x0.saturating_sub(x_pad),
+            upper.3.min(h),
+            overlap_x1.saturating_add(x_pad).min(w),
+            lower.1.min(h),
+        ),
+        w,
+        h,
+    );
+    if box_width(gap_box) < 8 || box_height(gap_box) < gap {
+        return false;
+    }
+
+    gap_region_is_low_texture(rgb, gap_box) || gap_region_has_horizontal_separator(rgb, gap_box)
+}
+
 fn gap_region_is_low_texture(rgb: &image::RgbImage, b: BoxRect) -> bool {
     let area = box_area(b).max(1);
     let mut edge_count = 0u64;
@@ -4198,6 +4430,29 @@ fn gap_region_is_low_texture(rgb: &image::RgbImage, b: BoxRect) -> bool {
         }
     }
     edge_count.saturating_mul(100) <= area.saturating_mul(2)
+}
+
+fn gap_region_has_horizontal_separator(rgb: &image::RgbImage, b: BoxRect) -> bool {
+    if box_width(b) < 8 || box_height(b) < 3 {
+        return false;
+    }
+
+    for y in b.1.saturating_add(1)..b.3.saturating_sub(1) {
+        let mut edge_count = 0u32;
+        for x in b.0.saturating_add(1)..b.2.saturating_sub(1) {
+            let up = rgb.get_pixel(x, y - 1);
+            let down = rgb.get_pixel(x, y + 1);
+            if luma_abs_diff(up, down) >= 18
+                || color_distance_u8(up, [down[0], down[1], down[2]]) >= 26
+            {
+                edge_count += 1;
+            }
+        }
+        if edge_count.saturating_mul(100) >= box_width(b).saturating_mul(72) {
+            return true;
+        }
+    }
+    false
 }
 
 fn gap_region_has_vertical_separator(rgb: &image::RgbImage, b: BoxRect) -> bool {
@@ -5325,6 +5580,41 @@ fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage
     out
 }
 
+fn local_recognition_variants_adaptive(
+    image: &DynamicImage,
+    direct: Option<&RecCandidate>,
+) -> Vec<(String, DynamicImage)> {
+    let mut variants = local_recognition_variants(image);
+    if let Some(candidate) = direct
+        && candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
+        && candidate.avg_margin >= 0.04
+        && readable_ratio(&candidate.text) >= 0.65
+    {
+        variants.truncate(3);
+    }
+    variants
+}
+
+fn should_try_local_recognition_variants(
+    image: &DynamicImage,
+    direct: Option<&RecCandidate>,
+) -> bool {
+    let Some(candidate) = direct else {
+        return true;
+    };
+    let text = normalize_recognized_text(&candidate.text);
+    if recognized_box_needs_repair(image_box(image), &text, candidate.confidence) {
+        return true;
+    }
+    if candidate.confidence < 0.78 {
+        return true;
+    }
+    if candidate.avg_margin < 0.08 || candidate.min_margin < 0.03 {
+        return true;
+    }
+    false
+}
+
 fn push_enhancement_variants(
     out: &mut Vec<(String, DynamicImage)>,
     prefix: &str,
@@ -5431,6 +5721,119 @@ fn rotation_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
         ("180".to_string(), image.rotate180()),
         ("270".to_string(), image.rotate270()),
     ]
+}
+
+fn deskew_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    let Some(angle) = estimate_foreground_skew_degrees(image) else {
+        return Vec::new();
+    };
+    if !(1.0..=7.0).contains(&angle.abs()) {
+        return Vec::new();
+    }
+    let corrected = rotate_image_degrees_on_white(image, -angle);
+    vec![(format!("{:.1}", -angle), corrected)]
+}
+
+fn estimate_foreground_skew_degrees(image: &DynamicImage) -> Option<f32> {
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    if w < 24 || h < 12 {
+        return None;
+    }
+    let mask = text_foreground_mask_from_rgb(&rgb)?;
+    let mut count = 0usize;
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if !mask[y * w as usize + x] {
+                continue;
+            }
+            count += 1;
+            sum_x += x as f64;
+            sum_y += y as f64;
+        }
+    }
+    if count < 16 {
+        return None;
+    }
+
+    let mean_x = sum_x / count as f64;
+    let mean_y = sum_y / count as f64;
+    let mut cov_xx = 0.0f64;
+    let mut cov_xy = 0.0f64;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if !mask[y * w as usize + x] {
+                continue;
+            }
+            let dx = x as f64 - mean_x;
+            let dy = y as f64 - mean_y;
+            cov_xx += dx * dx;
+            cov_xy += dx * dy;
+        }
+    }
+    if cov_xx <= 1.0 {
+        return None;
+    }
+
+    let angle = (cov_xy / cov_xx).atan().to_degrees() as f32;
+    if angle.is_finite() { Some(angle) } else { None }
+}
+
+fn rotate_image_degrees_on_white(image: &DynamicImage, degrees: f32) -> DynamicImage {
+    let src = to_rgb_on_white(image);
+    let (w, h) = src.dimensions();
+    if w == 0 || h == 0 {
+        return DynamicImage::ImageRgb8(src);
+    }
+
+    let radians = degrees.to_radians();
+    let cos = radians.cos();
+    let sin = radians.sin();
+    let corners = [
+        (-(w as f32) / 2.0, -(h as f32) / 2.0),
+        ((w as f32) / 2.0, -(h as f32) / 2.0),
+        (-(w as f32) / 2.0, (h as f32) / 2.0),
+        ((w as f32) / 2.0, (h as f32) / 2.0),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let rx = x * cos - y * sin;
+        let ry = x * sin + y * cos;
+        min_x = min_x.min(rx);
+        max_x = max_x.max(rx);
+        min_y = min_y.min(ry);
+        max_y = max_y.max(ry);
+    }
+    let out_w = (max_x - min_x).ceil().max(1.0) as u32;
+    let out_h = (max_y - min_y).ceil().max(1.0) as u32;
+    let mut out = image::RgbImage::from_pixel(out_w, out_h, image::Rgb([255, 255, 255]));
+    let src_cx = (w as f32 - 1.0) / 2.0;
+    let src_cy = (h as f32 - 1.0) / 2.0;
+    let out_cx = (out_w as f32 - 1.0) / 2.0;
+    let out_cy = (out_h as f32 - 1.0) / 2.0;
+
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let dx = x as f32 - out_cx;
+            let dy = y as f32 - out_cy;
+            let src_x = dx * cos + dy * sin + src_cx;
+            let src_y = -dx * sin + dy * cos + src_cy;
+            if src_x >= 0.0 && src_y >= 0.0 && src_x < w as f32 && src_y < h as f32 {
+                let px = src.get_pixel(
+                    (src_x.round() as u32).min(w.saturating_sub(1)),
+                    (src_y.round() as u32).min(h.saturating_sub(1)),
+                );
+                out.put_pixel(x, y, *px);
+            }
+        }
+    }
+
+    DynamicImage::ImageRgb8(out)
 }
 
 fn adaptive_binary_luma(gray: &GrayImage, invert: bool) -> GrayImage {
@@ -6265,10 +6668,14 @@ fn column_boxes_from_foreground_mask(
     boxes
 }
 
-fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -> (String, f32) {
+fn ctc_greedy_decode_with_stats(
+    logits: &[f32],
+    out_shape: &[usize],
+    alphabet: &[String],
+) -> (String, f32, CtcDecodeStats) {
     let shape = g_outer_shape(logits, out_shape);
     if shape.len() < 2 {
-        return (String::new(), 0.0);
+        return (String::new(), 0.0, CtcDecodeStats::default());
     }
 
     let (steps, classes, channel_first) = if shape[1] > shape[2] {
@@ -6278,18 +6685,21 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
     };
 
     if classes <= 1 {
-        return (String::new(), 0.0);
+        return (String::new(), 0.0, CtcDecodeStats::default());
     }
 
     let blank_id = 0usize;
     let mut prev = blank_id;
     let mut text = String::new();
     let mut prob_sum = 0.0f32;
+    let mut margin_sum = 0.0f32;
+    let mut min_margin = f32::INFINITY;
     let mut count = 0usize;
 
     for t in 0..steps {
         let mut best_id = 0usize;
         let mut best_val = f32::NEG_INFINITY;
+        let mut second_val = f32::NEG_INFINITY;
         for c in 0..classes {
             let v = if channel_first {
                 logits[c * steps + t]
@@ -6297,8 +6707,11 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
                 logits[t * classes + c]
             };
             if v > best_val {
+                second_val = best_val;
                 best_val = v;
                 best_id = c;
+            } else if v > second_val {
+                second_val = v;
             }
         }
         if best_id != blank_id && best_id != prev {
@@ -6309,6 +6722,13 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
                 }
                 text.push_str(ch);
                 prob_sum += best_val;
+                let margin = if second_val.is_finite() {
+                    (best_val - second_val).max(0.0)
+                } else {
+                    0.0
+                };
+                margin_sum += margin;
+                min_margin = min_margin.min(margin);
                 count += 1;
             }
         }
@@ -6319,7 +6739,15 @@ fn ctc_greedy_decode(logits: &[f32], out_shape: &[usize], alphabet: &[String]) -
     } else {
         prob_sum / count as f32
     };
-    (text, confidence)
+    let stats = if count == 0 {
+        CtcDecodeStats::default()
+    } else {
+        CtcDecodeStats {
+            avg_margin: margin_sum / count as f32,
+            min_margin,
+        }
+    };
+    (text, confidence, stats)
 }
 
 fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCandidate {
@@ -6343,10 +6771,19 @@ fn select_recognition(primary: RecCandidate, alt: Option<RecCandidate>) -> RecCa
     if alt_ascii >= 0.75 && primary_ascii >= 0.75 && alt.confidence > primary.confidence {
         return alt;
     }
-    if alt.confidence > primary.confidence + 0.08 {
+    if recognition_candidate_model_score(&alt) > recognition_candidate_model_score(&primary) + 6.0 {
         return alt;
     }
     primary
+}
+
+fn recognition_candidate_model_score(candidate: &RecCandidate) -> f32 {
+    recognition_text_quality_with_margin(
+        &candidate.text,
+        candidate.confidence,
+        candidate.avg_margin,
+        candidate.min_margin,
+    )
 }
 
 fn is_usable_recognition(candidate: &RecCandidate) -> bool {
@@ -7151,15 +7588,38 @@ mod tests {
             text: "川川川".to_string(),
             confidence: 0.61,
             variant: RecVariant::Primary,
+            avg_margin: 0.02,
+            min_margin: 0.01,
         };
         let alt = RecCandidate {
             text: "Invoice 42".to_string(),
             confidence: 0.60,
             variant: RecVariant::Alt,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         };
         let chosen = select_recognition(primary, Some(alt));
         assert_eq!(chosen.variant, RecVariant::Alt);
         assert_eq!(chosen.text, "Invoice 42");
+    }
+
+    #[test]
+    fn ctc_decode_reports_character_margins() {
+        let alphabet = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let logits = vec![
+            0.05, 0.70, 0.05, // blank
+            0.90, 0.10, 0.10, // A
+            0.20, 0.05, 0.80, // B
+            0.10, 0.05, 0.10, // C
+        ];
+
+        let (text, confidence, stats) =
+            ctc_greedy_decode_with_stats(&logits, &[1, 4, 3], &alphabet);
+
+        assert_eq!(text, "AB");
+        assert!((confidence - 0.85).abs() < 0.01);
+        assert!(stats.avg_margin > 0.65);
+        assert!(stats.min_margin > 0.60);
     }
 
     #[test]
@@ -7168,15 +7628,31 @@ mod tests {
             text: "测试文本".to_string(),
             confidence: 0.68,
             variant: RecVariant::Primary,
+            avg_margin: 0.08,
+            min_margin: 0.04,
         };
         let alt = RecCandidate {
             text: "Test Text".to_string(),
             confidence: 0.60,
             variant: RecVariant::Alt,
+            avg_margin: 0.08,
+            min_margin: 0.04,
         };
         let chosen = select_recognition(primary.clone(), Some(alt));
         assert_eq!(chosen.variant, primary.variant);
         assert_eq!(chosen.text, primary.text);
+    }
+
+    #[test]
+    fn select_recognition_uses_margin_for_model_quality() {
+        let primary = rec_candidate("Status", 0.62, RecVariant::Primary);
+        let mut alt = rec_candidate("Status", 0.61, RecVariant::Alt);
+        alt.avg_margin = 0.85;
+        alt.min_margin = 0.50;
+
+        let chosen = select_recognition(primary, Some(alt));
+
+        assert_eq!(chosen.variant, RecVariant::Alt);
     }
 
     #[test]
@@ -7185,16 +7661,22 @@ mod tests {
             text: "||||||".to_string(),
             confidence: 0.91,
             variant: RecVariant::Primary,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         };
         let low_confidence = RecCandidate {
             text: "Invoice 42".to_string(),
             confidence: 0.12,
             variant: RecVariant::Alt,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         };
         let valid = RecCandidate {
             text: "Invoice 42".to_string(),
             confidence: 0.42,
             variant: RecVariant::Alt,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         };
         assert!(!is_usable_recognition(&repeated));
         assert!(!is_usable_recognition(&low_confidence));
@@ -7239,6 +7721,8 @@ mod tests {
             text: "Alpha\nBeta".to_string(),
             confidence: 0.82,
             variant: RecVariant::Primary,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         };
 
         let lines = candidate_text_lines(
@@ -7383,6 +7867,7 @@ mod tests {
             &mut regions,
             &mut fallback,
             &mut pool,
+            None,
             "color-regions:eager".to_string(),
             &candidate,
         ));
@@ -7621,6 +8106,29 @@ mod tests {
     }
 
     #[test]
+    fn local_recognition_variants_skip_when_direct_is_stable() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(120, 32, Luma([255])));
+        let mut stable = rec_candidate("Stable text", 0.86, RecVariant::Primary);
+        stable.avg_margin = 0.18;
+        stable.min_margin = 0.08;
+        let weak = rec_candidate("Stable text", 0.52, RecVariant::Primary);
+
+        assert!(!should_try_local_recognition_variants(&img, Some(&stable)));
+        assert!(should_try_local_recognition_variants(&img, Some(&weak)));
+    }
+
+    #[test]
+    fn local_recognition_variants_adaptive_limits_medium_direct_result() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(120, 32, Luma([220])));
+        let candidate = rec_candidate("Panel text", 0.62, RecVariant::Primary);
+
+        let variants = local_recognition_variants_adaptive(&img, Some(&candidate));
+
+        assert!(variants.len() <= 3);
+        assert!(!variants.is_empty());
+    }
+
+    #[test]
     fn local_det_upscale_variants_prioritize_two_x_when_budget_allows() {
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(120, 40, Luma([128])));
         let variants = local_det_upscale_variants(&img)
@@ -7661,6 +8169,26 @@ mod tests {
         assert!(recognized.layout_applied);
         assert_eq!(recognized.regions[0].bbox, [0, 0, 90, 30]);
         assert_eq!(recognized.regions[0].lines[0].source, "det");
+    }
+
+    #[test]
+    fn layout_regions_respect_horizontal_visual_separator() {
+        let mut rgb = image::RgbImage::from_pixel(160, 80, image::Rgb([255, 255, 255]));
+        for x in 10..150 {
+            rgb.put_pixel(x, 32, image::Rgb([60, 60, 60]));
+        }
+        let image = DynamicImage::ImageRgb8(rgb);
+        let mut without_context = vec![
+            text_line((20, 10, 120, 22), "Alpha", 0.82),
+            text_line((20, 44, 120, 56), "Beta", 0.82),
+        ];
+        let mut with_context = without_context.clone();
+
+        let merged = recognized_from_text_lines(&mut without_context);
+        let separated = recognized_from_text_lines_with_image(&mut with_context, &image);
+
+        assert_eq!(merged.region_count, 1);
+        assert_eq!(separated.region_count, 2);
     }
 
     #[test]
@@ -7971,6 +8499,32 @@ mod tests {
     }
 
     #[test]
+    fn deskew_estimates_small_foreground_angle() {
+        let mut rgb = image::RgbImage::from_pixel(180, 80, image::Rgb([255, 255, 255]));
+        for x in 20..160 {
+            let y = 30 + (x - 20) / 16;
+            for dy in 0..3 {
+                rgb.put_pixel(x, y + dy, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let angle = estimate_foreground_skew_degrees(&DynamicImage::ImageRgb8(rgb))
+            .expect("estimated angle");
+
+        assert!(angle > 2.0);
+        assert!(angle < 7.0);
+    }
+
+    #[test]
+    fn rotate_image_degrees_on_white_expands_canvas() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 30, Luma([255])));
+        let rotated = rotate_image_degrees_on_white(&img, 5.0);
+
+        assert!(rotated.width() > 80);
+        assert!(rotated.height() >= 30);
+    }
+
+    #[test]
     fn detects_non_opaque_alpha_pixels() {
         let mut rgba = image::RgbaImage::new(2, 1);
         rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
@@ -8008,6 +8562,8 @@ mod tests {
             text: text.to_string(),
             confidence,
             variant,
+            avg_margin: 0.10,
+            min_margin: 0.06,
         }
     }
 
