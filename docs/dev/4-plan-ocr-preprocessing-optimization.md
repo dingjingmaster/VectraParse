@@ -4,9 +4,9 @@
 > - 文件编号：4
 > - 文档类型：plan
 > - 文件路径：docs/dev/4-plan-ocr-preprocessing-optimization.md
-> - 文档版本：v1.0.22
+> - 文档版本：v1.0.23
 > - 最后更新：2026-06-02
-> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop、近似重复去重、短噪声过滤、page-region 局部修复预算、高分辨率 tile det 补充、未覆盖纹理区域补识别、二维视觉区域候选、行级候选合并、宽行分段 rec、颜色背景区域局部 det 补识别、低对比局部二值化兜底、大框强制结构化拆分、tile 本地拆分预算、低对比前景 mask 拆行拆列、补充候选优先级排序、det 合并视觉分隔保护、近重复候选投票仲裁、全局候选池仲裁、分层背景区域识别、局部多预处理/多尺度 det 补充、OCR 文本 golden 规则、CTC margin、候选池评分细化、视觉边界版面分组、轻量 deskew、自适应局部预算、模型候选选择优化、行级 margin 仲裁、超大框先拆后识别、宽行滑窗识别、panel 分桶版面、颜色层级前景组件、低质 ASCII 噪声过滤、CTC 小 beam 解码、CTC prefix beam、det 轮廓投影细化、trace margin、文本行图版面、glyph textness、候选质量校准、OCR trace 指标规则、主 det 图像上下文版面、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态宽度/分段和 CTC 概率校准。
+> - 关联需求：按当前代码实现校准 OCR 预处理优化计划与完成状态；按识别质量优化建议实现一版可测试改进；继续实现增强/上采样/旋转重跑 det、部分成功补跑合并、det NMS/unclip 扩边、透明图黑底增强、复杂截图区域级布局聚类、颜色背景区域 fallback、结构化 regions/lines 输出、trace metadata、det 框内部多行切分、浅色底黑字主动补充识别、det 候选质量优化、rec tight crop、近似重复去重、短噪声过滤、page-region 局部修复预算、高分辨率 tile det 补充、未覆盖纹理区域补识别、二维视觉区域候选、行级候选合并、宽行分段 rec、颜色背景区域局部 det 补识别、低对比局部二值化兜底、大框强制结构化拆分、tile 本地拆分预算、低对比前景 mask 拆行拆列、补充候选优先级排序、det 合并视觉分隔保护、近重复候选投票仲裁、全局候选池仲裁、分层背景区域识别、局部多预处理/多尺度 det 补充、OCR 文本 golden 规则、CTC margin、候选池评分细化、视觉边界版面分组、轻量 deskew、自适应局部预算、模型候选选择优化、行级 margin 仲裁、超大框先拆后识别、宽行滑窗识别、panel 分桶版面、颜色层级前景组件、低质 ASCII 噪声过滤、CTC 小 beam 解码、CTC prefix beam、det 轮廓投影细化、trace margin、文本行图版面、glyph textness、候选质量校准、OCR trace 指标规则、主 det 图像上下文版面、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态宽度/分段、CTC 概率校准、候选池行级 support 仲裁、递归 panel-first 区域识别、低阈值局部 det、多前景 mask 融合、字符级 trace 指标和 trace 指标/metadata 回归入口。
 > - 关联调研：当前为代码只读分析结论，未单独创建 research 文档。
 
 ## 1. 目标与成功标准
@@ -18,7 +18,7 @@
 - 成功标准：
   - 常见图片格式能稳定进入 `ImageMetadataParser` 的 OCR 路径。
   - 失败样本可按原因分桶，并在 metadata 或 warnings 中体现。
-  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、浅色底黑字候选、det 原始小框替代切分候选、rec 前景 tight crop、近似重复行去重、短 ASCII/符号噪声过滤、结构化区域/行输出、det 框内部多行切分、行级 margin 投票、超大框优先结构化拆分、宽行滑窗、panel 分桶、颜色前景组件、CTC prefix beam、det 轮廓投影细化、trace margin、文本行图版面、glyph textness、候选质量校准、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态分段和 CTC 概率校准，并覆盖 OLE 图片候选处理。
+  - 当前单元测试覆盖 MIME 入口、诊断 metadata/warnings、图像增强变体、小图上采样、det mask 后处理、中英文结果选择、旋转变体、行级质量过滤、区域级布局聚类、颜色背景区域候选、浅色底黑字候选、det 原始小框替代切分候选、rec 前景 tight crop、近似重复行去重、短 ASCII/符号噪声过滤、结构化区域/行输出、det 框内部多行切分、行级 margin 投票、超大框优先结构化拆分、宽行滑窗、panel 分桶、颜色前景组件、CTC prefix beam、det 轮廓投影细化、trace margin、文本行图版面、glyph textness、候选质量校准、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态分段、CTC 概率校准、候选 support_count、递归 panel 子区域、低阈值局部 det、多前景 mask 变体和字符级 trace 指标，并覆盖 OLE 图片候选处理。
   - 当前 golden 覆盖 `image/png` parser 叶子行为、`image.format` 基础元数据和 OCR trace 文本/指标规则入口；尚未纳入私有真实截图 OCR 文本 fixture。
   - 当前验证主要证明入口、诊断和辅助算法行为；尚未用真实失败样本系统证明 OCR 文本质量提升。
 - 前置条件：
@@ -44,7 +44,7 @@
 - 影响模块/文件：
   - MIME 检测：补齐图片 magic 和资源名扩展识别。
   - Parser 入口：对齐 `ImageMetadataParser` 支持格式与 OCR 实际解码能力。
-  - OCR 核心：当前实现包含原图 det+逐框 rec、主 det 图像上下文版面分组、原始 det 小框作为合并框的替代切分候选、det map 膨胀连通域和轮廓投影细化、det 合并视觉分隔保护和更保守的小 panel 间隙保护、rec 前景 tight crop、CTC top1/top2 margin 统计、CTC prefix beam 备选解码、CTC 帧级概率校准、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、大框强制结构化拆分、超大框先拆后 direct rec、宽行窄空隙分段 rec、超长行动态分段预算、宽行无可靠切点时的重叠滑窗 rec、聊天 UI 中间时间标记断行后处理、文本行图版面聚类、视觉边界辅助区域分组、panel 分桶版面聚类、bbox+文本相似度的近似重复行去重、近重复候选投票仲裁、行级 margin 质量评分、全局候选池仲裁、候选 trace 事件和 candidate_count、候选来源权重和多来源支持评分、glyph textness 候选评分、短 ASCII/符号噪声过滤、低置信异常 ASCII token 过滤、颜色背景区域候选 fallback、受限主动颜色区域补充识别、分层背景区域识别、dominant 背景软前景 mask、颜色 panel 内前景组件候选、补充候选优先级排序、颜色背景区域局部 det 补识别、颜色区域局部放大 det 补充、颜色区域低对比局部二值化兜底、空结果视觉前景补扫、局部多窗口二值化 rec 候选、自适应局部预处理预算、低对比前景 mask 拆行/拆列、4-bit 颜色量化的浅色底黑字候选、未覆盖纹理区域补识别、二维视觉区域候选、行级候选合并、page-region 本地拆行/修复预算、高分辨率 tile det 补充和 tile 本地拆行/修复预算、结构化 `regions/lines` 输出、trace 统计和 trace margin、整图 fallback、轻量小角度 deskew 整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、基于 CTC margin 的模型候选选择、行级质量过滤、部分成功质量判定和诊断。
+  - OCR 核心：当前实现包含原图 det+逐框 rec、主 det 图像上下文版面分组、原始 det 小框作为合并框的替代切分候选、det map 膨胀连通域和轮廓投影细化、det 合并视觉分隔保护和更保守的小 panel 间隙保护、rec 前景 tight crop、CTC top1/top2 margin 统计、CTC prefix beam 备选解码、CTC 帧级概率校准、字符级最小置信度统计、det 框内部多行 crop 行投影切分、同一检测行内水平大空隙切分、大框强制结构化拆分、超大框先拆后 direct rec、宽行窄空隙分段 rec、超长行动态分段预算、宽行无可靠切点时的重叠滑窗 rec、聊天 UI 中间时间标记断行后处理、文本行图版面聚类、视觉边界辅助区域分组、panel 分桶版面聚类、递归 panel-first 区域识别、bbox+文本相似度的近似重复行去重、近重复候选投票仲裁、行级 margin 质量评分、行级 support_count 仲裁、全局候选池仲裁、候选 trace 事件和 candidate_count、候选采用/拒绝统计、候选来源权重和多来源支持评分、glyph textness 候选评分、短 ASCII/符号噪声过滤、低置信异常 ASCII token 过滤、颜色背景区域候选 fallback、受限主动颜色区域补充识别、分层背景区域识别、dominant 背景软前景 mask、颜色 panel 内前景组件候选、补充候选优先级排序、颜色背景区域局部 det 补识别、颜色区域局部放大 det 补充、颜色区域低对比局部二值化兜底、空结果视觉前景补扫、局部多窗口二值化 rec 候选、多前景 mask 融合、自适应局部预处理预算、低对比前景 mask 拆行/拆列、4-bit 颜色量化的浅色底黑字候选、未覆盖纹理区域补识别、二维视觉区域候选、行级候选合并、page-region 本地拆行/修复预算、高分辨率 tile det 补充和 tile 本地拆行/修复预算、局部低阈值 det 补扫、结构化 `regions/lines` 输出、trace 统计、trace source/candidate action 计数、trace 行级 `support_count/readable_ratio/char_min_confidence`、整图 fallback、轻量小角度 deskew 整图 fallback、luma/HSL/max-channel 的对比度拉伸、Otsu 全局二值化、局部均值二值化、透明图黑底增强变体、小图 1.5x/2x 上采样 fallback、90/180/270 度旋转 fallback、增强/上采样/旋转图重新 det+逐框 rec、行切分 fallback、中英文 rec 结果选择、基于 CTC margin 的模型候选选择、行级质量过滤、部分成功质量判定和诊断。
   - OCR 核心未实现：锐化/去噪、真实私有截图 OCR 文本 fixture；det 后处理仍输出轴对齐框，未实现真正 PaddleOCR polygon unclip、旋转框裁剪或语义级页面版面理解；小角度 deskew 仅作为整图 fallback，不对 det bbox 做任意角度回映；宽行滑窗只在修复路径中保守触发，不做语义级重排或词典纠错。
   - OLE 嵌入图：当前仅 `.doc` 路径汇总图片候选并 OCR；支持候选过滤、去重、预算告警和失败诊断。WebP 支持直接图片流，尚未从复合 payload 中切片提取 WebP。
 - 依赖关系：
@@ -138,6 +138,7 @@
 | 28 | 一次性完成新一轮准确性优化 1-7：行级 margin 质量仲裁、超大框先拆后识别、宽行重叠滑窗、panel 分桶版面、颜色层级前景组件、低质 ASCII 噪声过滤和 CTC 小 beam 备选解码 | `cargo test -p vectraparse-ocr`; trace/text golden；`cargo check -p vectraparse-ffi`; 格式和 diff 检查 | 完成 |
 | 29 | 一次性完成准确性优化 1-7：CTC prefix beam 概率合并、det 轮廓投影细化、trace margin 暴露、文本行图版面、glyph textness、结构化候选评分校准和 OCR trace 指标规则扩展 | `cargo test -p vectraparse-ocr`; OCR trace golden；parser 定向测试；`cargo check -p vectraparse-ffi`; 格式检查 | 完成 |
 | 30 | 一次性完成准确性优化 1-7：主 det 图像上下文版面、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态宽度/分段和 CTC 概率校准 | `cargo test -p vectraparse-ocr`; OCR trace golden；parser 定向测试；`cargo check -p vectraparse-ffi`; 格式检查 | 完成 |
+| 31 | 一次性完成准确性优化 1-7：候选池行级 support 仲裁、递归 panel-first 区域识别、低阈值局部 det、多前景 mask 融合、字符级 trace 指标和 trace 指标/metadata 回归入口 | `cargo test -p vectraparse-ocr`; OCR trace golden；parser 定向测试；`cargo check -p vectraparse-ffi`; `git diff --check` | 完成 |
 
 ## 6. 验证计划
 
@@ -803,6 +804,24 @@
   - 验证已执行 `cargo test -p vectraparse-ocr`、`python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、parser OCR metadata 定向测试、`cargo check -p vectraparse-ffi`、`rustfmt --edition 2024 --check --config skip_children=true crates/vectraparse-ocr/src/lib.rs`、`git diff --check` 和真实样本文本禁入检查。
   - 本轮仍未加入真实截图文本 golden，复杂页面实际准确度和耗时需要用户继续用私有样本回测。
 
+## 7.27 本轮 Code 阶段审视
+
+- 安全审查员：
+  - 本轮继续只修改 `crates/vectraparse-ocr/src/lib.rs`、`crates/vectraparse-parsers/src/lib.rs`、`scripts/ocr_trace_golden.py`、合成 OCR golden 和 OCR 计划/索引文档，不触碰 `crates/vectraparse-ocr/src/ort.rs`、ONNX 模型、字典、C ABI 或构建链接。
+  - 新增回归指标只包含 `support_count`、`readable_ratio`、`char_min_confidence`、candidate action/source 计数等泛化字段，不写入真实截图文本、业务词或私有路径。
+- 高级产品：
+  - 候选池由“更长文本优先”继续收紧为“近重复行支持度 + 行级质量”仲裁，降低多路径补识别把噪声长文本带入最终结果的概率。
+  - page-region 识别增加递归 panel-first 子区域展开和局部低阈值 det，有利于复杂截图中的嵌套色块、小面板和弱 det 区域。
+  - 多前景 mask 融合和字符级最小置信度 trace 提升了浅底深色字、弱对比行和私有样本回归诊断的可观测性。
+- 高级架构师：
+  - 未新增依赖；递归 panel 只展开到受限深度和数量上限，低阈值 det 只在局部弱结果 panel 上触发，仍保持预算可控。
+  - 公开 Rust OCR line/trace 结构增加 `char_min_confidence`、`readable_ratio` 和 `support_count`；parser metadata 增加 adopted/rejected/source 计数；C ABI 和 FFI 不变。
+  - 私有样本回归入口仍基于 trace/golden 指标，不在仓库中固化真实文本 fixture。
+- 高级工程师：
+  - 单测新增覆盖重复候选 `support_count`、多前景 mask 变体、panel 子区域候选、低阈值 det 门限，以及扩展后的 trace JSON/metadata 字段。
+  - 验证已执行 `cargo test -p vectraparse-ocr`、`python3 scripts/ocr_trace_golden.py tests/golden/ocr/manifest.tsv`、parser OCR metadata 定向测试、`cargo check -p vectraparse-ffi` 和 `git diff --check`；`vectraparse-parsers` 整文件 `rustfmt --check` 仍会触发历史格式差异，因此本轮只对 OCR crate 做定向格式检查。
+  - 真实复杂截图的净收益和耗时仍需用户私有样本回测；本轮主要补足行级仲裁、递归 panel 和指标回归闭环。
+
 ## 8. 变更记录
 
 | 日期 | 变更 | 原因 |
@@ -848,3 +867,4 @@
 | 2026-06-02 | 增加行级 margin、超大框优先拆分、宽行滑窗、panel 分桶、颜色组件、噪声过滤和 CTC beam | 一次性完成新一轮准确性优化 1-7，在不替换模型的前提下继续提升复杂截图的行级准确率和版面稳定性 |
 | 2026-06-02 | 增加 CTC prefix beam、det 轮廓投影、trace margin、文本行图、glyph textness、候选评分校准和 OCR trace 指标规则 | 一次性完成本轮准确性优化 1-7，以泛化机制和可观测指标继续提升复杂截图 OCR 稳定性 |
 | 2026-06-02 | 增加主 det 图像上下文版面、候选 trace 事件、空结果视觉补扫、dominant 背景软前景、保守 det 合并、长行动态宽度/分段和 CTC 概率校准 | 一次性完成本轮准确性优化 1-7，继续降低复杂页面误合并和漏召回，并提升 trace 可诊断性 |
+| 2026-06-02 | 增加候选池行级 support 仲裁、递归 panel-first 区域识别、低阈值局部 det、多前景 mask 融合、字符级 trace 指标和 trace 指标/metadata 回归入口 | 一次性完成本轮准确性优化 1-7，继续降低复杂页面误选和弱 det 漏召回，并补足私有样本回归所需的泛化指标 |

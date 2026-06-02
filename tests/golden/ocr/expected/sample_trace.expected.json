@@ -9,6 +9,15 @@
   "candidate_count": {
     "eq": 2
   },
+  "adopted_candidate_count": {
+    "eq": 1
+  },
+  "rejected_candidate_count": {
+    "eq": 1
+  },
+  "source_count": {
+    "eq": 2
+  },
   "confidence": {
     "min": 0.80
   },
@@ -17,6 +26,9 @@
   },
   "min_line_margin": {
     "min": 0.04
+  },
+  "min_char_confidence": {
+    "min": 0.70
   },
   "low_margin_threshold": 0.02,
   "low_margin_line_count": {
@@ -32,6 +44,9 @@
       "bbox": [10, 20, 90, 38],
       "crop_size": [80, 18],
       "min_confidence": 0.85,
+      "min_char_confidence": 0.80,
+      "min_readable_ratio": 1.0,
+      "min_support_count": 2,
       "min_avg_margin": 0.10,
       "min_min_margin": 0.05
     },

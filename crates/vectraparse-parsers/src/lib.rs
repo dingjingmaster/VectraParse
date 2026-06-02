@@ -1310,6 +1310,34 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
         "image.ocr.trace_candidate_count",
         ocr.trace.candidates.len().to_string(),
     );
+    metadata.insert(
+        "image.ocr.trace_adopted_candidate_count",
+        ocr.trace
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.action == "adopted")
+            .count()
+            .to_string(),
+    );
+    metadata.insert(
+        "image.ocr.trace_rejected_candidate_count",
+        ocr.trace
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.action == "rejected")
+            .count()
+            .to_string(),
+    );
+    metadata.insert(
+        "image.ocr.trace_source_count",
+        ocr.trace
+            .lines
+            .iter()
+            .map(|line| line.source.split(':').next().unwrap_or(line.source.as_str()).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            .to_string(),
+    );
     if let Some(json) = &ocr.trace.json {
         metadata.insert("image.ocr.trace_json", json.clone());
     }
@@ -3527,6 +3555,9 @@ mod tests {
                     confidence: 0.2,
                     avg_margin: 0.0,
                     min_margin: 0.0,
+                    char_min_confidence: 0.2,
+                    readable_ratio: 1.0,
+                    support_count: 1,
                     source: "whole-image".to_string(),
                 }],
                 candidates: vec![vectraparse_ocr::OcrTraceCandidate {
@@ -3611,6 +3642,27 @@ mod tests {
         assert_eq!(
             metadata
                 .values("image.ocr.trace_candidate_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_adopted_candidate_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_rejected_candidate_count")
+                .and_then(|v| v.first())
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata
+                .values("image.ocr.trace_source_count")
                 .and_then(|v| v.first())
                 .map(String::as_str),
             Some("1")

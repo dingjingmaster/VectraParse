@@ -12,6 +12,9 @@
     "det_pass_count": 1,
     "fallback_attempt_count": 0,
     "candidate_count": 2,
+    "adopted_candidate_count": 1,
+    "rejected_candidate_count": 1,
+    "source_count": 2,
     "detect_used_whole_image_box": false,
     "empty_result": false,
     "confidence": 0.8400,
@@ -32,6 +35,9 @@
           "confidence": 0.8800,
           "avg_margin": 0.1200,
           "min_margin": 0.0600,
+          "char_min_confidence": 0.8100,
+          "readable_ratio": 1.0000,
+          "support_count": 2,
           "source": "det",
           "text": "Alpha"
         },
@@ -42,6 +48,9 @@
           "confidence": 0.8000,
           "avg_margin": 0.0900,
           "min_margin": 0.0400,
+          "char_min_confidence": 0.7200,
+          "readable_ratio": 1.0000,
+          "support_count": 1,
           "source": "page-region:1",
           "text": "Beta"
         }
@@ -57,6 +66,9 @@
       "confidence": 0.8800,
       "avg_margin": 0.1200,
       "min_margin": 0.0600,
+      "char_min_confidence": 0.8100,
+      "readable_ratio": 1.0000,
+      "support_count": 2,
       "source": "det",
       "text": "Alpha"
     },
@@ -68,6 +80,9 @@
       "confidence": 0.8000,
       "avg_margin": 0.0900,
       "min_margin": 0.0400,
+      "char_min_confidence": 0.7200,
+      "readable_ratio": 1.0000,
+      "support_count": 1,
       "source": "page-region:1",
       "text": "Beta"
     }

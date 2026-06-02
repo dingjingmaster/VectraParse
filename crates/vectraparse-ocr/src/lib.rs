@@ -33,6 +33,8 @@ const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 6;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
+const MAX_PANEL_CHILD_CANDIDATES: usize = 6;
+const MAX_PANEL_RECURSION_DEPTH: usize = 2;
 const MAX_LOCAL_DET_UPSCALE_PASSES_PER_REGION: usize = 1;
 const CTC_BEAM_SIZE: usize = 4;
 const CTC_TOP_K: usize = 4;
@@ -96,6 +98,9 @@ pub struct OcrTextLine {
     pub confidence: f32,
     pub avg_margin: f32,
     pub min_margin: f32,
+    pub char_min_confidence: f32,
+    pub readable_ratio: f32,
+    pub support_count: usize,
     pub source: String,
 }
 
@@ -119,6 +124,9 @@ pub struct OcrTraceLine {
     pub confidence: f32,
     pub avg_margin: f32,
     pub min_margin: f32,
+    pub char_min_confidence: f32,
+    pub readable_ratio: f32,
+    pub support_count: usize,
     pub source: String,
 }
 
@@ -170,12 +178,14 @@ struct RecCandidate {
     variant: RecVariant,
     avg_margin: f32,
     min_margin: f32,
+    char_min_confidence: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CtcDecodeStats {
     avg_margin: f32,
     min_margin: f32,
+    char_min_confidence: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,6 +224,9 @@ struct TextLine {
     confidence: f32,
     avg_margin: f32,
     min_margin: f32,
+    char_min_confidence: f32,
+    readable_ratio: f32,
+    support_count: usize,
     source: String,
 }
 
@@ -225,12 +238,16 @@ fn make_text_line(
     min_margin: f32,
     source: String,
 ) -> TextLine {
+    let readable_ratio = readable_ratio(&text);
     TextLine {
         bbox,
         text,
         confidence,
         avg_margin,
         min_margin,
+        char_min_confidence: confidence,
+        readable_ratio,
+        support_count: 1,
         source,
     }
 }
@@ -786,6 +803,7 @@ impl OrtOcrEngine {
 
         let (img_w, img_h) = img.dimensions();
         let mut lines = Vec::new();
+        let mut det_passes = 0usize;
         for (idx, region_box) in region_boxes.iter().enumerate() {
             if trace_enabled {
                 eprintln!(
@@ -797,24 +815,86 @@ impl OrtOcrEngine {
                     region_box.1
                 );
             }
-            let crop = crop_box(img, *region_box);
             let source = format!("page-region:{}", idx + 1);
-            let detected = self.recognize_detected_text(
-                &crop,
+            let (region_passes, recognized) = self.recognize_panel_region_recursive(
+                img,
                 cfg,
-                false,
+                *region_box,
+                0,
                 &source,
-                BboxTransform::Offset {
-                    dx: region_box.0,
-                    dy: region_box.1,
-                    max_w: img_w,
-                    max_h: img_h,
-                },
+                (region_box.0, region_box.1),
+                (img_w, img_h),
             )?;
-            lines.extend(text_lines_from_recognized(&detected.recognized));
+            det_passes += region_passes;
+            lines.extend(text_lines_from_recognized(&recognized));
         }
 
-        Ok((region_boxes.len(), recognized_from_text_lines(&mut lines)))
+        Ok((det_passes, recognized_from_text_lines(&mut lines)))
+    }
+
+    fn recognize_panel_region_recursive(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        region_box: BoxRect,
+        depth: usize,
+        source: &str,
+        origin: (u32, u32),
+        image_dims: (u32, u32),
+    ) -> Result<(usize, RecognizedText), String> {
+        let crop = crop_box(img, region_box);
+        let mut det_passes = 1usize;
+        let transform = BboxTransform::Offset {
+            dx: origin.0,
+            dy: origin.1,
+            max_w: image_dims.0,
+            max_h: image_dims.1,
+        };
+        let detected = self.recognize_detected_text(&crop, cfg, false, source, transform)?;
+        let mut recognized = detected.recognized.clone();
+
+        if depth + 1 < MAX_PANEL_RECURSION_DEPTH {
+            let child_boxes = panel_child_candidate_boxes(&crop);
+            if child_boxes.len() >= 2 {
+                let mut child_lines = Vec::new();
+                for (idx, child_box) in child_boxes.iter().enumerate() {
+                    let child_source = format!("{source}.{}", idx + 1);
+                    let (child_passes, child_recognized) = self.recognize_panel_region_recursive(
+                        &crop,
+                        cfg,
+                        *child_box,
+                        depth + 1,
+                        &child_source,
+                        (
+                            origin.0.saturating_add(child_box.0),
+                            origin.1.saturating_add(child_box.1),
+                        ),
+                        image_dims,
+                    )?;
+                    det_passes += child_passes;
+                    child_lines.extend(text_lines_from_recognized(&child_recognized));
+                }
+                if !child_lines.is_empty() {
+                    let child_candidate = recognized_from_text_lines(&mut child_lines);
+                    recognized = merge_recognized_line_sets(&recognized.regions, &child_candidate);
+                }
+            }
+        }
+
+        if should_try_low_threshold_panel_det(&crop, &recognized) {
+            let mut low_cfg = cfg.clone();
+            low_cfg.det_box_thresh = low_threshold_box_thresh(cfg.det_box_thresh);
+            let low_source = format!("{source}:low-det");
+            let low_detected =
+                self.recognize_detected_text(&crop, &low_cfg, false, &low_source, transform)?;
+            det_passes += 1;
+            if !low_detected.recognized.text.trim().is_empty() {
+                recognized =
+                    merge_recognized_line_sets(&recognized.regions, &low_detected.recognized);
+            }
+        }
+
+        Ok((det_passes, recognized))
     }
 
     fn recognize_high_res_tiles(
@@ -1109,6 +1189,11 @@ impl OrtOcrEngine {
             } else {
                 0.0
             },
+            char_min_confidence: segment_candidates
+                .iter()
+                .map(|candidate| candidate.char_min_confidence)
+                .fold(f32::INFINITY, f32::min)
+                .min(confidence),
         };
         if !is_usable_recognition(&candidate) || !repair_candidate_is_better(direct, &candidate) {
             return None;
@@ -1902,6 +1987,7 @@ impl OrtOcrEngine {
             variant,
             avg_margin: stats.avg_margin,
             min_margin: stats.min_margin,
+            char_min_confidence: stats.char_min_confidence,
         })
     }
 }
@@ -1992,6 +2078,9 @@ fn recognized_from_candidate(
             confidence: candidate.confidence,
             avg_margin: candidate.avg_margin,
             min_margin: candidate.min_margin,
+            char_min_confidence: candidate.char_min_confidence,
+            readable_ratio: readable_ratio(&text),
+            support_count: 1,
             source: source.to_string(),
         };
         vec![OcrTextRegion {
@@ -2068,6 +2157,9 @@ fn public_region_from_layout(region: &LayoutRegion, text: &str) -> OcrTextRegion
             confidence: line.confidence,
             avg_margin: line.avg_margin,
             min_margin: line.min_margin,
+            char_min_confidence: line.char_min_confidence,
+            readable_ratio: line.readable_ratio,
+            support_count: line.support_count,
             source: line.source.clone(),
         })
         .collect::<Vec<_>>();
@@ -2110,6 +2202,9 @@ fn ocr_trace_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<OcrTraceLine> 
                 confidence: region.confidence,
                 avg_margin: 0.0,
                 min_margin: 0.0,
+                char_min_confidence: region.confidence,
+                readable_ratio: readable_ratio(&region.text),
+                support_count: 1,
                 source: region.source.clone(),
             });
             continue;
@@ -2124,6 +2219,9 @@ fn ocr_trace_lines_from_regions(regions: &[OcrTextRegion]) -> Vec<OcrTraceLine> 
                 confidence: line.confidence,
                 avg_margin: line.avg_margin,
                 min_margin: line.min_margin,
+                char_min_confidence: line.char_min_confidence,
+                readable_ratio: line.readable_ratio,
+                support_count: line.support_count,
                 source: line.source.clone(),
             });
         }
@@ -2173,6 +2271,24 @@ fn ocr_trace_json(
         true,
     );
     push_json_usize_field(&mut out, "candidate_count", trace.candidates.len(), true);
+    push_json_usize_field(
+        &mut out,
+        "adopted_candidate_count",
+        trace_candidate_action_count(&trace.candidates, "adopted"),
+        true,
+    );
+    push_json_usize_field(
+        &mut out,
+        "rejected_candidate_count",
+        trace_candidate_action_count(&trace.candidates, "rejected"),
+        true,
+    );
+    push_json_usize_field(
+        &mut out,
+        "source_count",
+        trace_source_family_count(&trace.lines),
+        true,
+    );
     push_json_bool_field(
         &mut out,
         "detect_used_whole_image_box",
@@ -2207,6 +2323,14 @@ fn ocr_trace_json(
             push_json_f32_field(&mut out, "confidence", line.confidence, true);
             push_json_f32_field(&mut out, "avg_margin", line.avg_margin, true);
             push_json_f32_field(&mut out, "min_margin", line.min_margin, true);
+            push_json_f32_field(
+                &mut out,
+                "char_min_confidence",
+                line.char_min_confidence,
+                true,
+            );
+            push_json_f32_field(&mut out, "readable_ratio", line.readable_ratio, true);
+            push_json_usize_field(&mut out, "support_count", line.support_count, true);
             push_json_str_field(&mut out, "source", &line.source, true);
             push_json_str_field(&mut out, "text", &line.text, true);
             out.push('}');
@@ -2226,6 +2350,14 @@ fn ocr_trace_json(
         push_json_f32_field(&mut out, "confidence", line.confidence, true);
         push_json_f32_field(&mut out, "avg_margin", line.avg_margin, true);
         push_json_f32_field(&mut out, "min_margin", line.min_margin, true);
+        push_json_f32_field(
+            &mut out,
+            "char_min_confidence",
+            line.char_min_confidence,
+            true,
+        );
+        push_json_f32_field(&mut out, "readable_ratio", line.readable_ratio, true);
+        push_json_usize_field(&mut out, "support_count", line.support_count, true);
         push_json_str_field(&mut out, "source", &line.source, true);
         push_json_str_field(&mut out, "text", &line.text, true);
         out.push('}');
@@ -2353,6 +2485,24 @@ fn escape_json(value: &str) -> String {
         }
     }
     out
+}
+
+fn trace_candidate_action_count(candidates: &[OcrTraceCandidate], action: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.action == action)
+        .count()
+}
+
+fn trace_source_family_count(lines: &[OcrTraceLine]) -> usize {
+    let mut families = Vec::<&str>::new();
+    for line in lines {
+        let family = source_family(&line.source);
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    families.len()
 }
 
 fn dominant_region_source(lines: &[TextLine]) -> String {
@@ -3875,7 +4025,25 @@ fn select_voted_text_line(cluster: &[TextLine]) -> Option<TextLine> {
             best_score = score;
         }
     }
-    Some(cluster[best_idx].clone())
+    let mut selected = cluster[best_idx].clone();
+    let selected_key = normalize_ocr_line(&selected.text);
+    if !selected_key.is_empty() {
+        let mut support_count = 1usize;
+        for other in cluster {
+            if std::ptr::eq(other, &cluster[best_idx]) {
+                continue;
+            }
+            if normalize_ocr_line(&other.text) == selected_key
+                || normalized_text_similarity(&selected.text, &other.text) >= 0.90
+            {
+                support_count += 1;
+            }
+        }
+        selected.support_count = support_count;
+    } else {
+        selected.support_count = cluster.len().max(1);
+    }
+    Some(selected)
 }
 
 fn voted_text_line_quality(line: &TextLine, cluster: &[TextLine]) -> f32 {
@@ -3938,10 +4106,12 @@ fn text_line_quality(line: &TextLine) -> f32 {
     let text = line.text.trim();
     let chars = recognized_char_count(text) as f32;
     line.confidence * 100.0
+        + line.char_min_confidence.clamp(0.0, 1.0) * 10.0
         + line.avg_margin.clamp(0.0, 1.0) * 8.0
         + line.min_margin.clamp(0.0, 1.0) * 3.0
-        + readable_ratio(text) * 12.0
+        + line.readable_ratio * 12.0
         + chars.min(32.0) * 0.35
+        + line.support_count.saturating_sub(1) as f32 * 5.0
         + source_quality_bonus(&line.source)
         - punctuation_ratio(text) * 8.0
         - dominant_char_ratio(text) * 4.0
@@ -3952,9 +4122,18 @@ fn line_confidence_weight(line: &TextLine) -> f32 {
     let chars = recognized_char_count(text) as f32;
     let margin_bonus =
         (line.avg_margin.clamp(0.0, 1.0) * 1.4 + line.min_margin.clamp(0.0, 1.0) * 0.6).min(1.2);
-    let readability = readable_ratio(text).clamp(0.0, 1.0);
+    let readability = line.readable_ratio.clamp(0.0, 1.0);
     let source = (source_quality_bonus(&line.source) / 8.0).clamp(-0.20, 0.50);
-    (0.45 + chars.min(24.0) / 24.0 + readability * 0.55 + margin_bonus + source).clamp(0.25, 3.0)
+    let support = line.support_count.saturating_sub(1).min(4) as f32 * 0.12;
+    let char_floor = line.char_min_confidence.clamp(0.0, 1.0) * 0.35;
+    (0.45
+        + chars.min(24.0) / 24.0
+        + readability * 0.55
+        + margin_bonus
+        + source
+        + support
+        + char_floor)
+        .clamp(0.25, 3.4)
 }
 
 fn source_quality_bonus(source: &str) -> f32 {
@@ -5357,6 +5536,66 @@ fn page_region_boxes(image: &DynamicImage, detection_boxes: &[DetectionBox]) -> 
     boxes
 }
 
+fn panel_child_candidate_boxes(image: &DynamicImage) -> Vec<BoxRect> {
+    let mut candidates = Vec::<(BoxRect, i64)>::new();
+    for b in visual_page_region_boxes(image) {
+        let score = supplemental_text_candidate_score(image, b).unwrap_or_default();
+        candidates.push((b, score + 12));
+    }
+    for b in color_region_boxes(image) {
+        if box_width(b) < 48 || box_height(b) < 18 {
+            continue;
+        }
+        if box_area(b).saturating_mul(100) > box_area(image_box(image)).saturating_mul(92) {
+            continue;
+        }
+        let score = supplemental_text_candidate_score(image, b).unwrap_or_default();
+        candidates.push((b, score));
+    }
+
+    if candidates.len() < 2 {
+        return Vec::new();
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+
+    let mut kept = Vec::new();
+    for (b, _) in candidates {
+        if kept
+            .iter()
+            .any(|existing: &BoxRect| boxes_significantly_overlap(*existing, b))
+        {
+            continue;
+        }
+        kept.push(b);
+        if kept.len() >= MAX_PANEL_CHILD_CANDIDATES {
+            break;
+        }
+    }
+    kept.sort_by(reading_box_order);
+    kept
+}
+
+fn should_try_low_threshold_panel_det(image: &DynamicImage, recognized: &RecognizedText) -> bool {
+    if recognized.text.trim().is_empty() {
+        return panel_text_score(image, image_box(image)) >= 12;
+    }
+    if recognized.confidence < 0.64 {
+        return true;
+    }
+    if regions_have_repairable_lines(&recognized.regions) {
+        return true;
+    }
+    recognized.line_count <= 1 && panel_text_score(image, image_box(image)) >= 18
+}
+
+fn low_threshold_box_thresh(base: f32) -> f32 {
+    (base * 0.72).clamp(0.10, 0.18)
+}
+
+fn panel_text_score(image: &DynamicImage, b: BoxRect) -> i64 {
+    supplemental_text_candidate_score(image, b).unwrap_or_default()
+}
+
 fn high_res_tile_boxes(image: &DynamicImage, det_img_side: usize) -> Vec<BoxRect> {
     let (w, h) = image.dimensions();
     if w == 0 || h == 0 {
@@ -6440,8 +6679,8 @@ fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
 
 fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
     let mut out = Vec::new();
-    if let Some(binary) = binarize_color_region_foreground(image, image_box(image)) {
-        out.push(("foreground-binary".to_string(), binary));
+    for variant in foreground_binary_variants(image) {
+        out.push(variant);
     }
 
     let gray = to_luma_on_white(image);
@@ -6466,6 +6705,97 @@ fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage
     }
 
     out
+}
+
+fn foreground_binary_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    let crop = crop_box(image, image_box(image));
+    let rgb = to_rgb_on_white(&crop);
+    let (w, h) = rgb.dimensions();
+    let mut out = Vec::new();
+    if let Some(binary) = binarize_color_region_foreground(image, image_box(image)) {
+        out.push(("foreground-binary".to_string(), binary));
+    }
+
+    for (name, mask) in [
+        ("foreground-mask", foreground_mask_from_rgb(&rgb)),
+        (
+            "foreground-soft-mask",
+            soft_color_foreground_mask_from_rgb(&rgb),
+        ),
+        (
+            "foreground-low-contrast-mask",
+            low_contrast_foreground_mask_from_rgb(&rgb),
+        ),
+        ("foreground-dark-mask", dark_luma_mask_from_rgb(&rgb)),
+    ] {
+        let Some(mask) = mask else {
+            continue;
+        };
+        if !foreground_glyph_textness_score(&mask, w as usize, h as usize)
+            .is_some_and(|score| score >= -20)
+        {
+            continue;
+        }
+        if let Some(binary) = dynamic_image_from_foreground_mask(&mask, w as usize, h as usize) {
+            out.push((name.to_string(), binary));
+        }
+    }
+
+    dedupe_named_dynamic_variants(out)
+}
+
+fn dynamic_image_from_foreground_mask(mask: &[bool], w: usize, h: usize) -> Option<DynamicImage> {
+    if w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return None;
+    }
+    let mut foreground = 0usize;
+    let mut out = GrayImage::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let active = mask[y * w + x];
+            if active {
+                foreground += 1;
+            }
+            out.put_pixel(x as u32, y as u32, Luma([if active { 0 } else { 255 }]));
+        }
+    }
+    let total = w.saturating_mul(h).max(1);
+    let ratio = foreground as f32 / total as f32;
+    if foreground < 4 || !(0.001..=0.72).contains(&ratio) {
+        return None;
+    }
+    Some(DynamicImage::ImageLuma8(out))
+}
+
+fn dedupe_named_dynamic_variants(
+    variants: Vec<(String, DynamicImage)>,
+) -> Vec<(String, DynamicImage)> {
+    let mut kept = Vec::new();
+    let mut seen = Vec::<u64>::new();
+    for (name, image) in variants {
+        let key = dynamic_image_signature(&image);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        kept.push((name, image));
+    }
+    kept
+}
+
+fn dynamic_image_signature(image: &DynamicImage) -> u64 {
+    let gray = image.to_luma8();
+    let (w, h) = gray.dimensions();
+    let mut hash = ((w as u64) << 32) | h as u64;
+    for pixel in gray
+        .pixels()
+        .step_by(((w as usize).saturating_mul(h as usize) / 64).max(1))
+    {
+        hash = hash
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(pixel[0] as u64 + 1);
+    }
+    hash
 }
 
 fn local_recognition_variants_adaptive(
@@ -7798,6 +8128,7 @@ fn ctc_greedy_decode_with_stats(
     let mut prob_sum = 0.0f32;
     let mut margin_sum = 0.0f32;
     let mut min_margin = f32::INFINITY;
+    let mut min_char_confidence = f32::INFINITY;
     let mut count = 0usize;
 
     for t in 0..steps {
@@ -7811,6 +8142,7 @@ fn ctc_greedy_decode_with_stats(
                 }
                 text.push_str(ch);
                 prob_sum += best_prob;
+                min_char_confidence = min_char_confidence.min(best_prob);
                 let margin = (best_prob - second_prob).max(0.0);
                 margin_sum += margin;
                 min_margin = min_margin.min(margin);
@@ -7830,6 +8162,11 @@ fn ctc_greedy_decode_with_stats(
         CtcDecodeStats {
             avg_margin: margin_sum / count as f32,
             min_margin,
+            char_min_confidence: if min_char_confidence.is_finite() {
+                min_char_confidence
+            } else {
+                0.0
+            },
         }
     };
     (text, confidence, stats)
@@ -8225,6 +8562,7 @@ fn ctc_stats_for_path(
     let mut prob_sum = 0.0f32;
     let mut margin_sum = 0.0f32;
     let mut min_margin = f32::INFINITY;
+    let mut min_char_confidence = f32::INFINITY;
     let mut count = 0usize;
     for (t, id) in ids.iter().copied().enumerate().take(steps) {
         if id != 0 && id != prev {
@@ -8239,6 +8577,7 @@ fn ctc_stats_for_path(
                 let second =
                     ctc_second_best_probability(logits, t, id, steps, classes, channel_first);
                 prob_sum += value;
+                min_char_confidence = min_char_confidence.min(value);
                 let margin = (value - second).max(0.0);
                 margin_sum += margin;
                 min_margin = min_margin.min(margin);
@@ -8256,6 +8595,11 @@ fn ctc_stats_for_path(
         CtcDecodeStats {
             avg_margin: margin_sum / count as f32,
             min_margin,
+            char_min_confidence: if min_char_confidence.is_finite() {
+                min_char_confidence
+            } else {
+                0.0
+            },
         },
     )
 }
@@ -8783,6 +9127,9 @@ mod tests {
                 confidence: 0.88,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.88,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -8911,6 +9258,9 @@ mod tests {
                 confidence: 0.88,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.88,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -8925,6 +9275,9 @@ mod tests {
                 confidence: 0.70,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.70,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9032,6 +9385,9 @@ mod tests {
                 confidence: 0.64,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.64,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9062,6 +9418,9 @@ mod tests {
                     confidence: 0.64,
                     avg_margin: 0.10,
                     min_margin: 0.06,
+                    char_min_confidence: 0.64,
+                    readable_ratio: 1.0,
+                    support_count: 1,
                     source: "det".to_string(),
                 }],
             },
@@ -9076,6 +9435,9 @@ mod tests {
                     confidence: 0.70,
                     avg_margin: 0.10,
                     min_margin: 0.06,
+                    char_min_confidence: 0.70,
+                    readable_ratio: 1.0,
+                    support_count: 1,
                     source: "det".to_string(),
                 }],
             },
@@ -9109,6 +9471,9 @@ mod tests {
                     confidence: 0.70,
                     avg_margin: 0.10,
                     min_margin: 0.06,
+                    char_min_confidence: 0.70,
+                    readable_ratio: 1.0,
+                    support_count: 1,
                     source: "det".to_string(),
                 },
                 OcrTextLine {
@@ -9117,6 +9482,9 @@ mod tests {
                     confidence: 0.76,
                     avg_margin: 0.12,
                     min_margin: 0.07,
+                    char_min_confidence: 0.76,
+                    readable_ratio: 1.0,
+                    support_count: 1,
                     source: "page-region:1".to_string(),
                 },
             ],
@@ -9131,6 +9499,8 @@ mod tests {
         assert_eq!(lines[0].crop_size, [70, 16]);
         assert_eq!(lines[0].avg_margin, 0.10);
         assert_eq!(lines[0].min_margin, 0.06);
+        assert_eq!(lines[0].char_min_confidence, 0.70);
+        assert_eq!(lines[0].support_count, 1);
         assert_eq!(lines[1].source, "page-region:1");
     }
 
@@ -9147,6 +9517,9 @@ mod tests {
                 confidence: 0.82,
                 avg_margin: 0.11,
                 min_margin: 0.05,
+                char_min_confidence: 0.82,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9179,7 +9552,11 @@ mod tests {
         assert!(json.contains("\"avg_margin\":0.1100"));
         assert!(json.contains("\"min_margin\":0.0500"));
         assert!(json.contains("\"candidate_count\":1"));
+        assert!(json.contains("\"adopted_candidate_count\":1"));
+        assert!(json.contains("\"source_count\":1"));
         assert!(json.contains("\"candidates\":["));
+        assert!(json.contains("\"char_min_confidence\":0.8200"));
+        assert!(json.contains("\"support_count\":1"));
         assert!(json.contains("\"label\":\"det\""));
         assert!(json.contains("\"reason\":\"adopted\""));
         assert!(json.contains("A \\\"quoted\\\" line"));
@@ -9223,6 +9600,7 @@ mod tests {
             variant: RecVariant::Primary,
             avg_margin: 0.02,
             min_margin: 0.01,
+            char_min_confidence: 0.61,
         };
         let alt = RecCandidate {
             text: "Invoice 42".to_string(),
@@ -9230,6 +9608,7 @@ mod tests {
             variant: RecVariant::Alt,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: 0.60,
         };
         let chosen = select_recognition(primary, Some(alt));
         assert_eq!(chosen.variant, RecVariant::Alt);
@@ -9281,6 +9660,7 @@ mod tests {
             variant: RecVariant::Primary,
             avg_margin: 0.08,
             min_margin: 0.04,
+            char_min_confidence: 0.68,
         };
         let alt = RecCandidate {
             text: "Test Text".to_string(),
@@ -9288,6 +9668,7 @@ mod tests {
             variant: RecVariant::Alt,
             avg_margin: 0.08,
             min_margin: 0.04,
+            char_min_confidence: 0.60,
         };
         let chosen = select_recognition(primary.clone(), Some(alt));
         assert_eq!(chosen.variant, primary.variant);
@@ -9314,6 +9695,7 @@ mod tests {
             variant: RecVariant::Primary,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: 0.91,
         };
         let low_confidence = RecCandidate {
             text: "Invoice 42".to_string(),
@@ -9321,6 +9703,7 @@ mod tests {
             variant: RecVariant::Alt,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: 0.12,
         };
         let valid = RecCandidate {
             text: "Invoice 42".to_string(),
@@ -9328,6 +9711,7 @@ mod tests {
             variant: RecVariant::Alt,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: 0.42,
         };
         assert!(!is_usable_recognition(&repeated));
         assert!(!is_usable_recognition(&low_confidence));
@@ -9374,6 +9758,7 @@ mod tests {
             variant: RecVariant::Primary,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: 0.82,
         };
 
         let lines = candidate_text_lines(
@@ -9475,6 +9860,21 @@ mod tests {
     }
 
     #[test]
+    fn recognized_from_text_lines_tracks_support_count_for_duplicate_votes() {
+        let mut lines = vec![
+            text_line((10, 10, 190, 26), "Project status: ready", 0.62),
+            text_line((11, 10, 191, 26), "Project status: ready", 0.61),
+            text_line((12, 11, 192, 27), "Project status: reedy", 0.74),
+        ];
+        lines[1].source = "tile-region:1".to_string();
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 1);
+        assert!(recognized.regions[0].lines[0].support_count >= 2);
+    }
+
+    #[test]
     fn maybe_adopt_candidate_pool_adopts_extra_supported_line() {
         let mut text = "Alpha".to_string();
         let mut confidence = 0.72;
@@ -9492,6 +9892,9 @@ mod tests {
                 confidence: 0.72,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.72,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9528,6 +9931,44 @@ mod tests {
         assert!(text.contains("Alpha"));
         assert!(text.contains("Beta"));
         assert_eq!(fallback.as_deref(), Some("pooled:color-regions:eager"));
+    }
+
+    #[test]
+    fn foreground_binary_variants_include_mask_fusions() {
+        let mut rgb = image::RgbImage::from_pixel(96, 32, image::Rgb([236, 242, 248]));
+        draw_synthetic_text_texture_at(&mut rgb, 10, 80, 10, 4);
+
+        let variants = foreground_binary_variants(&DynamicImage::ImageRgb8(rgb));
+        let names = variants
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"foreground-binary"));
+        assert!(names.iter().any(|name| name.contains("foreground-")));
+        assert!(!variants.is_empty());
+    }
+
+    #[test]
+    fn panel_child_candidate_boxes_keep_nested_panels() {
+        let mut rgb = image::RgbImage::from_pixel(320, 180, image::Rgb([250, 250, 250]));
+        fill_rect(&mut rgb, (20, 20, 140, 80), image::Rgb([232, 239, 248]));
+        fill_rect(&mut rgb, (170, 24, 300, 90), image::Rgb([236, 245, 233]));
+        draw_synthetic_text_texture_at(&mut rgb, 34, 120, 34, 4);
+        draw_synthetic_text_texture_at(&mut rgb, 184, 286, 40, 4);
+
+        let boxes = panel_child_candidate_boxes(&DynamicImage::ImageRgb8(rgb));
+
+        assert!(boxes.len() >= 2);
+        assert!(boxes.iter().any(|b| b.0 < 60 && b.2 < 180));
+        assert!(boxes.iter().any(|b| b.0 > 140 && b.2 > 260));
+    }
+
+    #[test]
+    fn low_threshold_box_thresh_is_bounded() {
+        assert!((low_threshold_box_thresh(0.20) - 0.144).abs() < 1.0e-6);
+        assert_eq!(low_threshold_box_thresh(0.30), 0.18);
+        assert_eq!(low_threshold_box_thresh(0.05), 0.10);
     }
 
     #[test]
@@ -9690,6 +10131,9 @@ mod tests {
                 confidence: 0.78,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.78,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9719,6 +10163,9 @@ mod tests {
                 confidence: 0.86,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: 0.86,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -9733,6 +10180,9 @@ mod tests {
                 confidence: 0.82,
                 avg_margin: 0.01,
                 min_margin: 0.0,
+                char_min_confidence: 0.82,
+                readable_ratio: 1.0,
+                support_count: 1,
                 source: "det".to_string(),
             }],
         }];
@@ -10480,6 +10930,7 @@ mod tests {
             variant,
             avg_margin: 0.10,
             min_margin: 0.06,
+            char_min_confidence: confidence,
         }
     }
 
@@ -10500,6 +10951,9 @@ mod tests {
                 confidence,
                 avg_margin: 0.10,
                 min_margin: 0.06,
+                char_min_confidence: confidence,
+                readable_ratio: readable_ratio(text),
+                support_count: 1,
                 source: source.to_string(),
             }],
         }
