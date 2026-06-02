@@ -20,6 +20,8 @@ const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_EAGER_COLOR_REGION_DET_PASSES: usize = 4;
 const MAX_EAGER_LAYERED_REGION_RECOGNITIONS: usize = 10;
 const MAX_EAGER_VISUAL_REGION_RECOGNITIONS: usize = 6;
+const MAX_EAGER_SUPPLEMENT_RECOGNITIONS_TOTAL: usize = 12;
+const MAX_EAGER_SUPPLEMENT_DET_PASSES_TOTAL: usize = 4;
 const MAX_QUALITY_FALLBACK_FAMILIES_EMPTY: usize = 5;
 const MAX_QUALITY_FALLBACK_FAMILIES_PARTIAL: usize = 3;
 const MAX_REC_IMG_W: usize = 960;
@@ -422,6 +424,8 @@ impl OrtOcrEngine {
         };
         let mut candidate_pool = Vec::new();
         push_recognition_candidate(&mut candidate_pool, "det".to_string(), &detected.recognized);
+        let mut remaining_supplement_rec_budget = MAX_EAGER_SUPPLEMENT_RECOGNITIONS_TOTAL;
+        let remaining_supplement_det_budget = MAX_EAGER_SUPPLEMENT_DET_PASSES_TOTAL;
 
         let page_region_start = Instant::now();
         let (page_region_count, page_region_candidate) =
@@ -514,15 +518,21 @@ impl OrtOcrEngine {
             line_count,
             &regions,
         );
-        if run_eager_color {
+        if run_eager_color
+            && should_continue_eager_supplements(&text, confidence, det_box_count, line_count, &regions)
+            && remaining_supplement_rec_budget > 0
+        {
             let color_region_start = Instant::now();
-            let (candidate_count, candidate) = self.recognize_uncovered_color_regions(
+            let color_limit = MAX_EAGER_COLOR_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
+            let (candidate_count, attempted, candidate) = self.recognize_uncovered_color_regions(
                 img,
                 cfg,
                 &regions,
-                MAX_EAGER_COLOR_REGION_RECOGNITIONS,
+                color_limit,
                 "color-region:eager",
             );
+            remaining_supplement_rec_budget =
+                remaining_supplement_rec_budget.saturating_sub(attempted);
             maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
@@ -552,22 +562,82 @@ impl OrtOcrEngine {
             color_region_count = candidate_count;
             trace.timing.color_region_ms = elapsed_ms(color_region_start);
 
-            let det_color_region_start = Instant::now();
-            let (det_color_region_count, det_pass_count, candidate) = self
-                .recognize_uncovered_color_region_detections(
-                    img,
-                    cfg,
-                    &regions,
-                    MAX_EAGER_COLOR_REGION_DET_PASSES,
-                    "color-region-det:eager",
-                );
-            trace.timing.color_region_ms = trace
-                .timing
-                .color_region_ms
-                .saturating_add(elapsed_ms(det_color_region_start));
-            color_region_count = color_region_count.max(det_color_region_count);
-            if det_pass_count > 0 {
-                trace.det_pass_count += det_pass_count;
+            if should_continue_eager_supplements(
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
+            ) && remaining_supplement_det_budget > 0
+            {
+                let det_color_region_start = Instant::now();
+                let det_limit =
+                    MAX_EAGER_COLOR_REGION_DET_PASSES.min(remaining_supplement_det_budget);
+                let (det_color_region_count, det_pass_count, candidate) = self
+                    .recognize_uncovered_color_region_detections(
+                        img,
+                        cfg,
+                        &regions,
+                        det_limit,
+                        "color-region-det:eager",
+                    );
+                trace.timing.color_region_ms = trace
+                    .timing
+                    .color_region_ms
+                    .saturating_add(elapsed_ms(det_color_region_start));
+                color_region_count = color_region_count.max(det_color_region_count);
+                if det_pass_count > 0 {
+                    trace.det_pass_count += det_pass_count;
+                    maybe_adopt_recognized_traced(
+                        &mut text,
+                        &mut confidence,
+                        &mut line_count,
+                        &mut region_count,
+                        &mut layout_applied,
+                        &mut regions,
+                        &mut fallback,
+                        &mut trace,
+                        "color-region-det:eager".to_string(),
+                        &candidate,
+                    );
+                    maybe_adopt_candidate_pool_traced(
+                        &mut text,
+                        &mut confidence,
+                        &mut line_count,
+                        &mut region_count,
+                        &mut layout_applied,
+                        &mut regions,
+                        &mut fallback,
+                        &mut candidate_pool,
+                        Some(img),
+                        &mut trace,
+                        "color-region-det:eager".to_string(),
+                        &candidate,
+                    );
+                }
+            }
+
+            if should_continue_eager_supplements(
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
+            ) && remaining_supplement_rec_budget > 0
+            {
+                let layered_region_start = Instant::now();
+                let layered_limit = MAX_EAGER_LAYERED_REGION_RECOGNITIONS
+                    .min(remaining_supplement_rec_budget);
+                let (layered_region_count, _attempted, layered_candidate) =
+                    self.recognize_layered_color_regions(
+                        img,
+                        cfg,
+                        &regions,
+                        layered_limit,
+                        "layered-region:eager",
+                    );
+                trace.timing.layered_region_ms = elapsed_ms(layered_region_start);
+                color_region_count = color_region_count.max(layered_region_count);
                 maybe_adopt_recognized_traced(
                     &mut text,
                     &mut confidence,
@@ -577,8 +647,8 @@ impl OrtOcrEngine {
                     &mut regions,
                     &mut fallback,
                     &mut trace,
-                    "color-region-det:eager".to_string(),
-                    &candidate,
+                    "layered-regions:eager".to_string(),
+                    &layered_candidate,
                 );
                 maybe_adopt_candidate_pool_traced(
                     &mut text,
@@ -591,50 +661,15 @@ impl OrtOcrEngine {
                     &mut candidate_pool,
                     Some(img),
                     &mut trace,
-                    "color-region-det:eager".to_string(),
-                    &candidate,
+                    "layered-regions:eager".to_string(),
+                    &layered_candidate,
                 );
             }
-
-            let layered_region_start = Instant::now();
-            let (layered_region_count, layered_candidate) = self.recognize_layered_color_regions(
-                img,
-                cfg,
-                &regions,
-                MAX_EAGER_LAYERED_REGION_RECOGNITIONS,
-                "layered-region:eager",
-            );
-            trace.timing.layered_region_ms = elapsed_ms(layered_region_start);
-            color_region_count = color_region_count.max(layered_region_count);
-            maybe_adopt_recognized_traced(
-                &mut text,
-                &mut confidence,
-                &mut line_count,
-                &mut region_count,
-                &mut layout_applied,
-                &mut regions,
-                &mut fallback,
-                &mut trace,
-                "layered-regions:eager".to_string(),
-                &layered_candidate,
-            );
-            maybe_adopt_candidate_pool_traced(
-                &mut text,
-                &mut confidence,
-                &mut line_count,
-                &mut region_count,
-                &mut layout_applied,
-                &mut regions,
-                &mut fallback,
-                &mut candidate_pool,
-                Some(img),
-                &mut trace,
-                "layered-regions:eager".to_string(),
-                &layered_candidate,
-            );
         }
 
-        if should_use_uncovered_visual_supplement(
+        if should_continue_eager_supplements(&text, confidence, det_box_count, line_count, &regions)
+            && remaining_supplement_rec_budget > 0
+            && should_use_uncovered_visual_supplement(
             img,
             cfg,
             &text,
@@ -643,11 +678,13 @@ impl OrtOcrEngine {
             &regions,
         ) {
             let visual_start = Instant::now();
-            let visual_candidate = self.recognize_uncovered_visual_regions(
+            let visual_limit =
+                MAX_EAGER_VISUAL_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
+            let (_attempted, visual_candidate) = self.recognize_uncovered_visual_regions(
                 img,
                 cfg,
                 &regions,
-                MAX_EAGER_VISUAL_REGION_RECOGNITIONS,
+                visual_limit,
                 "visual-region:eager",
             );
             trace.timing.visual_region_ms = elapsed_ms(visual_start);
@@ -1816,20 +1853,23 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
-    ) -> (usize, RecognizedText) {
+    ) -> (usize, usize, RecognizedText) {
         let raw_boxes = color_region_boxes(img);
         let boxes = prioritize_supplement_candidate_boxes(img, raw_boxes.clone(), existing_regions);
         let mut lines = Vec::new();
-        let mut recognized = 0usize;
+        let mut attempted = 0usize;
         for b in &boxes {
-            if recognized >= recognition_limit {
+            if attempted >= recognition_limit {
                 break;
             }
             if color_region_box_covered_by_reliable_text(*b, existing_regions) {
                 continue;
             }
+            if !supplement_box_is_worth_recognition(*b) {
+                continue;
+            }
             let crop = crop_box(img, *b);
-            recognized += 1;
+            attempted += 1;
             if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg) {
                 lines.extend(candidate_text_lines(
                     img,
@@ -1840,7 +1880,11 @@ impl OrtOcrEngine {
                 ));
             }
         }
-        (raw_boxes.len(), recognized_from_text_lines(&mut lines))
+        (
+            raw_boxes.len(),
+            attempted,
+            recognized_from_text_lines(&mut lines),
+        )
     }
 
     fn recognize_uncovered_color_region_detections(
@@ -1924,15 +1968,23 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
-    ) -> (usize, RecognizedText) {
+    ) -> (usize, usize, RecognizedText) {
         let boxes = layered_color_region_text_boxes(img, existing_regions);
         let candidate_count = boxes.len();
         let mut lines = Vec::new();
-        for b in boxes.iter().take(recognition_limit) {
+        let mut attempted = 0usize;
+        for b in &boxes {
+            if attempted >= recognition_limit {
+                break;
+            }
             if color_region_box_covered_by_reliable_text(*b, existing_regions) {
                 continue;
             }
+            if !supplement_box_is_worth_recognition(*b) {
+                continue;
+            }
             let crop = crop_box(img, *b);
+            attempted += 1;
             if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg) {
                 lines.extend(candidate_text_lines(
                     img,
@@ -1943,7 +1995,11 @@ impl OrtOcrEngine {
                 ));
             }
         }
-        (candidate_count, recognized_from_text_lines(&mut lines))
+        (
+            candidate_count,
+            attempted,
+            recognized_from_text_lines(&mut lines),
+        )
     }
 
     fn recognize_uncovered_visual_regions(
@@ -1953,16 +2009,24 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
-    ) -> RecognizedText {
+    ) -> (usize, RecognizedText) {
         let boxes = prioritize_supplement_candidate_boxes(
             img,
             uncovered_visual_text_boxes(img, existing_regions),
             existing_regions,
         );
         let mut lines = Vec::new();
-        for b in boxes.iter().take(recognition_limit) {
+        let mut attempted = 0usize;
+        for b in &boxes {
+            if attempted >= recognition_limit {
+                break;
+            }
+            if !supplement_box_is_worth_recognition(*b) {
+                continue;
+            }
             let crop = crop_box(img, *b);
             let candidate = self.best_from_crop_local_preprocessed(&crop, cfg);
+            attempted += 1;
             if let Some(candidate) = candidate {
                 lines.extend(candidate_text_lines(
                     img,
@@ -1973,7 +2037,7 @@ impl OrtOcrEngine {
                 ));
             }
         }
-        recognized_from_text_lines(&mut lines)
+        (attempted, recognized_from_text_lines(&mut lines))
     }
 
     fn recognize_line_crops(&self, img: &DynamicImage, cfg: &OcrConfig) -> RecognizedText {
@@ -2956,19 +3020,14 @@ fn reading_line_order(a: &TextLine, b: &TextLine) -> std::cmp::Ordering {
 }
 
 fn reading_region_order(a: &LayoutRegion, b: &LayoutRegion) -> std::cmp::Ordering {
-    let y_close = vertical_overlap(a.bbox, b.bbox) > 0
-        || a.bbox.1.abs_diff(b.bbox.1) <= (box_height(a.bbox).min(box_height(b.bbox)) / 3).max(24);
-    if y_close {
-        a.bbox
-            .0
-            .cmp(&b.bbox.0)
-            .then_with(|| a.bbox.1.cmp(&b.bbox.1))
-    } else {
-        a.bbox
-            .1
-            .cmp(&b.bbox.1)
-            .then_with(|| a.bbox.0.cmp(&b.bbox.0))
-    }
+    reading_region_key(a).cmp(&reading_region_key(b))
+}
+
+fn reading_region_key(region: &LayoutRegion) -> (u32, u32, u32, u32, u32) {
+    let bbox = region.bbox;
+    let center_y = ((bbox.1 as u64 + bbox.3 as u64) / 2) as u32;
+    let row_bucket = center_y / 32;
+    (row_bucket, bbox.0, bbox.1, bbox.2, bbox.3)
 }
 
 fn union_box(a: BoxRect, b: BoxRect) -> BoxRect {
@@ -4851,6 +4910,9 @@ fn prioritize_supplement_candidate_boxes(
 }
 
 fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option<i64> {
+    if !supplement_box_is_worth_recognition(b) {
+        return None;
+    }
     let crop = crop_box(image, b);
     let rgb = to_rgb_on_white(&crop);
     let (w, h) = rgb.dimensions();
@@ -4868,7 +4930,11 @@ fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option
 
     let text_w = max_x.saturating_sub(min_x).saturating_add(1);
     let text_h = max_y.saturating_sub(min_y).saturating_add(1);
-    if text_w < 4 || text_h < 2 {
+    if text_w < 8 || text_h < 4 {
+        return None;
+    }
+    let approx_slots = text_w as f32 / text_h.max(1) as f32;
+    if area < 1_600 && (text_w < 24 || approx_slots < 1.6) {
         return None;
     }
     let glyph_score = foreground_glyph_textness_score(&mask, w as usize, h as usize)?;
@@ -5429,6 +5495,51 @@ fn should_use_eager_color_region_supplement(
         return true;
     }
     regions_have_repairable_lines(regions)
+}
+
+fn should_continue_eager_supplements(
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    if confidence > 0.0 && confidence < 0.60 {
+        return true;
+    }
+    if det_box_count >= 6 && line_count * 3 <= det_box_count * 2 {
+        return true;
+    }
+    if recognized_char_count(text) < 10 && det_box_count >= 3 {
+        return true;
+    }
+    regions_have_repairable_lines(regions)
+}
+
+fn supplement_box_is_worth_recognition(b: BoxRect) -> bool {
+    let w = box_width(b);
+    let h = box_height(b).max(1);
+    let area = box_area(b);
+    if area >= 6_000 && w >= 120 && h >= 28 {
+        return true;
+    }
+    if area < 700 && (w < 56 || h < 16) {
+        return false;
+    }
+    if w < 28 || h < 8 {
+        return false;
+    }
+    let aspect = w as f32 / h as f32;
+    if aspect < 1.2 && area < 2_400 {
+        return false;
+    }
+    if h > 96 && w < h.saturating_mul(2) {
+        return false;
+    }
+    true
 }
 
 fn regions_have_repairable_lines(regions: &[OcrTextRegion]) -> bool {
@@ -9569,6 +9680,34 @@ mod tests {
             0,
             &[]
         ));
+    }
+
+    #[test]
+    fn reading_region_order_is_total_for_staggered_layouts() {
+        let a = LayoutRegion {
+            bbox: (340, 48, 520, 96),
+            lines: Vec::new(),
+        };
+        let b = LayoutRegion {
+            bbox: (24, 72, 260, 124),
+            lines: Vec::new(),
+        };
+        let c = LayoutRegion {
+            bbox: (320, 128, 560, 188),
+            lines: Vec::new(),
+        };
+
+        let mut regions = vec![c.clone(), a.clone(), b.clone()];
+        regions.sort_by(reading_region_order);
+
+        let keys = regions
+            .iter()
+            .map(reading_region_key)
+            .collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(reading_region_order(&a, &a), std::cmp::Ordering::Equal);
+        assert_eq!(reading_region_order(&b, &b), std::cmp::Ordering::Equal);
+        assert_eq!(reading_region_order(&c, &c), std::cmp::Ordering::Equal);
     }
 
     #[test]
