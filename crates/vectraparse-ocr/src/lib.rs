@@ -23,6 +23,7 @@ const MAX_PAGE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_PAGE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
+const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 4;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
@@ -763,6 +764,18 @@ impl OrtOcrEngine {
             }
         }
 
+        if let Some(wide_lines) = self.repair_wide_line_segments(
+            img,
+            cfg,
+            b,
+            direct,
+            source,
+            transform,
+            line_repair_rec_budget,
+        ) {
+            return Some(wide_lines);
+        }
+
         if let Some(binary) = binarize_color_region_foreground(img, b)
             && let Ok(candidate) = self.recognize_best(&binary, cfg)
             && is_usable_recognition(&candidate)
@@ -774,6 +787,62 @@ impl OrtOcrEngine {
         }
 
         None
+    }
+
+    fn repair_wide_line_segments(
+        &self,
+        img: &DynamicImage,
+        cfg: &OcrConfig,
+        b: BoxRect,
+        direct: Option<&RecCandidate>,
+        source: &str,
+        transform: BboxTransform,
+        line_repair_rec_budget: &mut usize,
+    ) -> Option<Vec<TextLine>> {
+        if *line_repair_rec_budget < 2 {
+            return None;
+        }
+        let segment_limit = (*line_repair_rec_budget).min(MAX_WIDE_LINE_SEGMENTS_PER_LINE);
+        let segment_boxes = wide_line_segment_boxes(img, b, segment_limit);
+        if segment_boxes.len() < 2 {
+            return None;
+        }
+
+        let mut segment_candidates = Vec::new();
+        for segment_box in &segment_boxes {
+            let crop = crop_box(img, *segment_box);
+            let candidate = self.best_from_crop_direct(&crop, cfg).or_else(|| {
+                let binary = binarize_color_region_foreground(img, *segment_box)?;
+                self.recognize_best(&binary, cfg)
+                    .ok()
+                    .filter(is_usable_recognition)
+            });
+            if let Some(candidate) = candidate {
+                segment_candidates.push(candidate);
+            }
+        }
+        if segment_candidates.len() != segment_boxes.len() {
+            return None;
+        }
+
+        let combined_text = join_segment_recognition_text(&segment_candidates);
+        let confidence = segment_candidates
+            .iter()
+            .map(|candidate| candidate.confidence)
+            .sum::<f32>()
+            / segment_candidates.len() as f32;
+        let candidate = RecCandidate {
+            text: combined_text,
+            confidence,
+            variant: segment_candidates[0].variant,
+        };
+        if !is_usable_recognition(&candidate) || !repair_candidate_is_better(direct, &candidate) {
+            return None;
+        }
+
+        *line_repair_rec_budget = (*line_repair_rec_budget).saturating_sub(segment_boxes.len());
+        let source = format!("{source}:wide");
+        Some(candidate_text_lines(img, b, &candidate, &source, transform))
     }
 
     fn recognize_split_line_boxes(
@@ -2896,6 +2965,32 @@ fn repair_candidate_is_better(current: Option<&RecCandidate>, candidate: &RecCan
             && candidate.confidence + 0.12 >= current.confidence)
 }
 
+fn join_segment_recognition_text(segments: &[RecCandidate]) -> String {
+    let mut out = String::new();
+    for segment in segments {
+        let text = normalize_recognized_text(&segment.text);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if should_insert_segment_space(&out, text) {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    out
+}
+
+fn should_insert_segment_space(left: &str, right: &str) -> bool {
+    let Some(left_ch) = left.chars().rev().find(|ch| !ch.is_whitespace()) else {
+        return false;
+    };
+    let Some(right_ch) = right.chars().find(|ch| !ch.is_whitespace()) else {
+        return false;
+    };
+    left_ch.is_ascii_alphanumeric() && right_ch.is_ascii_alphanumeric()
+}
+
 fn recognition_text_quality(text: &str, confidence: f32) -> f32 {
     let chars = recognized_char_count(text) as f32;
     confidence * 100.0 + readable_ratio(text) * 14.0 + chars.min(32.0) * 0.25
@@ -4612,6 +4707,159 @@ fn split_line_box_horizontally(image: &DynamicImage, bbox: BoxRect) -> Vec<BoxRe
         .collect()
 }
 
+fn wide_line_segment_boxes(
+    image: &DynamicImage,
+    bbox: BoxRect,
+    max_segments: usize,
+) -> Vec<BoxRect> {
+    if max_segments < 2 {
+        return Vec::new();
+    }
+    let bbox_w = box_width(bbox);
+    let bbox_h = box_height(bbox).max(1);
+    let aspect = bbox_w as f32 / bbox_h as f32;
+    if bbox_w < 560 && aspect < 14.0 {
+        return Vec::new();
+    }
+
+    let crop = crop_box(image, bbox);
+    let rgb = to_rgb_on_white(&crop);
+    let (w_u32, h_u32) = rgb.dimensions();
+    let w = w_u32 as usize;
+    let h = h_u32 as usize;
+    let Some(mask) = foreground_mask_from_rgb(&rgb).or_else(|| dark_luma_mask_from_rgb(&rgb))
+    else {
+        return Vec::new();
+    };
+    let Some((min_x, min_y, max_x, max_y, foreground_count)) =
+        foreground_bounds_from_mask(&mask, w, h)
+    else {
+        return Vec::new();
+    };
+    let text_w = max_x.saturating_sub(min_x).saturating_add(1);
+    let text_h = max_y.saturating_sub(min_y).saturating_add(1);
+    if foreground_count < 12 || text_w < 420 || text_h < 6 {
+        return Vec::new();
+    }
+
+    let max_segment_w = (text_h.saturating_mul(12)).clamp(180, 360);
+    let segment_count = text_w.div_ceil(max_segment_w).clamp(2, max_segments);
+    if segment_count < 2 {
+        return Vec::new();
+    }
+
+    let mut col_score = vec![0usize; w];
+    for x in min_x..=max_x {
+        let mut count = 0usize;
+        for y in min_y..=max_y {
+            if mask[y * w + x] {
+                count += 1;
+            }
+        }
+        col_score[x] = count;
+    }
+
+    let low_score = (text_h / 10).max(1);
+    let search_radius = text_h.clamp(6, 28);
+    let mut cuts = Vec::with_capacity(segment_count + 1);
+    cuts.push(min_x);
+    for idx in 1..segment_count {
+        let target = min_x.saturating_add((text_w.saturating_mul(idx)) / segment_count);
+        let left = target
+            .saturating_sub(search_radius)
+            .max(min_x.saturating_add(8));
+        let right = target
+            .saturating_add(search_radius)
+            .min(max_x.saturating_sub(8));
+        if right <= left {
+            return Vec::new();
+        }
+        let mut best_x = target;
+        let mut best_score = usize::MAX;
+        for x in left..=right {
+            let score = col_score[x];
+            if score < best_score {
+                best_score = score;
+                best_x = x;
+            }
+        }
+        if best_score > low_score {
+            return Vec::new();
+        }
+        if cuts
+            .last()
+            .copied()
+            .is_some_and(|last| best_x.saturating_sub(last) < text_h.saturating_mul(3).max(24))
+        {
+            return Vec::new();
+        }
+        cuts.push(best_x);
+    }
+    cuts.push(max_x.saturating_add(1));
+
+    if cuts
+        .windows(2)
+        .any(|pair| pair[1].saturating_sub(pair[0]) < text_h.saturating_mul(3).max(24))
+    {
+        return Vec::new();
+    }
+
+    let (img_w, img_h) = image.dimensions();
+    let x_pad = (text_h / 3).clamp(2, 8);
+    let y_pad = (text_h / 4).clamp(1, 5);
+    cuts.windows(2)
+        .map(|pair| {
+            clamp_box(
+                (
+                    bbox.0.saturating_add(pair[0].saturating_sub(x_pad) as u32),
+                    bbox.1.saturating_add(min_y.saturating_sub(y_pad) as u32),
+                    bbox.0
+                        .saturating_add(pair[1].saturating_add(x_pad).min(w) as u32),
+                    bbox.1.saturating_add(
+                        max_y
+                            .saturating_add(1)
+                            .saturating_add(y_pad)
+                            .min(h) as u32,
+                    ),
+                ),
+                img_w,
+                img_h,
+            )
+        })
+        .collect()
+}
+
+fn foreground_bounds_from_mask(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+) -> Option<(usize, usize, usize, usize, usize)> {
+    if w == 0 || h == 0 || mask.len() != w.saturating_mul(h) {
+        return None;
+    }
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut count = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y * w + x] {
+                continue;
+            }
+            count += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if count == 0 || max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    Some((min_x, min_y, max_x, max_y, count))
+}
+
 fn foreground_line_boxes(image: &DynamicImage, max_boxes: usize) -> Vec<BoxRect> {
     let rgb = to_rgb_on_white(image);
     let (w, h) = rgb.dimensions();
@@ -6162,6 +6410,48 @@ mod tests {
     }
 
     #[test]
+    fn wide_line_segment_boxes_split_long_line_at_narrow_gaps() {
+        let mut rgb = image::RgbImage::from_pixel(660, 48, image::Rgb([255, 255, 255]));
+        draw_segment_texture(&mut rgb, 20, 210);
+        draw_segment_texture(&mut rgb, 235, 425);
+        draw_segment_texture(&mut rgb, 450, 640);
+
+        let boxes = wide_line_segment_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 660, 48), 4);
+
+        assert_eq!(boxes.len(), 3);
+        assert!(boxes.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[test]
+    fn wide_line_segment_boxes_avoid_hard_cut_without_gap() {
+        let mut rgb = image::RgbImage::from_pixel(660, 48, image::Rgb([255, 255, 255]));
+        for y in 14..32 {
+            for x in 20..640 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = wide_line_segment_boxes(&DynamicImage::ImageRgb8(rgb), (0, 0, 660, 48), 4);
+
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn join_segment_recognition_text_spaces_ascii_only() {
+        let ascii = vec![
+            rec_candidate("Alpha", 0.80, RecVariant::Primary),
+            rec_candidate("Beta", 0.82, RecVariant::Primary),
+        ];
+        let cjk = vec![
+            rec_candidate("甲方", 0.80, RecVariant::Primary),
+            rec_candidate("乙方", 0.82, RecVariant::Primary),
+        ];
+
+        assert_eq!(join_segment_recognition_text(&ascii), "Alpha Beta");
+        assert_eq!(join_segment_recognition_text(&cjk), "甲方乙方");
+    }
+
+    #[test]
     fn split_text_box_into_color_region_boxes_splits_adjacent_panels() {
         let mut rgb = image::RgbImage::from_pixel(180, 48, image::Rgb([245, 247, 250]));
         for y in 6..42 {
@@ -6233,6 +6523,14 @@ mod tests {
         }
     }
 
+    fn rec_candidate(text: &str, confidence: f32, variant: RecVariant) -> RecCandidate {
+        RecCandidate {
+            text: text.to_string(),
+            confidence,
+            variant,
+        }
+    }
+
     fn detection_box(bbox: BoxRect) -> DetectionBox {
         DetectionBox {
             bbox,
@@ -6263,6 +6561,19 @@ mod tests {
                 }
                 x += 28;
             }
+        }
+    }
+
+    fn draw_segment_texture(rgb: &mut image::RgbImage, x0: u32, x1: u32) {
+        let dark = image::Rgb([20, 20, 20]);
+        let mut x = x0;
+        while x + 10 < x1 {
+            for y in 14..32 {
+                for xx in x..(x + 12).min(x1).min(rgb.width()) {
+                    rgb.put_pixel(xx, y, dark);
+                }
+            }
+            x += 18;
         }
     }
 }
