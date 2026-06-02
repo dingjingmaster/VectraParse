@@ -1195,7 +1195,8 @@ impl OrtOcrEngine {
         recognition_limit: usize,
         source: &str,
     ) -> (usize, RecognizedText) {
-        let boxes = color_region_boxes(img);
+        let raw_boxes = color_region_boxes(img);
+        let boxes = prioritize_supplement_candidate_boxes(img, raw_boxes.clone(), &[]);
         let mut lines = Vec::new();
         for b in boxes.iter().take(recognition_limit) {
             let Some(binary) = binarize_color_region_foreground(img, *b) else {
@@ -1212,7 +1213,7 @@ impl OrtOcrEngine {
                 });
             }
         }
-        (boxes.len(), recognized_from_text_lines(&mut lines))
+        (raw_boxes.len(), recognized_from_text_lines(&mut lines))
     }
 
     fn recognize_uncovered_color_regions(
@@ -1223,7 +1224,8 @@ impl OrtOcrEngine {
         recognition_limit: usize,
         source: &str,
     ) -> (usize, RecognizedText) {
-        let boxes = color_region_boxes(img);
+        let raw_boxes = color_region_boxes(img);
+        let boxes = prioritize_supplement_candidate_boxes(img, raw_boxes.clone(), existing_regions);
         let mut lines = Vec::new();
         let mut recognized = 0usize;
         for b in &boxes {
@@ -1249,7 +1251,7 @@ impl OrtOcrEngine {
                 ));
             }
         }
-        (boxes.len(), recognized_from_text_lines(&mut lines))
+        (raw_boxes.len(), recognized_from_text_lines(&mut lines))
     }
 
     fn recognize_uncovered_color_region_detections(
@@ -1306,7 +1308,11 @@ impl OrtOcrEngine {
         recognition_limit: usize,
         source: &str,
     ) -> RecognizedText {
-        let boxes = uncovered_visual_text_boxes(img, existing_regions);
+        let boxes = prioritize_supplement_candidate_boxes(
+            img,
+            uncovered_visual_text_boxes(img, existing_regions),
+            existing_regions,
+        );
         let mut lines = Vec::new();
         for b in boxes.iter().take(recognition_limit) {
             let candidate = binarize_color_region_foreground(img, *b)
@@ -2801,21 +2807,82 @@ fn box_intersection_area(a: BoxRect, b: BoxRect) -> u64 {
 }
 
 fn dedupe_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
-    let mut kept: Vec<TextLine> = Vec::new();
+    let mut clusters: Vec<Vec<TextLine>> = Vec::new();
     'candidate: for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
-        for kept_line in &mut kept {
-            if !text_lines_are_near_duplicates(kept_line, line) {
-                continue;
+        for cluster in &mut clusters {
+            if cluster
+                .iter()
+                .any(|cluster_line| text_lines_are_near_duplicates(cluster_line, line))
+            {
+                cluster.push(line.clone());
+                continue 'candidate;
             }
-            if text_line_quality(line) > text_line_quality(kept_line) {
-                *kept_line = line.clone();
-            }
-            continue 'candidate;
         }
-        kept.push(line.clone());
+        clusters.push(vec![line.clone()]);
     }
+
+    let mut kept = clusters
+        .iter()
+        .filter_map(|cluster| select_voted_text_line(cluster))
+        .collect::<Vec<_>>();
     kept.sort_by(reading_line_order);
     kept
+}
+
+fn select_voted_text_line(cluster: &[TextLine]) -> Option<TextLine> {
+    if cluster.is_empty() {
+        return None;
+    }
+    let mut best_idx = 0usize;
+    let mut best_score = voted_text_line_quality(&cluster[best_idx], cluster);
+    for (idx, line) in cluster.iter().enumerate().skip(1) {
+        let score = voted_text_line_quality(line, cluster);
+        if score > best_score + 0.01
+            || ((score - best_score).abs() <= 0.01
+                && text_line_quality(line) > text_line_quality(&cluster[best_idx]))
+        {
+            best_idx = idx;
+            best_score = score;
+        }
+    }
+    Some(cluster[best_idx].clone())
+}
+
+fn voted_text_line_quality(line: &TextLine, cluster: &[TextLine]) -> f32 {
+    let key = normalize_ocr_line(&line.text);
+    if key.is_empty() {
+        return text_line_quality(line);
+    }
+
+    let mut exact_support = 0usize;
+    let mut near_support = 0usize;
+    let mut source_families: Vec<&str> = vec![source_family(&line.source)];
+    for other in cluster {
+        if std::ptr::eq(other, line) {
+            continue;
+        }
+        let similarity = normalized_text_similarity(&line.text, &other.text);
+        if normalize_ocr_line(&other.text) == key {
+            exact_support += 1;
+        } else if similarity >= 0.90 {
+            near_support += 1;
+        }
+        if similarity >= 0.82 {
+            let family = source_family(&other.source);
+            if !source_families.contains(&family) {
+                source_families.push(family);
+            }
+        }
+    }
+
+    text_line_quality(line)
+        + exact_support as f32 * 24.0
+        + near_support as f32 * 3.0
+        + source_families.len().saturating_sub(1) as f32 * 4.0
+}
+
+fn source_family(source: &str) -> &str {
+    source.split(':').next().unwrap_or(source)
 }
 
 fn text_lines_are_near_duplicates(a: &TextLine, b: &TextLine) -> bool {
@@ -3245,6 +3312,54 @@ fn recognition_text_quality(text: &str, confidence: f32) -> f32 {
         - dominant_char_ratio(text) * 5.0
 }
 
+fn prioritize_supplement_candidate_boxes(
+    image: &DynamicImage,
+    boxes: Vec<BoxRect>,
+    existing_regions: &[OcrTextRegion],
+) -> Vec<BoxRect> {
+    let mut scored = boxes
+        .into_iter()
+        .filter(|b| !color_region_box_covered_by_reliable_text(*b, existing_regions))
+        .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    scored.into_iter().map(|(b, _)| b).collect()
+}
+
+fn supplemental_text_candidate_score(image: &DynamicImage, b: BoxRect) -> Option<i64> {
+    let crop = crop_box(image, b);
+    let rgb = to_rgb_on_white(&crop);
+    let (w, h) = rgb.dimensions();
+    let mask = text_foreground_mask_from_rgb(&rgb)?;
+    let Some((min_x, min_y, max_x, max_y, foreground_count)) =
+        foreground_bounds_from_mask(&mask, w as usize, h as usize)
+    else {
+        return None;
+    };
+    let area = box_area(b).max(1);
+    let foreground_ratio = foreground_count as f32 / area as f32;
+    if !(0.001..=0.55).contains(&foreground_ratio) {
+        return None;
+    }
+
+    let text_w = max_x.saturating_sub(min_x).saturating_add(1);
+    let text_h = max_y.saturating_sub(min_y).saturating_add(1);
+    if text_w < 4 || text_h < 2 {
+        return None;
+    }
+
+    let density_score = (foreground_ratio * 12_000.0).round() as i64;
+    let foreground_score = (foreground_count.min(4000) / 4) as i64;
+    let extent_score = (text_w + text_h).min(1200) as i64 / 2;
+    let split_bonus = if large_text_box_needs_structured_split(b) {
+        24
+    } else {
+        0
+    };
+    let area_penalty = (area / 12_000) as i64;
+    Some(density_score + foreground_score + extent_score + split_bonus - area_penalty)
+}
+
 fn color_region_det_candidate_boxes(
     image: &DynamicImage,
     existing_regions: &[OcrTextRegion],
@@ -3260,24 +3375,12 @@ fn color_region_det_candidate_boxes(
         .into_iter()
         .filter(|b| box_width(*b) >= 48 && box_height(*b) >= 16)
         .filter(|b| !color_region_det_box_covered_by_reliable_text(*b, existing_regions))
-        .filter_map(|b| {
-            let score = color_region_det_candidate_score(image, b);
-            if score >= 4 { Some((b, score)) } else { None }
-        })
+        .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
     scored.truncate(max_boxes);
     scored.sort_by(|a, b| reading_box_order(&a.0, &b.0));
     (total, scored.into_iter().map(|(b, _)| b).collect())
-}
-
-fn color_region_det_candidate_score(image: &DynamicImage, b: BoxRect) -> usize {
-    let crop = crop_box(image, b);
-    let rgb = to_rgb_on_white(&crop);
-    let Some(mask) = text_foreground_mask_from_rgb(&rgb) else {
-        return 0;
-    };
-    mask.into_iter().filter(|active| *active).count()
 }
 
 fn color_region_det_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
@@ -3487,7 +3590,8 @@ impl OrtOcrEngine {
         }
 
         let scaled = nms_boxes(scaled, 0.35);
-        let mut merged = merge_nearby_detection_boxes(scaled.clone());
+        let source_rgb = to_rgb_on_white(img);
+        let mut merged = merge_nearby_detection_boxes(&source_rgb, scaled.clone());
 
         merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
         merged.sort_by(reading_box_order);
@@ -3506,7 +3610,7 @@ impl OrtOcrEngine {
     }
 }
 
-fn merge_nearby_detection_boxes(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
+fn merge_nearby_detection_boxes(rgb: &image::RgbImage, mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
     boxes.sort_by(reading_box_order);
     let mut merged: Vec<BoxRect> = Vec::new();
     for b in boxes {
@@ -3515,7 +3619,11 @@ fn merge_nearby_detection_boxes(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
             let x_gap = if b.0 > last.2 { b.0 - last.2 } else { 0 };
             let line_h = (last.3 - last.1).min(b.3 - b.1);
             let new_w = last.2.max(b.2) - last.0.min(b.0);
-            if y_overlap && x_gap <= (line_h * 3).max(20) && new_w <= 1200 {
+            if y_overlap
+                && x_gap <= (line_h * 3).max(20)
+                && new_w <= 1200
+                && !boxes_have_merge_separator(rgb, *last, b)
+            {
                 last.0 = last.0.min(b.0);
                 last.1 = last.1.min(b.1);
                 last.2 = last.2.max(b.2);
@@ -3526,6 +3634,73 @@ fn merge_nearby_detection_boxes(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
         merged.push(b);
     }
     merged
+}
+
+fn boxes_have_merge_separator(rgb: &image::RgbImage, left: BoxRect, right: BoxRect) -> bool {
+    if right.0 <= left.2 || left.3 <= right.1 || right.3 <= left.1 {
+        return false;
+    }
+    let gap = right.0 - left.2;
+    let line_h = box_height(left).min(box_height(right)).max(1);
+    if gap < line_h.max(18) {
+        return false;
+    }
+
+    let (w, h) = rgb.dimensions();
+    let y0 = left.1.max(right.1).saturating_sub((line_h / 4).max(2));
+    let y1 = left
+        .3
+        .min(right.3)
+        .saturating_add((line_h / 4).max(2))
+        .min(h);
+    let gap_box = clamp_box((left.2.min(w), y0, right.0.min(w), y1), w, h);
+    if box_width(gap_box) < gap || box_height(gap_box) < 4 {
+        return false;
+    }
+
+    gap_region_is_low_texture(rgb, gap_box) || gap_region_has_vertical_separator(rgb, gap_box)
+}
+
+fn gap_region_is_low_texture(rgb: &image::RgbImage, b: BoxRect) -> bool {
+    let area = box_area(b).max(1);
+    let mut edge_count = 0u64;
+    for y in b.1.saturating_add(1)..b.3.saturating_sub(1) {
+        for x in b.0.saturating_add(1)..b.2.saturating_sub(1) {
+            let left = rgb.get_pixel(x - 1, y);
+            let right = rgb.get_pixel(x + 1, y);
+            let up = rgb.get_pixel(x, y - 1);
+            let down = rgb.get_pixel(x, y + 1);
+            if luma_abs_diff(left, right) >= 14
+                || luma_abs_diff(up, down) >= 14
+                || color_distance_u8(left, [right[0], right[1], right[2]]) >= 22
+                || color_distance_u8(up, [down[0], down[1], down[2]]) >= 22
+            {
+                edge_count += 1;
+            }
+        }
+    }
+    edge_count.saturating_mul(100) <= area.saturating_mul(2)
+}
+
+fn gap_region_has_vertical_separator(rgb: &image::RgbImage, b: BoxRect) -> bool {
+    if box_width(b) < 3 || box_height(b) < 8 {
+        return false;
+    }
+    let mut best_col = 0u32;
+    for x in b.0.saturating_add(1)..b.2.saturating_sub(1) {
+        let mut col_edges = 0u32;
+        for y in b.1..b.3 {
+            let left = rgb.get_pixel(x - 1, y);
+            let right = rgb.get_pixel(x + 1, y);
+            if luma_abs_diff(left, right) >= 22
+                || color_distance_u8(left, [right[0], right[1], right[2]]) >= 30
+            {
+                col_edges += 1;
+            }
+        }
+        best_col = best_col.max(col_edges);
+    }
+    best_col.saturating_mul(100) >= box_height(b).saturating_mul(55)
 }
 
 fn raw_split_detection_candidates(merged: BoxRect, raw: &[BoxRect]) -> Vec<BoxRect> {
@@ -5899,15 +6074,26 @@ mod tests {
 
     #[test]
     fn raw_split_detection_candidates_keep_merged_and_parts() {
-        let raw = vec![(0, 0, 40, 12), (70, 0, 120, 12)];
-        let boxes = merge_nearby_detection_boxes(raw.clone());
-        assert_eq!(boxes, vec![(0, 0, 120, 12)]);
+        let rgb = image::RgbImage::from_pixel(128, 24, image::Rgb([255, 255, 255]));
+        let raw = vec![(0, 0, 40, 12), (54, 0, 104, 12)];
+        let boxes = merge_nearby_detection_boxes(&rgb, raw.clone());
+        assert_eq!(boxes, vec![(0, 0, 104, 12)]);
 
         let alternatives = raw_split_detection_candidates(boxes[0], &raw);
 
         assert_eq!(alternatives.len(), 2);
         assert!(alternatives.contains(&(0, 0, 40, 12)));
-        assert!(alternatives.contains(&(70, 0, 120, 12)));
+        assert!(alternatives.contains(&(54, 0, 104, 12)));
+    }
+
+    #[test]
+    fn merge_nearby_detection_boxes_respects_visual_gutter() {
+        let rgb = image::RgbImage::from_pixel(140, 32, image::Rgb([245, 245, 245]));
+        let raw = vec![(0, 8, 42, 22), (74, 8, 120, 22)];
+
+        let boxes = merge_nearby_detection_boxes(&rgb, raw);
+
+        assert_eq!(boxes, vec![(0, 8, 42, 22), (74, 8, 120, 22)]);
     }
 
     #[test]
@@ -6559,6 +6745,23 @@ mod tests {
     }
 
     #[test]
+    fn recognized_from_text_lines_votes_across_near_duplicate_sources() {
+        let mut lines = vec![
+            text_line((10, 10, 190, 26), "Project status: reedy", 0.74),
+            text_line((11, 10, 191, 26), "Project status: ready", 0.62),
+            text_line((12, 11, 192, 27), "Project status: ready", 0.61),
+        ];
+        lines[1].source = "tile-region:1".to_string();
+        lines[2].source = "color-region-det:eager:1".to_string();
+
+        let recognized = recognized_from_text_lines(&mut lines);
+
+        assert_eq!(recognized.line_count, 1);
+        assert!(recognized.text.contains("Project status: ready"));
+        assert!(!recognized.text.contains("Project status: reedy"));
+    }
+
+    #[test]
     fn recognized_from_text_lines_dedupes_nearby_long_text_variants() {
         let mut lines = vec![
             text_line((320, 10, 540, 26), "Project Alpha Release 2024", 0.70),
@@ -6688,6 +6891,30 @@ mod tests {
             (12, 12, 98, 30),
             &weak
         ));
+    }
+
+    #[test]
+    fn supplement_candidate_priority_prefers_dense_text_like_box() {
+        let mut rgb = image::RgbImage::from_pixel(240, 120, image::Rgb([250, 250, 250]));
+        for y in 20..24 {
+            for x in 10..210 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        for y in 64..79 {
+            for x in 20..120 {
+                rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let boxes = prioritize_supplement_candidate_boxes(
+            &DynamicImage::ImageRgb8(rgb),
+            vec![(0, 10, 230, 50), (0, 55, 140, 90)],
+            &[],
+        );
+
+        assert_eq!(boxes[0], (0, 55, 140, 90));
+        assert_eq!(boxes[1], (0, 10, 230, 50));
     }
 
     #[test]
