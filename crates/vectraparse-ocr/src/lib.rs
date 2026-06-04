@@ -63,6 +63,8 @@ const MAX_REC_PREPARED_IMAGE_CACHE_ENTRIES: usize = 192;
 const MAX_RGB_IMAGE_CACHE_ENTRIES: usize = 256;
 const MAX_LUMA_IMAGE_CACHE_ENTRIES: usize = 256;
 const BOX_DEDUPE_BUCKET_SIZE: u32 = 64;
+const LOCAL_RECOGNITION_TINY_CROP_AREA: u64 = 3_000;
+const LOCAL_RECOGNITION_SMALL_CROP_AREA: u64 = 10_000;
 const MAX_FAST_TEXT_CHARS: usize = 10;
 const STABLE_TEXT_CONFIDENCE: f32 = 0.90;
 const STABLE_TEXT_AVG_MARGIN: f32 = 0.10;
@@ -9272,44 +9274,35 @@ fn enhancement_variants_limited(
     image: &DynamicImage,
     variant_budget: usize,
 ) -> Vec<(String, DynamicImage)> {
+    let has_alpha = has_non_opaque_alpha(image);
+    let full_capacity = if has_alpha { 30 } else { 18 };
+    let variant_budget = variant_budget.min(full_capacity);
     if variant_budget == 0 {
         return Vec::new();
     }
 
-    let has_alpha = has_non_opaque_alpha(image);
-    let gray = to_luma_on_white(image);
-    let signal = luma_signal(&gray);
-    let roi = enhancement_roi_from_gray(&gray, &signal, has_alpha);
-    let full_capacity = if has_alpha { 30 } else { 18 };
-    if variant_budget >= full_capacity {
-        let mut variants = vec![
+    let mut out = Vec::with_capacity(variant_budget);
+    let bases = if variant_budget >= full_capacity {
+        let mut bases = vec![
             EnhancementBaseVariant::Luma,
             EnhancementBaseVariant::Hsl,
             EnhancementBaseVariant::Max,
         ];
         if has_alpha {
-            variants.extend([
+            bases.extend([
                 EnhancementBaseVariant::AlphaBlackLuma,
                 EnhancementBaseVariant::AlphaBlackHsl,
                 EnhancementBaseVariant::AlphaBlackMax,
             ]);
         }
+        bases
+    } else {
+        ranked_enhancement_bases(image, variant_budget)
+    };
 
-        return variants
-            .into_iter()
-            .flat_map(|base| {
-                let gray = enhancement_variant_base_image(image, base);
-                let prefix = enhancement_variant_prefix(base);
-                let mut out = Vec::with_capacity(5);
-                push_enhancement_variants_limited(&mut out, prefix, &gray, full_capacity, &roi);
-                out
-            })
-            .take(full_capacity)
-            .collect();
-    }
-
-    let mut out = Vec::with_capacity(variant_budget.min(18));
-    let bases = ranked_enhancement_bases(image, variant_budget);
+    let gray = to_luma_on_white(image);
+    let signal = luma_signal(&gray);
+    let roi = enhancement_roi_from_gray(&gray, &signal, has_alpha);
     for base in bases {
         if out.len() >= variant_budget {
             break;
@@ -9598,7 +9591,7 @@ fn local_recognition_variants_adaptive(
     image: &DynamicImage,
     direct: Option<&RecCandidate>,
 ) -> Vec<(String, DynamicImage)> {
-    let mut variant_budget = local_recognition_variant_budget(direct);
+    let mut variant_budget = local_recognition_variant_budget(image, direct);
     if let Some(candidate) = direct
         && candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
         && candidate.avg_margin >= 0.04
@@ -9609,23 +9602,53 @@ fn local_recognition_variants_adaptive(
     local_recognition_variants_limited(image, variant_budget)
 }
 
-fn local_recognition_variant_budget(direct: Option<&RecCandidate>) -> usize {
+fn local_recognition_variant_budget(image: &DynamicImage, direct: Option<&RecCandidate>) -> usize {
+    let (w, h) = image.dimensions();
+    let area = (w as u64).saturating_mul(h as u64);
+
     if let Some(candidate) = direct {
         let text = normalize_recognized_text(&candidate.text);
         let text_len = text.chars().count();
+
         if is_stable_short_text_candidate(candidate, &text, MAX_FAST_TEXT_CHARS) {
             return 1;
         }
-        if candidate.confidence >= MIN_STRONG_REC_CONFIDENCE && candidate.avg_margin >= 0.05 {
-            return if text_len >= 12 { 3 } else { 4 };
+
+        let mut budget = if candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
+            && candidate.avg_margin >= 0.05
+        {
+            if text_len >= 12 { 3 } else { 4 }
+        } else if candidate.confidence >= 0.78 || (candidate.avg_margin >= 0.10 && text_len >= 8) {
+            4
+        } else if candidate.confidence < 0.45 && text_len < 6 {
+            8
+        } else {
+            7
+        };
+
+        if area <= LOCAL_RECOGNITION_TINY_CROP_AREA {
+            if text_len <= 4 {
+                return 1;
+            }
+            budget = budget.min(2);
         }
-        if candidate.confidence >= 0.78 || (candidate.avg_margin >= 0.10 && text_len >= 8) {
-            return 4;
+        if area <= LOCAL_RECOGNITION_SMALL_CROP_AREA && text_len <= 4 {
+            return 1;
         }
-        if candidate.confidence < 0.45 && text_len < 6 {
-            return 8;
+        if area <= LOCAL_RECOGNITION_SMALL_CROP_AREA && text_len <= 6 {
+            budget = budget.min(2);
         }
+
+        return budget;
     }
+
+    if area <= LOCAL_RECOGNITION_TINY_CROP_AREA {
+        return 2;
+    }
+    if area <= LOCAL_RECOGNITION_SMALL_CROP_AREA {
+        return 5;
+    }
+
     7
 }
 
@@ -11770,6 +11793,14 @@ mod tests {
     }
 
     #[test]
+    fn enhancement_variants_limited_stops_at_budget_even_with_full_capacity() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 24, Luma([220])));
+        let variants = enhancement_variants_limited(&img, 1);
+
+        assert_eq!(variants.len(), 1);
+    }
+
+    #[test]
     fn enhancement_variants_include_black_background_for_alpha() {
         let mut rgba = image::RgbaImage::new(2, 1);
         rgba.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
@@ -13538,6 +13569,15 @@ mod tests {
 
         assert!(variants.len() <= 3);
         assert!(!variants.is_empty());
+    }
+
+    #[test]
+    fn local_recognition_variants_adaptive_stops_for_tiny_crop_short_text() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(40, 30, Luma([220])));
+        let candidate = rec_candidate("AB", 0.72, RecVariant::Primary);
+        let variants = local_recognition_variants_adaptive(&img, Some(&candidate));
+
+        assert_eq!(variants.len(), 1);
     }
 
     #[test]
