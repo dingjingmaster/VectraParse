@@ -2713,11 +2713,11 @@ impl OrtOcrEngine {
         direct: Option<RecCandidate>,
     ) -> Option<RecCandidate> {
         let mut best = direct.filter(is_usable_recognition);
-        if !should_try_crop_enhancement_variants(best.as_ref()) {
+        let variant_budget = crop_enhancement_variant_budget(image, best.as_ref());
+        if variant_budget == 0 {
             return best;
         }
 
-        let variant_budget = crop_enhancement_variant_budget(image, best.as_ref());
         let variant_budget = variant_budget.max(1);
         let mut stale_streak = 0usize;
         for (_name, enhanced) in enhancement_variants_limited(image, variant_budget).into_iter() {
@@ -9678,7 +9678,10 @@ fn should_try_local_recognition_variants(
     false
 }
 
-fn should_try_crop_enhancement_variants(direct: Option<&RecCandidate>) -> bool {
+fn should_try_crop_enhancement_variants(
+    image: &DynamicImage,
+    direct: Option<&RecCandidate>,
+) -> bool {
     let Some(candidate) = direct else {
         return true;
     };
@@ -9686,6 +9689,14 @@ fn should_try_crop_enhancement_variants(direct: Option<&RecCandidate>) -> bool {
         return true;
     }
     let text = normalize_recognized_text(&candidate.text);
+    let text_len = recognized_char_count(&text);
+    let area = (image.width() as u64).saturating_mul(image.height() as u64);
+    if area <= CROP_ENHANCE_TINY_AREA && text_len <= 8 && candidate.confidence >= 0.80 {
+        return false;
+    }
+    if area <= CROP_ENHANCE_SMALL_AREA && text_len <= 4 && candidate.confidence >= 0.72 {
+        return false;
+    }
     if is_stable_short_text_candidate(candidate, &text, MAX_FAST_TEXT_CHARS.saturating_sub(2)) {
         return false;
     }
@@ -9729,7 +9740,7 @@ fn crop_enhancement_candidate_is_final(candidate: &RecCandidate) -> bool {
 }
 
 fn crop_enhancement_variant_budget(image: &DynamicImage, direct: Option<&RecCandidate>) -> usize {
-    if !should_try_crop_enhancement_variants(direct) {
+    if !should_try_crop_enhancement_variants(image, direct) {
         return 0;
     }
 
@@ -13620,7 +13631,10 @@ mod tests {
         let mut candidate = rec_candidate("AB", 0.93, RecVariant::Primary);
         candidate.avg_margin = 0.15;
         candidate.min_margin = 0.10;
-        assert!(!should_try_crop_enhancement_variants(Some(&candidate)));
+        assert!(!should_try_crop_enhancement_variants(
+            &img,
+            Some(&candidate)
+        ));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 0);
     }
 
@@ -13628,7 +13642,7 @@ mod tests {
     fn crop_enhancement_variants_keep_for_uncertain_direct_candidate() {
         let candidate = rec_candidate("Unstable text", 0.72, RecVariant::Primary);
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(360, 100, Luma([220])));
-        assert!(should_try_crop_enhancement_variants(Some(&candidate)));
+        assert!(should_try_crop_enhancement_variants(&img, Some(&candidate)));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 4);
     }
 
@@ -13636,15 +13650,26 @@ mod tests {
     fn crop_enhancement_variants_limit_small_crops_even_when_uncertain() {
         let candidate = rec_candidate("Maybe", 0.72, RecVariant::Primary);
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(60, 16, Luma([220])));
-        assert!(should_try_crop_enhancement_variants(Some(&candidate)));
+        assert!(should_try_crop_enhancement_variants(&img, Some(&candidate)));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 1);
     }
 
     #[test]
     fn crop_enhancement_variants_limit_short_text_in_small_box() {
-        let candidate = rec_candidate("短字", 0.72, RecVariant::Primary);
+        let candidate = rec_candidate("短字", 0.70, RecVariant::Primary);
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(75, 80, Luma([220])));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 1);
+    }
+
+    #[test]
+    fn should_try_crop_enhancement_variants_tiny_box_text() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(48, 28, Luma([220])));
+        let candidate = rec_candidate("TXT", 0.80, RecVariant::Primary);
+        assert!(!should_try_crop_enhancement_variants(
+            &img,
+            Some(&candidate)
+        ));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 0);
     }
 
     #[test]
@@ -13653,7 +13678,10 @@ mod tests {
         let mut candidate = rec_candidate("AB", 0.93, RecVariant::Primary);
         candidate.avg_margin = 0.15;
         candidate.min_margin = 0.10;
-        assert!(!should_try_crop_enhancement_variants(Some(&candidate)));
+        assert!(!should_try_crop_enhancement_variants(
+            &img,
+            Some(&candidate)
+        ));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 0);
     }
 
