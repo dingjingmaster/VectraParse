@@ -1,6 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use image::imageops::FilterType;
@@ -16,6 +17,8 @@ const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
 const MAX_UPSCALE_PIXELS: u64 = 2_500_000;
 const MAX_COLOR_REGION_PIXELS: u64 = 1_500_000;
 const MAX_COLOR_REGION_CANDIDATES: usize = 48;
+const MIN_SUPPLEMENT_CHAR_GROWTH: usize = 3;
+const MIN_SUPPLEMENT_CONFIDENCE_GAIN: f32 = 0.03;
 const MAX_EAGER_COLOR_REGION_RECOGNITIONS: usize = 8;
 const MAX_EAGER_COLOR_REGION_DET_PASSES: usize = 4;
 const MAX_EAGER_LAYERED_REGION_RECOGNITIONS: usize = 10;
@@ -35,18 +38,38 @@ const MAX_COLOR_REGION_DET_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 3;
 const MAX_COLOR_REGION_DET_REPAIR_RECOGNITIONS_PER_PASS: usize = 3;
 const MAX_TILE_REGION_SPLIT_LINE_RECOGNITIONS_PER_PASS: usize = 4;
 const MAX_TILE_REGION_REPAIR_RECOGNITIONS_PER_PASS: usize = 4;
+const MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS: usize = 6;
 const MAX_HIGH_RES_TILE_DET_PASSES: usize = 8;
 const MAX_HORIZONTAL_SEGMENTS_PER_LINE: usize = 4;
 const MAX_WIDE_LINE_SEGMENTS_PER_LINE: usize = 6;
 const MAX_RAW_DET_SPLIT_CANDIDATES: usize = 12;
+const MAX_SUPPLEMENT_CANDIDATE_SCORE_PRESELECT: usize = 96;
 const MAX_PAGE_REGION_DET_PASSES: usize = 4;
 const MAX_PANEL_CHILD_CANDIDATES: usize = 6;
 const MAX_PANEL_RECURSION_DEPTH: usize = 2;
 const MAX_LOCAL_DET_UPSCALE_PASSES_PER_REGION: usize = 1;
+const MAX_ENHANCEMENT_VARIANTS_PER_PASS: usize = 4;
+const DETECTION_CONTAINMENT_OVERLAP: f32 = 0.88;
+const DETECTION_SIMILARITY_OVERLAP: f32 = 0.90;
+const GRAPH_REGION_VERTICAL_GAP_LIMIT: u32 = 96;
 const CTC_BEAM_SIZE: usize = 4;
 const CTC_TOP_K: usize = 4;
 const MIN_ACCEPT_REC_CONFIDENCE: f32 = 0.25;
 const MIN_STRONG_REC_CONFIDENCE: f32 = 0.55;
+const MAX_REC_IMAGE_SIGNATURE_CACHE_ENTRIES: usize = 1024;
+const MAX_REC_CANDIDATE_CACHE_ENTRIES: usize = 512;
+const MAX_REC_PREPROCESS_CACHE_ENTRIES: usize = 768;
+const MAX_REC_PREPARED_IMAGE_CACHE_ENTRIES: usize = 192;
+const MAX_RGB_IMAGE_CACHE_ENTRIES: usize = 256;
+const MAX_LUMA_IMAGE_CACHE_ENTRIES: usize = 256;
+const BOX_DEDUPE_BUCKET_SIZE: u32 = 64;
+const MAX_FAST_TEXT_CHARS: usize = 10;
+const STABLE_TEXT_CONFIDENCE: f32 = 0.90;
+const STABLE_TEXT_AVG_MARGIN: f32 = 0.10;
+const STABLE_TEXT_MIN_MARGIN: f32 = 0.05;
+const STABLE_TEXT_READABLE_RATIO: f32 = 0.88;
+const STABLE_TEXT_DOMINANT_RATIO: f32 = 0.60;
+const STABLE_TEXT_PUNCTUATION_RATIO: f32 = 0.40;
 
 #[derive(Debug, Clone)]
 pub struct OcrConfig {
@@ -136,6 +159,11 @@ pub struct OcrTraceTiming {
     pub fallback_ms: u64,
     pub rec_primary_ms: u64,
     pub rec_alt_ms: u64,
+    pub rec_cache_hit_count: u64,
+    pub rec_cache_miss_count: u64,
+    pub preprocess_call_count: u64,
+    pub preprocess_ms: u64,
+    pub variant_candidate_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -195,6 +223,21 @@ enum RecVariant {
     Alt,
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum RecVariantForCache {
+    Primary,
+    Alt,
+}
+
+impl From<RecVariant> for RecVariantForCache {
+    fn from(value: RecVariant) -> Self {
+        match value {
+            RecVariant::Primary => Self::Primary,
+            RecVariant::Alt => Self::Alt,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RecCandidate {
     text: String,
@@ -203,6 +246,22 @@ struct RecCandidate {
     avg_margin: f32,
     min_margin: f32,
     char_min_confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRecognitionImage {
+    image: Arc<DynamicImage>,
+    signature: u64,
+}
+
+impl PreparedRecognitionImage {
+    fn as_image(&self) -> &DynamicImage {
+        self.image.as_ref()
+    }
+
+    fn signature(&self) -> u64 {
+        self.signature
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -262,8 +321,363 @@ struct OcrRecPerf {
     alt_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct OcrWorkPerf {
+    rec_cache_hit_count: u64,
+    rec_cache_miss_count: u64,
+    preprocess_call_count: u64,
+    preprocess_ms: u64,
+    variant_candidate_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct ImageSignatureCacheKey {
+    format: u8,
+    width: u32,
+    height: u32,
+    ptr: usize,
+    len: usize,
+}
+
+#[derive(Debug, Default)]
+struct RecImageSignatureCache {
+    entries: HashMap<ImageSignatureCacheKey, u64>,
+}
+
+impl RecImageSignatureCache {
+    fn get(&self, key: &ImageSignatureCacheKey) -> Option<u64> {
+        self.entries.get(key).copied()
+    }
+
+    fn put(&mut self, key: ImageSignatureCacheKey, signature: u64) {
+        if self.entries.len() >= MAX_REC_IMAGE_SIGNATURE_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(key, signature);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct PreprocessCacheKey {
+    image_signature: u64,
+    target_w: usize,
+    target_h: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPreprocessResult {
+    input: Arc<Vec<f32>>,
+    shape: Vec<usize>,
+}
+
+#[derive(Debug, Default)]
+struct PreprocessCache {
+    entries: HashMap<PreprocessCacheKey, CachedPreprocessResult>,
+    lru: VecDeque<PreprocessCacheKey>,
+}
+
+impl PreprocessCache {
+    fn get(&mut self, key: &PreprocessCacheKey) -> Option<CachedPreprocessResult> {
+        if let Some(result) = self.entries.get(key).cloned() {
+            self.touch(key);
+            return Some(CachedPreprocessResult {
+                input: Arc::clone(&result.input),
+                shape: result.shape,
+            });
+        }
+        None
+    }
+
+    fn put(&mut self, key: PreprocessCacheKey, input: Vec<f32>, shape: Vec<usize>) {
+        if self.entries.len() >= MAX_REC_PREPROCESS_CACHE_ENTRIES
+            && !self.entries.contains_key(&key)
+        {
+            self.evict_one();
+        }
+        self.entries.insert(
+            key,
+            CachedPreprocessResult {
+                input: Arc::new(input),
+                shape,
+            },
+        );
+        self.touch(&key);
+    }
+
+    fn touch(&mut self, key: &PreprocessCacheKey) {
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_back(*key);
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(evict) = self.lru.pop_front() {
+            self.entries.remove(&evict);
+        } else {
+            self.entries.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct ImageRgbCacheKey {
+    format: u8,
+    width: u32,
+    height: u32,
+    ptr: usize,
+    len: usize,
+    background: u8,
+}
+
+#[derive(Debug, Default)]
+struct RgbImageCache {
+    entries: HashMap<ImageRgbCacheKey, Arc<image::RgbImage>>,
+    lru: VecDeque<ImageRgbCacheKey>,
+}
+
+impl RgbImageCache {
+    fn get(&mut self, key: &ImageRgbCacheKey) -> Option<Arc<image::RgbImage>> {
+        if let Some(image) = self.entries.get(key).cloned() {
+            self.touch(key);
+            return Some(image);
+        }
+        None
+    }
+
+    fn put(&mut self, key: ImageRgbCacheKey, image: image::RgbImage) {
+        if self.entries.len() >= MAX_RGB_IMAGE_CACHE_ENTRIES && !self.entries.contains_key(&key) {
+            self.evict_one();
+        }
+        self.entries.insert(key, Arc::new(image));
+        self.touch(&key);
+    }
+
+    fn touch(&mut self, key: &ImageRgbCacheKey) {
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_back(*key);
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(evict) = self.lru.pop_front() {
+            self.entries.remove(&evict);
+        } else {
+            self.entries.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct ImageLumaCacheKey {
+    format: u8,
+    width: u32,
+    height: u32,
+    ptr: usize,
+    len: usize,
+    background: u8,
+}
+
+#[derive(Debug, Default)]
+struct LumaImageCache {
+    entries: HashMap<ImageLumaCacheKey, Arc<GrayImage>>,
+    lru: VecDeque<ImageLumaCacheKey>,
+}
+
+impl LumaImageCache {
+    fn get(&mut self, key: &ImageLumaCacheKey) -> Option<Arc<GrayImage>> {
+        if let Some(image) = self.entries.get(key).cloned() {
+            self.touch(key);
+            return Some(image);
+        }
+        None
+    }
+
+    fn put(&mut self, key: ImageLumaCacheKey, image: GrayImage) {
+        if self.entries.len() >= MAX_LUMA_IMAGE_CACHE_ENTRIES && !self.entries.contains_key(&key) {
+            self.evict_one();
+        }
+        self.entries.insert(key, Arc::new(image));
+        self.touch(&key);
+    }
+
+    fn touch(&mut self, key: &ImageLumaCacheKey) {
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_back(*key);
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(evict) = self.lru.pop_front() {
+            self.entries.remove(&evict);
+        } else {
+            self.entries.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRecognitionImageCacheEntry {
+    signature: u64,
+    image: Arc<DynamicImage>,
+}
+
+#[derive(Debug, Default)]
+struct PreparedRecognitionImageCache {
+    entries: HashMap<u64, PreparedRecognitionImageCacheEntry>,
+    lru: VecDeque<u64>,
+}
+
+impl PreparedRecognitionImageCache {
+    fn get(&mut self, source_signature: &u64) -> Option<PreparedRecognitionImageCacheEntry> {
+        if let Some(entry) = self.entries.get(source_signature).cloned() {
+            self.touch(source_signature);
+            return Some(entry);
+        }
+        None
+    }
+
+    fn put(&mut self, source_signature: u64, entry: PreparedRecognitionImageCacheEntry) {
+        if self.entries.len() >= MAX_REC_PREPARED_IMAGE_CACHE_ENTRIES
+            && !self.entries.contains_key(&source_signature)
+        {
+            self.evict_one();
+        }
+        self.entries.insert(source_signature, entry);
+        self.touch(&source_signature);
+    }
+
+    fn touch(&mut self, key: &u64) {
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_back(*key);
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(evict) = self.lru.pop_front() {
+            self.entries.remove(&evict);
+        } else {
+            self.entries.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+}
+
+#[derive(Default)]
+struct OcrWorkContextScope;
+
+thread_local! {
+    static OCR_WORK_PERF: RefCell<OcrWorkPerf> = RefCell::new(OcrWorkPerf::default());
+    static OCR_REC_IMAGE_SIGNATURE_CACHE: RefCell<RecImageSignatureCache> = RefCell::new(RecImageSignatureCache::default());
+    static OCR_REC_PREPROCESS_CACHE: RefCell<PreprocessCache> = RefCell::new(PreprocessCache::default());
+    static OCR_REC_CANDIDATE_CACHE: RefCell<RecCandidateCache> = RefCell::new(RecCandidateCache::default());
+    static OCR_REC_RGB_CACHE: RefCell<RgbImageCache> = RefCell::new(RgbImageCache::default());
+    static OCR_REC_LUMA_CACHE: RefCell<LumaImageCache> = RefCell::new(LumaImageCache::default());
+    static OCR_REC_PREPARED_IMAGE_CACHE: RefCell<PreparedRecognitionImageCache> =
+        RefCell::new(PreparedRecognitionImageCache::default());
+}
+
+impl OcrWorkContextScope {
+    fn enter() -> Self {
+        OCR_WORK_PERF.with(|perf| {
+            *perf.borrow_mut() = OcrWorkPerf::default();
+        });
+        OCR_REC_IMAGE_SIGNATURE_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_PREPROCESS_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_CANDIDATE_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_RGB_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_LUMA_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_PREPARED_IMAGE_CACHE.with(|cache| cache.borrow_mut().clear());
+        Self
+    }
+}
+
+impl Drop for OcrWorkContextScope {
+    fn drop(&mut self) {
+        OCR_WORK_PERF.with(|perf| {
+            *perf.borrow_mut() = OcrWorkPerf::default();
+        });
+        OCR_REC_IMAGE_SIGNATURE_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_PREPROCESS_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_CANDIDATE_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_RGB_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_LUMA_CACHE.with(|cache| cache.borrow_mut().clear());
+        OCR_REC_PREPARED_IMAGE_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
+}
+
 thread_local! {
     static OCR_REC_PERF: RefCell<OcrRecPerf> = RefCell::new(OcrRecPerf::default());
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct RecCandidateCacheKey {
+    image_signature: u64,
+    target_w: usize,
+    rec_img_h: usize,
+    rec_img_w: usize,
+    variant: RecVariantForCache,
+}
+
+#[derive(Debug, Default)]
+struct RecCandidateCache {
+    candidates: HashMap<RecCandidateCacheKey, RecCandidate>,
+    lru: VecDeque<RecCandidateCacheKey>,
+}
+
+impl RecCandidateCache {
+    fn get(&mut self, key: &RecCandidateCacheKey) -> Option<&RecCandidate> {
+        if self.candidates.contains_key(key) {
+            self.touch(key);
+        }
+        self.candidates.get(key)
+    }
+
+    fn put(&mut self, key: RecCandidateCacheKey, candidate: RecCandidate) {
+        if !self.candidates.contains_key(&key)
+            && self.candidates.len() >= MAX_REC_CANDIDATE_CACHE_ENTRIES
+        {
+            self.evict_one();
+        }
+        self.candidates.insert(key, candidate);
+        self.touch(&key);
+    }
+
+    fn touch(&mut self, key: &RecCandidateCacheKey) {
+        self.lru.retain(|entry| entry != key);
+        self.lru.push_back(*key);
+    }
+
+    fn evict_one(&mut self) {
+        if let Some(evict) = self.lru.pop_front() {
+            self.candidates.remove(&evict);
+        } else {
+            self.candidates.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.candidates.clear();
+        self.lru.clear();
+    }
 }
 
 fn make_text_line(
@@ -384,8 +798,10 @@ impl OrtOcrEngine {
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
         let total_start = Instant::now();
+        let _rec_cache_scope = OcrWorkContextScope::enter();
         reset_ocr_rec_perf();
         let trace_enabled = ocr_trace_enabled();
+        let (_, img_h) = img.dimensions();
         let source_has_alpha = has_non_opaque_alpha(img);
         if trace_enabled {
             let (w, h) = img.dimensions();
@@ -427,6 +843,7 @@ impl OrtOcrEngine {
         push_recognition_candidate(&mut candidate_pool, "det".to_string(), &detected.recognized);
         let mut remaining_supplement_rec_budget = MAX_EAGER_SUPPLEMENT_RECOGNITIONS_TOTAL;
         let remaining_supplement_det_budget = MAX_EAGER_SUPPLEMENT_DET_PASSES_TOTAL;
+        let mut supplement_seen_boxes = SupplementSeenIndex::new(img_h);
 
         let page_region_start = Instant::now();
         let (page_region_count, page_region_candidate) =
@@ -519,6 +936,9 @@ impl OrtOcrEngine {
             line_count,
             &regions,
         );
+        let mut enforce_visual_progress = false;
+        let mut visual_progress_anchor = (text.clone(), confidence, line_count);
+
         if run_eager_color
             && should_continue_eager_supplements(
                 &text,
@@ -529,6 +949,9 @@ impl OrtOcrEngine {
             )
             && remaining_supplement_rec_budget > 0
         {
+            let color_before_text = text.clone();
+            let color_before_confidence = confidence;
+            let color_before_line_count = line_count;
             let color_region_start = Instant::now();
             let color_limit =
                 MAX_EAGER_COLOR_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
@@ -538,6 +961,7 @@ impl OrtOcrEngine {
                 &regions,
                 color_limit,
                 "color-region:eager",
+                &mut supplement_seen_boxes,
             );
             remaining_supplement_rec_budget =
                 remaining_supplement_rec_budget.saturating_sub(attempted);
@@ -570,14 +994,36 @@ impl OrtOcrEngine {
             color_region_count = candidate_count;
             trace.timing.color_region_ms = elapsed_ms(color_region_start);
 
-            if should_continue_eager_supplements(
+            enforce_visual_progress = should_continue_eager_supplement_pass(
                 &text,
                 confidence,
                 det_box_count,
                 line_count,
                 &regions,
+                &color_before_text,
+                color_before_confidence,
+                color_before_line_count,
+            );
+            visual_progress_anchor = (
+                color_before_text.clone(),
+                color_before_confidence,
+                color_before_line_count,
+            );
+
+            if should_continue_eager_supplement_pass(
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
+                &color_before_text,
+                color_before_confidence,
+                color_before_line_count,
             ) && remaining_supplement_det_budget > 0
             {
+                let det_before_text = text.clone();
+                let det_before_confidence = confidence;
+                let det_before_line_count = line_count;
                 let det_color_region_start = Instant::now();
                 let det_limit =
                     MAX_EAGER_COLOR_REGION_DET_PASSES.min(remaining_supplement_det_budget);
@@ -588,6 +1034,7 @@ impl OrtOcrEngine {
                         &regions,
                         det_limit,
                         "color-region-det:eager",
+                        &mut supplement_seen_boxes,
                     );
                 trace.timing.color_region_ms = trace
                     .timing
@@ -623,16 +1070,37 @@ impl OrtOcrEngine {
                         &candidate,
                     );
                 }
+                enforce_visual_progress = should_continue_eager_supplement_pass(
+                    &text,
+                    confidence,
+                    det_box_count,
+                    line_count,
+                    &regions,
+                    &det_before_text,
+                    det_before_confidence,
+                    det_before_line_count,
+                );
+                visual_progress_anchor = (
+                    det_before_text,
+                    det_before_confidence,
+                    det_before_line_count,
+                );
             }
 
-            if should_continue_eager_supplements(
+            if should_continue_eager_supplement_pass(
                 &text,
                 confidence,
                 det_box_count,
                 line_count,
                 &regions,
+                &visual_progress_anchor.0,
+                visual_progress_anchor.1,
+                visual_progress_anchor.2,
             ) && remaining_supplement_rec_budget > 0
             {
+                let layered_before_text = text.clone();
+                let layered_before_confidence = confidence;
+                let layered_before_line_count = line_count;
                 let layered_region_start = Instant::now();
                 let layered_limit =
                     MAX_EAGER_LAYERED_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
@@ -643,6 +1111,7 @@ impl OrtOcrEngine {
                         &regions,
                         layered_limit,
                         "layered-region:eager",
+                        &mut supplement_seen_boxes,
                     );
                 trace.timing.layered_region_ms = elapsed_ms(layered_region_start);
                 color_region_count = color_region_count.max(layered_region_count);
@@ -672,11 +1141,31 @@ impl OrtOcrEngine {
                     "layered-regions:eager".to_string(),
                     &layered_candidate,
                 );
+                enforce_visual_progress = should_continue_eager_supplement_pass(
+                    &text,
+                    confidence,
+                    det_box_count,
+                    line_count,
+                    &regions,
+                    &layered_before_text,
+                    layered_before_confidence,
+                    layered_before_line_count,
+                );
+                visual_progress_anchor = (
+                    layered_before_text,
+                    layered_before_confidence,
+                    layered_before_line_count,
+                );
             }
         }
 
-        if should_continue_eager_supplements(&text, confidence, det_box_count, line_count, &regions)
-            && remaining_supplement_rec_budget > 0
+        let mut can_run_visual = should_continue_eager_supplements(
+            &text,
+            confidence,
+            det_box_count,
+            line_count,
+            &regions,
+        ) && remaining_supplement_rec_budget > 0
             && should_use_uncovered_visual_supplement(
                 img,
                 cfg,
@@ -684,8 +1173,21 @@ impl OrtOcrEngine {
                 det_box_count,
                 line_count,
                 &regions,
-            )
-        {
+            );
+        if enforce_visual_progress {
+            can_run_visual = can_run_visual
+                && should_continue_eager_supplement_pass(
+                    &text,
+                    confidence,
+                    det_box_count,
+                    line_count,
+                    &regions,
+                    &visual_progress_anchor.0,
+                    visual_progress_anchor.1,
+                    visual_progress_anchor.2,
+                );
+        }
+        if can_run_visual {
             let visual_start = Instant::now();
             let visual_limit =
                 MAX_EAGER_VISUAL_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
@@ -695,6 +1197,7 @@ impl OrtOcrEngine {
                 &regions,
                 visual_limit,
                 "visual-region:eager",
+                &mut supplement_seen_boxes,
             );
             trace.timing.visual_region_ms = elapsed_ms(visual_start);
             maybe_adopt_recognized_traced(
@@ -759,10 +1262,16 @@ impl OrtOcrEngine {
             }
         });
         let rec_perf = read_ocr_rec_perf();
+        let work_perf = ocr_work_perf_snapshot();
         trace.rec_primary_call_count = rec_perf.primary_call_count;
         trace.rec_alt_call_count = rec_perf.alt_call_count;
         trace.timing.rec_primary_ms = rec_perf.primary_ms;
         trace.timing.rec_alt_ms = rec_perf.alt_ms;
+        trace.timing.rec_cache_hit_count = work_perf.rec_cache_hit_count;
+        trace.timing.rec_cache_miss_count = work_perf.rec_cache_miss_count;
+        trace.timing.preprocess_call_count = work_perf.preprocess_call_count;
+        trace.timing.preprocess_ms = work_perf.preprocess_ms;
+        trace.timing.variant_candidate_count = work_perf.variant_candidate_count;
         trace.timing.total_ms = elapsed_ms(total_start);
         trace.lines = ocr_trace_lines_from_regions(&regions);
         if ocr_trace_json_enabled() {
@@ -786,7 +1295,7 @@ impl OrtOcrEngine {
         if trace_enabled {
             let (w, h) = img.dimensions();
             eprintln!(
-                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} rec_primary_calls={} rec_alt_calls={} source={} whole_image_box={} fallback={} empty={} total_ms={} det_ms={} page_region_ms={} tile_ms={} color_region_ms={} layered_region_ms={} visual_region_ms={} fallback_ms={} rec_primary_ms={} rec_alt_ms={}",
+                "[OCR_TRACE] dims={}x{} alpha={} det_boxes={} line_count={} regions={} layout={} color_regions={} det_passes={} fallback_attempts={} rec_primary_calls={} rec_alt_calls={} rec_cache_hits={} rec_cache_miss={} preprocess_calls={} preprocess_ms={} variant_candidates={} source={} whole_image_box={} fallback={} empty={} total_ms={} det_ms={} page_region_ms={} tile_ms={} color_region_ms={} layered_region_ms={} visual_region_ms={} fallback_ms={} rec_primary_ms={} rec_alt_ms={}",
                 w,
                 h,
                 source_has_alpha,
@@ -799,6 +1308,11 @@ impl OrtOcrEngine {
                 trace.fallback_attempt_count,
                 trace.rec_primary_call_count,
                 trace.rec_alt_call_count,
+                trace.timing.rec_cache_hit_count,
+                trace.timing.rec_cache_miss_count,
+                trace.timing.preprocess_call_count,
+                trace.timing.preprocess_ms,
+                trace.timing.variant_candidate_count,
                 trace.selected_source.as_deref().unwrap_or("-"),
                 detect_used_whole_image_box,
                 fallback.as_deref().unwrap_or("-"),
@@ -1119,6 +1633,7 @@ impl OrtOcrEngine {
         {
             split_boxes = split_text_box_into_line_boxes(img, b);
         }
+        split_boxes = dedupe_box_candidates(split_boxes);
         if split_boxes.len() >= 2 && split_boxes.len() <= *split_line_rec_budget {
             let split_lines =
                 self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
@@ -1198,7 +1713,9 @@ impl OrtOcrEngine {
             && should_enhance_crop(b)
         {
             *crop_enhancement_budget -= 1;
-            direct = self.best_from_crop(&direct_crop, cfg).or(direct);
+            direct = self
+                .best_from_crop(&direct_crop, cfg, direct.clone())
+                .or(direct);
         };
 
         if let Some(repaired) = self.repair_recognized_box_lines(
@@ -1471,7 +1988,13 @@ impl OrtOcrEngine {
         if !consume_quality_fallback_family(&mut family_budget) {
             return Ok(());
         }
-        for (name, enhanced) in enhancement_variants(img) {
+        let enhancement_limit = quality_fallback_enhancement_variant_budget(
+            text,
+            *confidence,
+            det_box_count,
+            *line_count,
+        );
+        for (name, enhanced) in enhancement_variants_limited(img, enhancement_limit) {
             trace.fallback_attempt_count += 1;
             trace.det_pass_count += 1;
             if let Ok(candidate) = self.recognize_detected_text(
@@ -1862,6 +2385,7 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
+        supplement_seen_boxes: &mut SupplementSeenIndex,
     ) -> (usize, usize, RecognizedText) {
         let raw_boxes = color_region_boxes(img);
         let boxes = prioritize_supplement_candidate_boxes(img, raw_boxes.clone(), existing_regions);
@@ -1877,17 +2401,21 @@ impl OrtOcrEngine {
             if !supplement_box_is_worth_recognition(*b) {
                 continue;
             }
+            if supplement_seen_boxes.is_redundant(*b) {
+                continue;
+            }
+            let mut found_reliable = false;
             let crop = crop_box(img, *b);
             attempted += 1;
             if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg) {
-                lines.extend(candidate_text_lines(
-                    img,
-                    *b,
-                    &candidate,
-                    source,
-                    BboxTransform::Identity,
-                ));
+                let candidate_lines =
+                    candidate_text_lines(img, *b, &candidate, source, BboxTransform::Identity);
+                if supplement_lines_are_reliable(&candidate_lines) {
+                    found_reliable = true;
+                }
+                lines.extend(candidate_lines);
             }
+            supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
         (
             raw_boxes.len(),
@@ -1903,6 +2431,7 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
+        supplement_seen_boxes: &mut SupplementSeenIndex,
     ) -> (usize, usize, RecognizedText) {
         let (candidate_count, boxes) =
             color_region_det_candidate_boxes(img, existing_regions, recognition_limit);
@@ -1914,6 +2443,10 @@ impl OrtOcrEngine {
         let mut lines = Vec::new();
         let mut det_pass_count = 0usize;
         for (idx, b) in boxes.iter().enumerate() {
+            if supplement_seen_boxes.is_redundant(*b) {
+                continue;
+            }
+            let mut found_reliable = false;
             let crop = crop_box(img, *b);
             let source = format!("{source}:{}", idx + 1);
             det_pass_count += 1;
@@ -1931,7 +2464,11 @@ impl OrtOcrEngine {
             ) {
                 let supplement =
                     filter_color_region_det_supplement(&detected.recognized, existing_regions);
-                lines.extend(text_lines_from_recognized(&supplement));
+                let supplement_lines = text_lines_from_recognized(&supplement);
+                if supplement_lines_are_reliable(&supplement_lines) {
+                    found_reliable = true;
+                }
+                lines.extend(supplement_lines);
             }
             for (name, upscaled) in local_det_upscale_variants(&crop)
                 .into_iter()
@@ -1958,9 +2495,14 @@ impl OrtOcrEngine {
                 ) {
                     let supplement =
                         filter_color_region_det_supplement(&detected.recognized, existing_regions);
-                    lines.extend(text_lines_from_recognized(&supplement));
+                    let supplement_lines = text_lines_from_recognized(&supplement);
+                    if supplement_lines_are_reliable(&supplement_lines) {
+                        found_reliable = true;
+                    }
+                    lines.extend(supplement_lines);
                 }
             }
+            supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
 
         (
@@ -1977,6 +2519,7 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
+        supplement_seen_boxes: &mut SupplementSeenIndex,
     ) -> (usize, usize, RecognizedText) {
         let boxes = layered_color_region_text_boxes(img, existing_regions);
         let candidate_count = boxes.len();
@@ -1992,17 +2535,21 @@ impl OrtOcrEngine {
             if !supplement_box_is_worth_recognition(*b) {
                 continue;
             }
+            if supplement_seen_boxes.is_redundant(*b) {
+                continue;
+            }
+            let mut found_reliable = false;
             let crop = crop_box(img, *b);
             attempted += 1;
             if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg) {
-                lines.extend(candidate_text_lines(
-                    img,
-                    *b,
-                    &candidate,
-                    source,
-                    BboxTransform::Identity,
-                ));
+                let candidate_lines =
+                    candidate_text_lines(img, *b, &candidate, source, BboxTransform::Identity);
+                if supplement_lines_are_reliable(&candidate_lines) {
+                    found_reliable = true;
+                }
+                lines.extend(candidate_lines);
             }
+            supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
         (
             candidate_count,
@@ -2018,6 +2565,7 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
         recognition_limit: usize,
         source: &str,
+        supplement_seen_boxes: &mut SupplementSeenIndex,
     ) -> (usize, RecognizedText) {
         let boxes = prioritize_supplement_candidate_boxes(
             img,
@@ -2033,18 +2581,22 @@ impl OrtOcrEngine {
             if !supplement_box_is_worth_recognition(*b) {
                 continue;
             }
+            if supplement_seen_boxes.is_redundant(*b) {
+                continue;
+            }
+            let mut found_reliable = false;
             let crop = crop_box(img, *b);
             let candidate = self.best_from_crop_local_preprocessed(&crop, cfg);
             attempted += 1;
             if let Some(candidate) = candidate {
-                lines.extend(candidate_text_lines(
-                    img,
-                    *b,
-                    &candidate,
-                    source,
-                    BboxTransform::Identity,
-                ));
+                let candidate_lines =
+                    candidate_text_lines(img, *b, &candidate, source, BboxTransform::Identity);
+                if supplement_lines_are_reliable(&candidate_lines) {
+                    found_reliable = true;
+                }
+                lines.extend(candidate_lines);
             }
+            supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
         (attempted, recognized_from_text_lines(&mut lines))
     }
@@ -2074,16 +2626,36 @@ impl OrtOcrEngine {
         image: &DynamicImage,
         cfg: &OcrConfig,
     ) -> Result<RecCandidate, String> {
-        let primary =
-            self.recognize_candidate(&self.rec, &self.alphabet, image, cfg, RecVariant::Primary)?;
+        OCR_REC_CANDIDATE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            self.recognize_best_cached(image, cfg, &mut cache)
+        })
+    }
+
+    fn recognize_best_cached(
+        &self,
+        image: &DynamicImage,
+        cfg: &OcrConfig,
+        rec_cache: &mut RecCandidateCache,
+    ) -> Result<RecCandidate, String> {
+        let prepared = self.prepare_recognition_input(image);
+        let primary = self.recognize_candidate_prepared(
+            &self.rec,
+            &self.alphabet,
+            &prepared,
+            cfg,
+            RecVariant::Primary,
+            rec_cache,
+        )?;
         let alt = if should_try_alt_recognition(&primary) {
             if let Some(rec_alt) = &self.rec_alt {
-                Some(self.recognize_candidate(
+                Some(self.recognize_candidate_prepared(
                     rec_alt,
                     &self.alphabet_alt,
-                    image,
+                    &prepared,
                     cfg,
                     RecVariant::Alt,
+                    rec_cache,
                 )?)
             } else {
                 None
@@ -2094,23 +2666,86 @@ impl OrtOcrEngine {
         Ok(select_recognition(primary, alt))
     }
 
-    fn best_from_crop(&self, image: &DynamicImage, cfg: &OcrConfig) -> Option<RecCandidate> {
-        let direct = self.recognize_best(image, cfg).ok();
-        if let Some(candidate) = &direct {
-            if is_usable_recognition(candidate) && candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
-            {
-                return Some(candidate.clone());
-            }
+    fn prepare_recognition_input(&self, image: &DynamicImage) -> PreparedRecognitionImage {
+        let source_signature = dynamic_image_signature_cached(image);
+        if let Some(cached) =
+            OCR_REC_PREPARED_IMAGE_CACHE.with(|cache| cache.borrow_mut().get(&source_signature))
+        {
+            return PreparedRecognitionImage {
+                image: cached.image,
+                signature: cached.signature,
+            };
         }
+
+        let image = if let Some(cropped) = tight_rec_crop(image) {
+            let signature = dynamic_image_signature_cached(&cropped);
+            PreparedRecognitionImage {
+                image: Arc::new(cropped),
+                signature,
+            }
+        } else {
+            PreparedRecognitionImage {
+                image: Arc::new(image.clone()),
+                signature: source_signature,
+            }
+        };
+
+        OCR_REC_PREPARED_IMAGE_CACHE.with(|cache| {
+            cache.borrow_mut().put(
+                source_signature,
+                PreparedRecognitionImageCacheEntry {
+                    signature: image.signature,
+                    image: Arc::clone(&image.image),
+                },
+            );
+        });
+        image
+    }
+
+    fn best_from_crop(
+        &self,
+        image: &DynamicImage,
+        cfg: &OcrConfig,
+        direct: Option<RecCandidate>,
+    ) -> Option<RecCandidate> {
         let mut best = direct.filter(is_usable_recognition);
-        for (_name, enhanced) in enhancement_variants(image) {
+        if !should_try_crop_enhancement_variants(best.as_ref()) {
+            return best;
+        }
+
+        let variant_budget = crop_enhancement_variant_budget(image, best.as_ref());
+        let variant_budget = variant_budget.max(1);
+        let mut stale_streak = 0usize;
+        for (_name, enhanced) in enhancement_variants_limited(image, variant_budget).into_iter() {
+            ocr_work_perf_record_variant_candidates(1);
             if let Ok(candidate) = self.recognize_best(&enhanced, cfg) {
-                if is_usable_recognition(&candidate)
-                    && best
-                        .as_ref()
-                        .map_or(true, |b| candidate.confidence > b.confidence)
+                let is_improved = is_usable_recognition(&candidate)
+                    && recognition_candidate_is_better(best.as_ref(), &candidate);
+                if !is_improved {
+                    stale_streak = stale_streak.saturating_add(1);
+                    if should_short_circuit_crop_enhancement(
+                        best.as_ref(),
+                        stale_streak,
+                        variant_budget,
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                best = Some(candidate);
+                stale_streak = 0;
+                if let Some(best_ref) = best.as_ref()
+                    && crop_enhancement_candidate_is_final(best_ref)
                 {
-                    best = Some(candidate);
+                    break;
+                }
+
+                if should_short_circuit_crop_enhancement(
+                    best.as_ref(),
+                    stale_streak,
+                    variant_budget,
+                ) {
+                    break;
                 }
             }
         }
@@ -2132,12 +2767,33 @@ impl OrtOcrEngine {
         if !should_try_local_recognition_variants(image, best.as_ref()) {
             return best;
         }
+        let mut stale_streak = 0usize;
+        let variant_budget = if best.is_some() { 3 } else { 4 };
         for (_, variant) in local_recognition_variants_adaptive(image, best.as_ref()) {
+            ocr_work_perf_record_variant_candidates(1);
             if let Ok(candidate) = self.recognize_best(&variant, cfg)
                 && is_usable_recognition(&candidate)
                 && recognition_candidate_is_better(best.as_ref(), &candidate)
             {
                 best = Some(candidate);
+                stale_streak = 0;
+                if best
+                    .as_ref()
+                    .is_some_and(local_recognition_candidate_is_final)
+                {
+                    break;
+                }
+            } else {
+                stale_streak = stale_streak.saturating_add(1);
+                if stale_streak >= 2
+                    && should_short_circuit_crop_enhancement(
+                        best.as_ref(),
+                        stale_streak,
+                        variant_budget,
+                    )
+                {
+                    break;
+                }
             }
         }
         best
@@ -2150,31 +2806,109 @@ impl OrtOcrEngine {
         image: &DynamicImage,
         cfg: &OcrConfig,
         variant: RecVariant,
+        rec_cache: &mut RecCandidateCache,
     ) -> Result<RecCandidate, String> {
-        let tight_crop = tight_rec_crop(image);
-        let image = tight_crop.as_ref().unwrap_or(image);
+        self.recognize_candidate_prepared(
+            session,
+            alphabet,
+            &self.prepare_recognition_input(image),
+            cfg,
+            variant,
+            rec_cache,
+        )
+    }
+
+    fn recognize_candidate_prepared(
+        &self,
+        session: &OrtSession,
+        alphabet: &[String],
+        prepared: &PreparedRecognitionImage,
+        cfg: &OcrConfig,
+        variant: RecVariant,
+        rec_cache: &mut RecCandidateCache,
+    ) -> Result<RecCandidate, String> {
+        let image = prepared.as_image();
+        let image_signature = prepared.signature();
         let target_w = dynamic_rec_target_width(image, cfg.rec_img_h, cfg.rec_img_w);
-        match self.recognize_candidate_at_width(session, alphabet, image, cfg, variant, target_w) {
-            Ok(candidate) => Ok(candidate),
-            Err(e) if target_w != cfg.rec_img_w => self
-                .recognize_candidate_at_width(session, alphabet, image, cfg, variant, cfg.rec_img_w)
-                .map_err(|fallback| format!("{e}; fixed-width fallback failed: {fallback}")),
+        let key = rec_candidate_cache_key_with_signature(
+            image_signature,
+            cfg.rec_img_h,
+            cfg.rec_img_w,
+            target_w,
+            variant,
+        );
+        if let Some(candidate) = rec_cache.get(&key) {
+            ocr_work_perf_record_rec_cache_hit();
+            return Ok(candidate.clone());
+        }
+        ocr_work_perf_record_rec_cache_miss();
+
+        match self.recognize_candidate_at_width_cached(
+            session,
+            alphabet,
+            image,
+            image_signature,
+            cfg,
+            variant,
+            target_w,
+        ) {
+            Ok(candidate) => {
+                rec_cache.put(key, candidate.clone());
+                Ok(candidate)
+            }
+            Err(e) if target_w != cfg.rec_img_w => {
+                let fixed_key = rec_candidate_cache_key_with_signature(
+                    image_signature,
+                    cfg.rec_img_h,
+                    cfg.rec_img_w,
+                    cfg.rec_img_w,
+                    variant,
+                );
+                if let Some(candidate) = rec_cache.get(&fixed_key).cloned() {
+                    ocr_work_perf_record_rec_cache_hit();
+                    rec_cache.put(key, candidate.clone());
+                    return Ok(candidate);
+                }
+                ocr_work_perf_record_rec_cache_miss();
+                let candidate = self
+                    .recognize_candidate_at_width_cached(
+                        session,
+                        alphabet,
+                        image,
+                        image_signature,
+                        cfg,
+                        variant,
+                        cfg.rec_img_w,
+                    )
+                    .map_err(|fallback| format!("{e}; fixed-width fallback failed: {fallback}"))?;
+                rec_cache.put(fixed_key, candidate.clone());
+                rec_cache.put(key, candidate.clone());
+                Ok(candidate)
+            }
             Err(e) => Err(e),
         }
     }
 
-    fn recognize_candidate_at_width(
+    fn recognize_candidate_at_width_cached(
         &self,
         session: &OrtSession,
         alphabet: &[String],
         image: &DynamicImage,
+        image_signature: u64,
         cfg: &OcrConfig,
         variant: RecVariant,
         target_w: usize,
     ) -> Result<RecCandidate, String> {
         let start = Instant::now();
-        let (rec_input, rec_shape) = preprocess_rec_image(image, cfg.rec_img_h, target_w)?;
-        let (output, out_shapes) = ort::run_session(session, &[rec_input], &[rec_shape])?;
+        let (rec_input, rec_shape) = preprocess_rec_image_cached_with_signature(
+            image,
+            image_signature,
+            cfg.rec_img_h,
+            target_w,
+        )?;
+        let input_slices = [rec_input.as_slice()];
+        let shape_slices = [rec_shape.as_slice()];
+        let (output, out_shapes) = ort::run_session(session, &input_slices, &shape_slices)?;
         let logits = &output[0];
         let (text, confidence, stats) = ctc_decode_with_stats(logits, &out_shapes[0], alphabet);
         record_ocr_rec_perf(variant, elapsed_ms(start));
@@ -2193,6 +2927,56 @@ fn recognized_from_text_lines(lines: &mut [TextLine]) -> RecognizedText {
     recognized_from_text_lines_with_context(lines, None)
 }
 
+fn sort_and_truncate_by<T, F>(mut values: Vec<T>, max_count: usize, mut cmp: F) -> Vec<T>
+where
+    F: FnMut(&T, &T) -> std::cmp::Ordering,
+{
+    if values.len() <= 1 {
+        values.sort_by(|a, b| cmp(a, b));
+        return values;
+    }
+    if max_count == 0 {
+        return Vec::new();
+    }
+    if values.len() > max_count {
+        values.select_nth_unstable_by(max_count - 1, |a, b| cmp(a, b));
+        values.truncate(max_count);
+    }
+    values.sort_by(|a, b| cmp(a, b));
+    values
+}
+
+fn rec_candidate_cache_key(
+    image: &DynamicImage,
+    cfg: &OcrConfig,
+    target_w: usize,
+    variant: RecVariant,
+) -> RecCandidateCacheKey {
+    rec_candidate_cache_key_with_signature(
+        dynamic_image_signature_cached(image),
+        cfg.rec_img_h,
+        cfg.rec_img_w,
+        target_w,
+        variant,
+    )
+}
+
+fn rec_candidate_cache_key_with_signature(
+    image_signature: u64,
+    rec_img_h: usize,
+    rec_img_w: usize,
+    target_w: usize,
+    variant: RecVariant,
+) -> RecCandidateCacheKey {
+    RecCandidateCacheKey {
+        image_signature,
+        target_w,
+        rec_img_h,
+        rec_img_w,
+        variant: variant.into(),
+    }
+}
+
 #[cfg(test)]
 fn recognized_from_text_lines_with_image(
     lines: &mut [TextLine],
@@ -2205,9 +2989,16 @@ fn recognized_from_text_lines_with_context(
     lines: &mut [TextLine],
     image: Option<&DynamicImage>,
 ) -> RecognizedText {
+    if lines.is_empty() {
+        return RecognizedText::default();
+    }
+
     lines.sort_by(reading_line_order);
     let deduped = dedupe_text_lines(lines);
     let filtered = filter_low_value_text_lines(&deduped);
+    if filtered.is_empty() {
+        return RecognizedText::default();
+    }
     let rgb = image.map(to_rgb_on_white);
     let mut regions = if let Some(rgb) = rgb.as_ref() {
         group_text_lines_into_panel_regions(&filtered, rgb)
@@ -2216,19 +3007,23 @@ fn recognized_from_text_lines_with_context(
     };
     regions.sort_by(reading_region_order);
 
-    let mut blocks = Vec::new();
+    let mut blocks = Vec::with_capacity(regions.len());
     let mut confidence_sum = 0.0f32;
     let mut confidence_weight_sum = 0.0f32;
-    let mut public_regions = Vec::new();
+    let mut public_regions = Vec::with_capacity(regions.len());
     for region in regions.iter_mut() {
         region.lines.sort_by(reading_line_order);
-        let block = region
-            .lines
-            .iter()
-            .map(|line| line.text.trim())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut block = String::new();
+        for line in region.lines.iter() {
+            let text = line.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(text);
+        }
         if block.trim().is_empty() {
             continue;
         }
@@ -2528,6 +3323,31 @@ fn ocr_trace_json(
     push_json_u64_field(&mut out, "fallback", trace.timing.fallback_ms, true);
     push_json_u64_field(&mut out, "rec_primary", trace.timing.rec_primary_ms, true);
     push_json_u64_field(&mut out, "rec_alt", trace.timing.rec_alt_ms, true);
+    push_json_u64_field(
+        &mut out,
+        "rec_cache_hit",
+        trace.timing.rec_cache_hit_count,
+        true,
+    );
+    push_json_u64_field(
+        &mut out,
+        "rec_cache_miss",
+        trace.timing.rec_cache_miss_count,
+        true,
+    );
+    push_json_u64_field(
+        &mut out,
+        "preprocess_call_count",
+        trace.timing.preprocess_call_count,
+        true,
+    );
+    push_json_u64_field(&mut out, "preprocess_ms", trace.timing.preprocess_ms, true);
+    push_json_u64_field(
+        &mut out,
+        "variant_candidate_count",
+        trace.timing.variant_candidate_count,
+        true,
+    );
     out.push('}');
     out.push('}');
 
@@ -2868,36 +3688,38 @@ fn group_text_lines_into_graph_regions(
     let mut parents = (0..candidates.len()).collect::<Vec<_>>();
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
+            if candidates[j].bbox.1
+                > candidates[i]
+                    .bbox
+                    .3
+                    .saturating_add(GRAPH_REGION_VERTICAL_GAP_LIMIT)
+            {
+                break;
+            }
             if line_graph_edge(&candidates[i], &candidates[j], rgb) {
                 union_parent(&mut parents, i, j);
             }
         }
     }
 
-    let mut groups: Vec<(usize, Vec<TextLine>)> = Vec::new();
+    let mut groups: Vec<LayoutRegion> = Vec::with_capacity(candidates.len());
+    let mut group_index: HashMap<usize, usize> = HashMap::with_capacity(candidates.len());
     for (idx, line) in candidates.into_iter().enumerate() {
         let root = find_parent(&mut parents, idx);
-        if let Some((_, bucket)) = groups.iter_mut().find(|(seen, _)| *seen == root) {
-            bucket.push(line);
+        if let Some(&group_idx) = group_index.get(&root) {
+            groups[group_idx].add_line(line);
         } else {
-            groups.push((root, vec![line]));
+            group_index.insert(root, groups.len());
+            groups.push(LayoutRegion::from_line(line));
         }
     }
 
-    let mut regions = groups
-        .into_iter()
-        .map(|(_, mut bucket)| {
-            bucket.sort_by(reading_line_order);
-            let first = bucket.remove(0);
-            let mut region = LayoutRegion::from_line(first);
-            for line in bucket {
-                region.add_line(line);
-            }
-            region
-        })
-        .collect::<Vec<_>>();
-    regions.sort_by(reading_region_order);
-    regions
+    for region in &mut groups {
+        region.lines.sort_by(reading_line_order);
+    }
+
+    groups.sort_by(reading_region_order);
+    groups
 }
 
 fn find_parent(parents: &mut [usize], idx: usize) -> usize {
@@ -2917,16 +3739,15 @@ fn union_parent(parents: &mut [usize], a: usize, b: usize) {
 }
 
 fn line_graph_edge(a: &TextLine, b: &TextLine, rgb: Option<&image::RgbImage>) -> bool {
-    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
+    let min_h = box_height(a.bbox).min(box_height(b.bbox)).max(1);
+    let y_gap = vertical_gap(a.bbox, b.bbox);
+    if y_gap > GRAPH_REGION_VERTICAL_GAP_LIMIT {
         return false;
     }
-
-    let min_h = box_height(a.bbox).min(box_height(b.bbox)).max(1);
     let avg_h = (box_height(a.bbox).max(1) + box_height(b.bbox).max(1)) as f32 / 2.0;
     let y_overlap = vertical_overlap(a.bbox, b.bbox);
     let x_overlap = horizontal_overlap(a.bbox, b.bbox);
     let x_gap = horizontal_gap(a.bbox, b.bbox);
-    let y_gap = vertical_gap(a.bbox, b.bbox);
     let min_w = box_width(a.bbox).min(box_width(b.bbox)).max(1);
     let max_w = box_width(a.bbox).max(box_width(b.bbox)).max(1);
     let overlap_ratio = x_overlap as f32 / min_w as f32;
@@ -2936,18 +3757,28 @@ fn line_graph_edge(a: &TextLine, b: &TextLine, rgb: Option<&image::RgbImage>) ->
 
     let same_visual_row = y_overlap.saturating_mul(100) >= min_h.saturating_mul(35)
         && x_gap <= min_h.saturating_mul(4).max(28);
-    if same_visual_row && width_ratio <= 4.0 {
-        return true;
-    }
 
-    if y_gap as f32 > (avg_h * 2.8).clamp(28.0, 96.0) {
+    let can_merge = if same_visual_row && width_ratio <= 4.0 {
+        true
+    } else {
+        if y_gap as f32 > (avg_h * 2.8).clamp(28.0, 96.0) {
+            return false;
+        }
+        if width_ratio >= 1.85 && y_gap as f32 > avg_h * 1.2 {
+            return false;
+        }
+        (overlap_ratio >= 0.42 || center_close) && width_ratio < 2.4
+    };
+
+    if !can_merge {
         return false;
     }
-    if width_ratio >= 1.85 && y_gap as f32 > avg_h * 1.2 {
+
+    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
         return false;
     }
 
-    (overlap_ratio >= 0.42 || center_close) && width_ratio < 2.4
+    true
 }
 
 fn group_text_lines_into_panel_regions(
@@ -3002,41 +3833,100 @@ fn best_panel_for_line(line: BoxRect, panels: &[BoxRect]) -> Option<usize> {
 }
 
 fn merge_layout_regions(
-    mut regions: Vec<LayoutRegion>,
+    regions: Vec<LayoutRegion>,
     rgb: Option<&image::RgbImage>,
 ) -> Vec<LayoutRegion> {
-    let mut changed = true;
-    while changed {
-        changed = false;
-        'outer: for i in 0..regions.len() {
-            for j in (i + 1)..regions.len() {
-                if regions_should_merge(&regions[i], &regions[j], rgb) {
-                    let other = regions.remove(j);
-                    for line in other.lines {
-                        regions[i].add_line(line);
-                    }
-                    changed = true;
-                    break 'outer;
-                }
+    if regions.len() <= 1 {
+        return regions;
+    }
+
+    let max_region_height = regions
+        .iter()
+        .map(|region| box_height(region.bbox))
+        .max()
+        .unwrap_or(1);
+    let avg_heights: Vec<f32> = regions.iter().map(region_average_line_height).collect();
+    let max_merge_gap = ((max_region_height as f32) * 3.0).max(48.0);
+    let mut sorted_indices: Vec<usize> = (0..regions.len()).collect();
+    sorted_indices.sort_by(|&left, &right| {
+        let a = regions[left].bbox;
+        let b = regions[right].bbox;
+        (a.1, a.0).cmp(&(b.1, b.0))
+    });
+
+    let mut parents = (0..regions.len()).collect::<Vec<_>>();
+    for outer in 0..sorted_indices.len() {
+        let i = sorted_indices[outer];
+        for inner in (outer + 1)..sorted_indices.len() {
+            let j = sorted_indices[inner];
+            if regions[j].bbox.1
+                > regions[i]
+                    .bbox
+                    .3
+                    .saturating_add(max_merge_gap.ceil() as u32)
+            {
+                break;
+            }
+            if regions_should_merge(
+                &regions[i],
+                &regions[j],
+                avg_heights[i],
+                avg_heights[j],
+                rgb,
+            ) {
+                union_parent(&mut parents, i, j);
             }
         }
     }
-    regions
+
+    let mut groups: Vec<LayoutRegion> = Vec::with_capacity(regions.len());
+    let mut group_index: HashMap<usize, usize> = HashMap::with_capacity(regions.len());
+    for (idx, mut region) in regions.into_iter().enumerate() {
+        let root = find_parent(&mut parents, idx);
+        if let Some(&group_idx) = group_index.get(&root) {
+            let target: &mut LayoutRegion = &mut groups[group_idx];
+            for line in region.lines.drain(..) {
+                target.add_line(line);
+            }
+            continue;
+        }
+
+        group_index.insert(root, groups.len());
+        groups.push(region);
+    }
+
+    groups.sort_by(reading_region_order);
+    groups
 }
 
-fn regions_should_merge(a: &LayoutRegion, b: &LayoutRegion, rgb: Option<&image::RgbImage>) -> bool {
-    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
-        return false;
-    }
+fn regions_should_merge(
+    a: &LayoutRegion,
+    b: &LayoutRegion,
+    avg_h_a: f32,
+    avg_h_b: f32,
+    rgb: Option<&image::RgbImage>,
+) -> bool {
     let overlap = horizontal_overlap(a.bbox, b.bbox) as f32;
     let min_width = box_width(a.bbox).min(box_width(b.bbox)).max(1) as f32;
     let overlap_ratio = overlap / min_width;
+    if overlap_ratio < 0.45 {
+        return false;
+    }
     let y_gap = vertical_gap(a.bbox, b.bbox) as f32;
-    let avg_h = region_average_line_height(a).max(region_average_line_height(b));
+    if y_gap > (avg_h_a.max(avg_h_b) * 3.0).max(48.0) {
+        return false;
+    }
     let width_ratio = box_width(a.bbox).max(box_width(b.bbox)).max(1) as f32
         / box_width(a.bbox).min(box_width(b.bbox)).max(1) as f32;
+    if width_ratio >= 1.75 {
+        return false;
+    }
 
-    overlap_ratio >= 0.45 && y_gap <= (avg_h * 3.0).max(48.0) && width_ratio < 1.75
+    if rgb.is_some_and(|rgb| visual_separator_between_boxes(rgb, a.bbox, b.bbox)) {
+        return false;
+    }
+
+    true
 }
 
 fn reading_line_order(a: &TextLine, b: &TextLine) -> std::cmp::Ordering {
@@ -4211,6 +5101,99 @@ fn boxes_significantly_overlap(a: BoxRect, b: BoxRect) -> bool {
     area as f32 / min_area as f32 >= 0.50
 }
 
+#[derive(Copy, Clone)]
+struct SupplementSeenBox {
+    bbox: BoxRect,
+    has_reliable_text: bool,
+}
+
+struct SupplementSeenIndex {
+    buckets: Vec<Vec<usize>>,
+    boxes: Vec<BoxRect>,
+    bucket_count: usize,
+}
+
+impl SupplementSeenIndex {
+    fn new(image_height: u32) -> Self {
+        let bucket_count =
+            (image_height as usize / BOX_DEDUPE_BUCKET_SIZE as usize).saturating_add(1);
+        Self {
+            buckets: vec![Vec::new(); bucket_count.max(1)],
+            boxes: Vec::new(),
+            bucket_count: bucket_count.max(1),
+        }
+    }
+
+    fn insert_if_reliable(&mut self, b: BoxRect, has_reliable_text: bool) {
+        if !has_reliable_text {
+            return;
+        }
+        let idx = self.boxes.len();
+        self.boxes.push(b);
+        let (start_bucket, end_bucket) = box_bucket_range(b, self.bucket_count);
+        for bucket_idx in start_bucket..=end_bucket {
+            self.buckets[bucket_idx].push(idx);
+        }
+    }
+
+    fn is_redundant(&self, candidate: BoxRect) -> bool {
+        if self.boxes.is_empty() {
+            return false;
+        }
+        let (start_bucket, end_bucket) = box_bucket_range(candidate, self.bucket_count);
+        let candidate_area = box_area(candidate).max(1);
+        for bucket_idx in start_bucket..=end_bucket {
+            for &idx in &self.buckets[bucket_idx] {
+                if idx >= self.boxes.len() {
+                    continue;
+                }
+                let seen_box = self.boxes[idx];
+                let overlap = box_intersection_area(candidate, seen_box);
+                if overlap == 0 {
+                    continue;
+                }
+                let seen_area = box_area(seen_box).max(1);
+                if overlap as f32 / candidate_area as f32 >= 0.90
+                    || overlap as f32 / seen_area as f32 >= 0.90
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn supplement_box_is_redundant(candidate: BoxRect, seen_boxes: &[SupplementSeenBox]) -> bool {
+    let candidate_area = box_area(candidate).max(1);
+    seen_boxes.iter().any(|seen| {
+        if !seen.has_reliable_text {
+            return false;
+        }
+        let overlap = box_intersection_area(candidate, seen.bbox);
+        if overlap == 0 {
+            return false;
+        }
+        let seen_area = box_area(seen.bbox).max(1);
+        overlap as f32 / candidate_area as f32 >= 0.90 || overlap as f32 / seen_area as f32 >= 0.90
+    })
+}
+
+fn supplement_lines_are_reliable(lines: &[TextLine]) -> bool {
+    if lines.is_empty() {
+        return false;
+    }
+    let total_lines = lines.len();
+    lines.iter().any(|line| {
+        let text = line.text.trim();
+        !text.is_empty()
+            && !is_low_value_short_ocr_line(text)
+            && !is_low_value_text_line(line, total_lines)
+            && line.confidence >= MIN_ACCEPT_REC_CONFIDENCE
+            && readable_ratio(text) >= 0.45
+    })
+}
+
 fn box_intersection_area(a: BoxRect, b: BoxRect) -> u64 {
     let x0 = a.0.max(b.0);
     let y0 = a.1.max(b.1);
@@ -4223,7 +5206,7 @@ fn box_intersection_area(a: BoxRect, b: BoxRect) -> u64 {
 }
 
 fn dedupe_text_lines(lines: &[TextLine]) -> Vec<TextLine> {
-    let mut clusters: Vec<Vec<TextLine>> = Vec::new();
+    let mut clusters: Vec<Vec<TextLine>> = Vec::with_capacity(lines.len());
     'candidate: for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
         for cluster in &mut clusters {
             if cluster
@@ -4751,6 +5734,27 @@ fn quality_fallback_family_budget(text: &str) -> usize {
     }
 }
 
+fn quality_fallback_enhancement_variant_budget(
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+) -> usize {
+    if text.trim().is_empty() {
+        return MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS;
+    }
+    if confidence <= 0.0 || confidence < 0.40 {
+        return MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS;
+    }
+    if confidence < 0.58 || det_box_count >= 6 || line_count == 0 {
+        return (MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS - 1).max(1);
+    }
+    if line_count >= det_box_count.max(1) {
+        return 4;
+    }
+    MAX_ENHANCEMENT_VARIANTS_PER_PASS
+}
+
 fn consume_quality_fallback_family(budget: &mut usize) -> bool {
     if *budget == 0 {
         return false;
@@ -4832,15 +5836,38 @@ fn recognition_candidate_is_better(
             && candidate.confidence + 0.08 >= current.confidence)
 }
 
+fn local_recognition_candidate_is_final(candidate: &RecCandidate) -> bool {
+    if !is_usable_recognition(candidate) {
+        return false;
+    }
+    if candidate.confidence < 0.92 {
+        return false;
+    }
+    if candidate.avg_margin < 0.12 || candidate.min_margin < 0.04 {
+        return false;
+    }
+    if candidate.char_min_confidence < 0.92 {
+        return false;
+    }
+    let text = normalize_ocr_line(&candidate.text);
+    if text.chars().count() <= 1 {
+        return false;
+    }
+    readable_ratio(&candidate.text) >= 0.90
+}
+
 fn should_try_alt_recognition(primary: &RecCandidate) -> bool {
-    let text = primary.text.trim();
+    let text = normalize_recognized_text(&primary.text);
     if text.is_empty() {
         return true;
     }
     if !is_usable_recognition(primary) {
         return true;
     }
-    let ascii = ascii_ratio(text);
+    if is_stable_short_text_candidate(primary, &text, MAX_FAST_TEXT_CHARS) {
+        return false;
+    }
+    let ascii = ascii_ratio(&text);
     if ascii >= 0.35 {
         return true;
     }
@@ -4930,6 +5957,13 @@ fn prioritize_supplement_candidate_boxes(
         .filter(|b| !color_region_box_covered_by_reliable_text(*b, existing_regions))
         .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
         .collect::<Vec<_>>();
+    if scored.len() > MAX_SUPPLEMENT_CANDIDATE_SCORE_PRESELECT {
+        let keep = MAX_SUPPLEMENT_CANDIDATE_SCORE_PRESELECT.max(1);
+        scored.select_nth_unstable_by(keep - 1, |a, b| {
+            supplement_candidate_score_cmp(a, b, focus_band)
+        });
+        scored.truncate(keep);
+    }
     sort_supplement_candidate_scores(&mut scored, focus_band);
     scored = retain_focus_prioritized_candidates(scored, focus_band);
     scored.into_iter().map(|(b, _)| b).collect()
@@ -5050,12 +6084,18 @@ fn supplement_focus_rank(b: BoxRect, focus_band: Option<(u32, u32)>) -> u8 {
 }
 
 fn sort_supplement_candidate_scores(scored: &mut [(BoxRect, i64)], focus_band: Option<(u32, u32)>) {
-    scored.sort_by(|a, b| {
-        supplement_focus_rank(b.0, focus_band)
-            .cmp(&supplement_focus_rank(a.0, focus_band))
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| reading_box_order(&a.0, &b.0))
-    });
+    scored.sort_by(|a, b| supplement_candidate_score_cmp(a, b, focus_band));
+}
+
+fn supplement_candidate_score_cmp(
+    a: &(BoxRect, i64),
+    b: &(BoxRect, i64),
+    focus_band: Option<(u32, u32)>,
+) -> std::cmp::Ordering {
+    supplement_focus_rank(b.0, focus_band)
+        .cmp(&supplement_focus_rank(a.0, focus_band))
+        .then_with(|| b.1.cmp(&a.1))
+        .then_with(|| reading_box_order(&a.0, &b.0))
 }
 
 fn retain_focus_prioritized_candidates(
@@ -5153,7 +6193,7 @@ fn layered_color_region_text_boxes(
         return Vec::new();
     }
 
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<BoxRect> = Vec::new();
     for panel in panels {
         if box_width(panel) < 32 || box_height(panel) < 16 {
             continue;
@@ -5166,6 +6206,7 @@ fn layered_color_region_text_boxes(
         candidates.extend(layered_text_boxes_in_panel(image, panel, 0, 16));
     }
     candidates = nms_boxes(candidates, 0.55);
+    candidates = dedupe_box_candidates(candidates);
     let mut candidates = prioritize_supplement_candidate_boxes(image, candidates, existing_regions);
     candidates.truncate(MAX_COLOR_REGION_CANDIDATES);
     candidates
@@ -5233,8 +6274,7 @@ fn layered_text_boxes_in_panel(
         }
     }
 
-    boxes.sort_by(reading_box_order);
-    boxes.truncate(max_boxes);
+    boxes = sort_and_truncate_by(boxes, max_boxes, reading_box_order);
     boxes
 }
 
@@ -5260,8 +6300,7 @@ fn dominant_color_layer_text_boxes(image: &DynamicImage, max_boxes: usize) -> Ve
         ));
         boxes = nms_boxes(boxes, 0.60);
     }
-    boxes.sort_by(reading_box_order);
-    boxes.truncate(max_boxes);
+    boxes = sort_and_truncate_by(boxes, max_boxes, reading_box_order);
     boxes
 }
 
@@ -5367,9 +6406,7 @@ fn component_line_boxes_from_mask(
     }
     let mut merged = merge_component_boxes_into_lines(components);
     merged.retain(|b| box_width(*b) >= 8 && box_height(*b) >= 4);
-    merged.sort_by(reading_box_order);
-    merged.truncate(max_boxes);
-    merged
+    sort_and_truncate_by(merged, max_boxes, reading_box_order)
 }
 
 fn component_box_is_text_like(b: BoxRect, foreground_count: usize) -> bool {
@@ -5518,10 +6555,14 @@ fn color_region_det_candidate_boxes(
         .filter(|b| !color_region_det_box_covered_by_reliable_text(*b, existing_regions))
         .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
         .collect::<Vec<_>>();
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
-    scored.truncate(max_boxes);
-    scored.sort_by(|a, b| reading_box_order(&a.0, &b.0));
-    (total, scored.into_iter().map(|(b, _)| b).collect())
+    if scored.is_empty() {
+        return (total, Vec::new());
+    }
+    scored = retain_top_scored_candidates(scored, max_boxes);
+    let mut boxes = scored.into_iter().map(|(b, _)| b).collect::<Vec<_>>();
+    boxes = dedupe_box_candidates(boxes);
+    boxes = sort_and_truncate_by(boxes, max_boxes, reading_box_order);
+    (total, boxes)
 }
 
 fn color_region_det_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
@@ -5695,6 +6736,11 @@ fn should_continue_eager_supplements(
     if text.trim().is_empty() {
         return true;
     }
+    let stable_hint = normalize_recognized_text(text);
+    let stable_chars = recognized_char_count(&stable_hint);
+    if confidence >= 0.95 && stable_chars >= 6 && !regions_have_repairable_lines(regions) {
+        return false;
+    }
     if confidence > 0.0 && confidence < 0.60 {
         return true;
     }
@@ -5705,6 +6751,54 @@ fn should_continue_eager_supplements(
         return true;
     }
     regions_have_repairable_lines(regions)
+}
+
+fn should_continue_eager_supplement_pass(
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+    previous_text: &str,
+    previous_confidence: f32,
+    previous_line_count: usize,
+) -> bool {
+    should_continue_eager_supplements(text, confidence, det_box_count, line_count, regions)
+        && (supplement_pass_made_progress(
+            previous_text,
+            previous_confidence,
+            previous_line_count,
+            text,
+            confidence,
+            line_count,
+        ) || regions_have_repairable_lines(regions))
+}
+
+fn supplement_pass_made_progress(
+    previous_text: &str,
+    previous_confidence: f32,
+    previous_line_count: usize,
+    current_text: &str,
+    current_confidence: f32,
+    current_line_count: usize,
+) -> bool {
+    let previous_chars = recognized_char_count(previous_text);
+    let current_chars = recognized_char_count(current_text);
+    if current_chars >= previous_chars + MIN_SUPPLEMENT_CHAR_GROWTH {
+        return true;
+    }
+    if current_line_count > previous_line_count {
+        return true;
+    }
+    let gain_requirement = if previous_chars <= 6 || current_chars <= 6 {
+        MIN_SUPPLEMENT_CONFIDENCE_GAIN.min(0.02)
+    } else {
+        MIN_SUPPLEMENT_CONFIDENCE_GAIN
+    };
+    if current_confidence >= previous_confidence + gain_requirement {
+        return true;
+    }
+    false
 }
 
 fn supplement_box_is_worth_recognition(b: BoxRect) -> bool {
@@ -5759,6 +6853,30 @@ fn text_line_count(text: &str) -> usize {
     text.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
+fn should_short_circuit_crop_enhancement(
+    best: Option<&RecCandidate>,
+    stale_streak: usize,
+    variant_budget: usize,
+) -> bool {
+    if stale_streak < 2 || variant_budget < 3 {
+        return false;
+    }
+
+    let Some(best) = best else {
+        return false;
+    };
+    if best.confidence >= 0.96 {
+        return true;
+    }
+
+    let normalized_text = normalize_recognized_text(&best.text);
+    let len = normalized_text.chars().count();
+    if best.confidence >= 0.90 && len >= 6 {
+        return true;
+    }
+    best.confidence >= 0.84 && len >= 16
+}
+
 type BoxRect = (u32, u32, u32, u32);
 
 impl OrtOcrEngine {
@@ -5770,7 +6888,9 @@ impl OrtOcrEngine {
     ) -> Result<Vec<DetectionBox>, String> {
         let (det_input, det_shape, sx, sy, src_w, src_h) =
             preprocess_det_image(img, cfg.det_img_side)?;
-        let (det_output, _det_shapes) = ort::run_session(&self.det, &[det_input], &[det_shape])?;
+        let det_input = [det_input.as_slice()];
+        let det_shape = [det_shape.as_slice()];
+        let (det_output, _det_shapes) = ort::run_session(&self.det, &det_input, &det_shape)?;
         let map = &det_output[0];
         let shape = &_det_shapes[0];
         let map_h = shape.get(2).copied().unwrap_or(960) as u32;
@@ -5807,6 +6927,7 @@ impl OrtOcrEngine {
         let scaled = nms_boxes(scaled, 0.35);
         let source_rgb = to_rgb_on_white(img);
         let mut merged = merge_nearby_detection_boxes(&source_rgb, scaled.clone());
+        merged = normalize_detection_boxes(merged);
 
         merged.retain(|(x0, y0, x1, y1)| x1 > x0 && y1 > y0);
         merged.sort_by(reading_box_order);
@@ -5814,7 +6935,7 @@ impl OrtOcrEngine {
             .into_iter()
             .map(|bbox| DetectionBox {
                 alternatives: if include_raw_split_candidates {
-                    raw_split_detection_candidates(bbox, &scaled)
+                    dedupe_box_candidates(raw_split_detection_candidates(bbox, &scaled))
                 } else {
                     Vec::new()
                 },
@@ -5855,6 +6976,153 @@ fn merge_nearby_detection_boxes(rgb: &image::RgbImage, mut boxes: Vec<BoxRect>) 
         merged.push(b);
     }
     merged
+}
+
+fn normalize_detection_boxes(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
+    dedupe_box_candidates_with_overlap_threshold(
+        boxes,
+        DETECTION_CONTAINMENT_OVERLAP,
+        DETECTION_SIMILARITY_OVERLAP,
+    )
+}
+
+fn dedupe_box_candidates(mut boxes: Vec<BoxRect>) -> Vec<BoxRect> {
+    dedupe_box_candidates_with_overlap_threshold(
+        boxes,
+        DETECTION_CONTAINMENT_OVERLAP,
+        DETECTION_SIMILARITY_OVERLAP,
+    )
+}
+
+fn dedupe_box_candidates_with_overlap_threshold(
+    mut boxes: Vec<BoxRect>,
+    containment_overlap: f32,
+    similarity_overlap: f32,
+) -> Vec<BoxRect> {
+    if boxes.len() <= 1 {
+        return boxes;
+    }
+
+    boxes.retain(|b| b.2 > b.0 && b.3 > b.1);
+    if boxes.len() <= 1 {
+        return boxes;
+    }
+
+    let mut deduped = Vec::with_capacity(boxes.len());
+    let mut seen: HashSet<BoxRect> = HashSet::with_capacity(boxes.len());
+    for b in boxes {
+        if seen.insert(b) {
+            deduped.push(b);
+        }
+    }
+    if deduped.len() <= 1 {
+        return deduped;
+    }
+    boxes = deduped;
+
+    boxes.sort_by(|a, b| box_area(*b).cmp(&box_area(*a)));
+
+    let max_bucket = boxes
+        .iter()
+        .map(|b| b.3)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(BOX_DEDUPE_BUCKET_SIZE.saturating_sub(1))
+        .max(1);
+    let bucket_count = ((max_bucket as usize) / BOX_DEDUPE_BUCKET_SIZE as usize).saturating_add(1);
+    let mut kept: Vec<BoxRect> = Vec::with_capacity(boxes.len());
+    let mut bucketed_kept: Vec<Vec<usize>> = vec![Vec::new(); bucket_count.max(1)];
+
+    for candidate in boxes {
+        let mut redundant = false;
+        let (start_bucket, end_bucket) = box_bucket_range(candidate, bucket_count);
+        for bucket_idx in start_bucket..=end_bucket {
+            for &kept_idx in &bucketed_kept[bucket_idx] {
+                let kept_box = kept[kept_idx];
+                if candidate.2 <= kept_box.0
+                    || candidate.0 >= kept_box.2
+                    || candidate.3 <= kept_box.1
+                    || candidate.1 >= kept_box.3
+                {
+                    continue;
+                }
+                let overlap = box_intersection_area(candidate, kept_box);
+                if overlap == 0 {
+                    continue;
+                }
+                let candidate_area = box_area(candidate).max(1);
+                let kept_area = box_area(kept_box).max(1);
+                if overlap as f32 / candidate_area.min(kept_area) as f32 >= containment_overlap
+                    || box_iou(candidate, kept_box) >= similarity_overlap
+                {
+                    redundant = true;
+                    break;
+                }
+            }
+            if redundant {
+                break;
+            }
+        }
+        if redundant {
+            continue;
+        }
+
+        let kept_idx = kept.len();
+        kept.push(candidate);
+        for bucket_idx in start_bucket..=end_bucket {
+            bucketed_kept[bucket_idx].push(kept_idx);
+        }
+    }
+
+    kept.sort_by(reading_box_order);
+    kept
+}
+
+fn box_bucket_range(candidate: BoxRect, bucket_count: usize) -> (usize, usize) {
+    let start = (candidate.1 / BOX_DEDUPE_BUCKET_SIZE) as usize;
+    let end = (candidate.3.saturating_sub(1) / BOX_DEDUPE_BUCKET_SIZE) as usize;
+    (
+        start.min(bucket_count.saturating_sub(1)),
+        end.min(bucket_count.saturating_sub(1)),
+    )
+}
+
+fn retain_top_scored_candidates_with_counts(
+    mut scored: Vec<(BoxRect, usize, u64)>,
+    max_count: usize,
+) -> Vec<(BoxRect, usize, u64)> {
+    if scored.is_empty() || max_count == 0 {
+        return Vec::new();
+    }
+    let keep = max_count.max(1);
+    if scored.len() > keep {
+        scored.select_nth_unstable_by(keep - 1, |a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+        scored.truncate(keep);
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    scored
+}
+
+fn score_reading_order_cmp(a: &(BoxRect, i64), b: &(BoxRect, i64)) -> std::cmp::Ordering {
+    b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0))
+}
+
+fn retain_top_scored_candidates(
+    mut scored: Vec<(BoxRect, i64)>,
+    max_count: usize,
+) -> Vec<(BoxRect, i64)> {
+    if scored.is_empty() || max_count == 0 {
+        return Vec::new();
+    }
+    if scored.len() <= max_count {
+        scored.sort_by(score_reading_order_cmp);
+        return scored;
+    }
+    let keep = max_count.max(1);
+    scored.select_nth_unstable_by(keep - 1, score_reading_order_cmp);
+    scored.truncate(keep);
+    scored.sort_by(score_reading_order_cmp);
+    scored
 }
 
 fn boxes_have_merge_separator(rgb: &image::RgbImage, left: BoxRect, right: BoxRect) -> bool {
@@ -6048,9 +7316,10 @@ fn page_region_boxes(image: &DynamicImage, detection_boxes: &[DetectionBox]) -> 
             }
             boxes.push(det_box);
         }
-        boxes.sort_by_key(|b| (b.0, b.1));
     }
-    boxes.truncate(MAX_PAGE_REGION_DET_PASSES);
+    boxes = sort_and_truncate_by(boxes, MAX_PAGE_REGION_DET_PASSES, |a, b| {
+        (a.0, a.1).cmp(&(b.0, b.1))
+    });
     boxes
 }
 
@@ -6068,13 +7337,14 @@ fn panel_child_candidate_boxes(image: &DynamicImage) -> Vec<BoxRect> {
             continue;
         }
         let score = supplemental_text_candidate_score(image, b).unwrap_or_default();
-        candidates.push((b, score));
+        candidates.push((b, score as i64));
     }
 
     if candidates.len() < 2 {
         return Vec::new();
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
+    let candidate_budget = MAX_PANEL_CHILD_CANDIDATES.saturating_mul(4).max(16);
+    candidates = retain_top_scored_candidates(candidates, candidate_budget);
 
     let mut kept = Vec::new();
     for (b, _) in candidates {
@@ -6136,7 +7406,7 @@ fn high_res_tile_boxes(image: &DynamicImage, det_img_side: usize) -> Vec<BoxRect
             let b = clamp_box((*x, y, x1, y1), w, h);
             let score = tile_text_score(image, b);
             if score > 0 {
-                scored.push((b, score));
+                scored.push((b, score as i64));
             }
         }
     }
@@ -6144,8 +7414,8 @@ fn high_res_tile_boxes(image: &DynamicImage, det_img_side: usize) -> Vec<BoxRect
     if scored.is_empty() {
         return Vec::new();
     }
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
-    scored.truncate(MAX_HIGH_RES_TILE_DET_PASSES);
+    let candidate_budget = MAX_HIGH_RES_TILE_DET_PASSES.saturating_mul(2).max(12);
+    scored = retain_top_scored_candidates(scored, candidate_budget);
     scored.sort_by(|a, b| reading_box_order(&a.0, &b.0));
     scored.into_iter().map(|(b, _)| b).collect()
 }
@@ -6187,8 +7457,11 @@ fn uncovered_visual_text_boxes(
     }
 
     boxes = nms_boxes(boxes, 0.55);
-    boxes.sort_by(reading_box_order);
-    boxes.truncate(MAX_EAGER_VISUAL_REGION_RECOGNITIONS.saturating_mul(2));
+    boxes = sort_and_truncate_by(
+        boxes,
+        MAX_EAGER_VISUAL_REGION_RECOGNITIONS.saturating_mul(2),
+        reading_box_order,
+    );
     boxes
 }
 
@@ -6385,7 +7658,7 @@ fn visual_page_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) -> Vec<
         return Vec::new();
     }
 
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(BoxRect, usize)> = Vec::new();
     for idx in 0..bands.len() {
         let (band_x0, band_x1, score) = bands[idx];
         let x0 = if idx == 0 {
@@ -6405,14 +7678,23 @@ fn visual_page_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) -> Vec<
         {
             continue;
         }
-        candidates.push((b, score));
+        candidates.push((b, score as usize));
     }
 
     if candidates.len() < 2 {
         return Vec::new();
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    let candidate_budget = MAX_PAGE_REGION_DET_PASSES.saturating_mul(4).max(12);
+    candidates = retain_top_scored_candidates_with_counts(
+        candidates
+            .into_iter()
+            .map(|(b, score)| (b, 0usize, score as u64))
+            .collect(),
+        candidate_budget,
+    )
+    .into_iter()
+    .map(|(b, _, _)| (b, 0usize))
+    .collect();
     candidates.sort_by_key(|(b, _)| (b.0, b.1));
     candidates.into_iter().map(|(b, _)| b).collect()
 }
@@ -6441,7 +7723,7 @@ fn visual_page_grid_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) ->
         return Vec::new();
     }
 
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(BoxRect, usize)> = Vec::new();
     for (row_start, row_end) in row_bands {
         let band_h = row_end.saturating_sub(row_start) + 1;
         let col_bands = projection_bands(
@@ -6501,8 +7783,17 @@ fn visual_page_grid_region_boxes_from_mask(mask: &[bool], w: usize, h: usize) ->
     if candidates.len() < 2 {
         return Vec::new();
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reading_box_order(&a.0, &b.0)));
-    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    let candidate_budget = MAX_PAGE_REGION_DET_PASSES.saturating_mul(4).max(12);
+    candidates = retain_top_scored_candidates_with_counts(
+        candidates
+            .into_iter()
+            .map(|(b, score)| (b, 0usize, score as u64))
+            .collect(),
+        candidate_budget,
+    )
+    .into_iter()
+    .map(|(b, _, _)| (b, 0usize))
+    .collect();
     candidates.sort_by(|a, b| reading_box_order(&a.0, &b.0));
     candidates.into_iter().map(|(b, _)| b).collect()
 }
@@ -6638,8 +7929,8 @@ fn page_region_boxes_from_detection_boxes(
         return Vec::new();
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-    candidates.truncate(MAX_PAGE_REGION_DET_PASSES);
+    let candidate_budget = MAX_PAGE_REGION_DET_PASSES.saturating_mul(4).max(12);
+    candidates = retain_top_scored_candidates_with_counts(candidates, candidate_budget);
     candidates.sort_by_key(|(b, _, _)| (b.0, b.1));
     candidates.into_iter().map(|(b, _, _)| b).collect()
 }
@@ -6678,6 +7969,9 @@ fn reset_ocr_rec_perf() {
     OCR_REC_PERF.with(|perf| {
         *perf.borrow_mut() = OcrRecPerf::default();
     });
+    OCR_WORK_PERF.with(|perf| {
+        *perf.borrow_mut() = OcrWorkPerf::default();
+    });
 }
 
 fn record_ocr_rec_perf(variant: RecVariant, elapsed_ms: u64) {
@@ -6700,6 +7994,157 @@ fn read_ocr_rec_perf() -> OcrRecPerf {
     OCR_REC_PERF.with(|perf| *perf.borrow())
 }
 
+fn ocr_work_perf_record_rec_cache_hit() {
+    OCR_WORK_PERF.with(|perf| {
+        let mut perf = perf.borrow_mut();
+        perf.rec_cache_hit_count = perf.rec_cache_hit_count.saturating_add(1);
+    });
+}
+
+fn ocr_work_perf_record_rec_cache_miss() {
+    OCR_WORK_PERF.with(|perf| {
+        let mut perf = perf.borrow_mut();
+        perf.rec_cache_miss_count = perf.rec_cache_miss_count.saturating_add(1);
+    });
+}
+
+fn ocr_work_perf_record_preprocess_call(elapsed_ms: u64) {
+    OCR_WORK_PERF.with(|perf| {
+        let mut perf = perf.borrow_mut();
+        perf.preprocess_call_count = perf.preprocess_call_count.saturating_add(1);
+        perf.preprocess_ms = perf.preprocess_ms.saturating_add(elapsed_ms);
+    });
+}
+
+fn ocr_work_perf_record_variant_candidates(count: usize) {
+    OCR_WORK_PERF.with(|perf| {
+        let mut perf = perf.borrow_mut();
+        perf.variant_candidate_count = perf.variant_candidate_count.saturating_add(count as u64);
+    });
+}
+
+fn ocr_work_perf_snapshot() -> OcrWorkPerf {
+    OCR_WORK_PERF.with(|perf| *perf.borrow())
+}
+
+fn dynamic_image_signature_cached(image: &DynamicImage) -> u64 {
+    let key = dynamic_image_signature_cache_key(image);
+    if let Some(key) = key {
+        if let Some(cached) = OCR_REC_IMAGE_SIGNATURE_CACHE.with(|cache| cache.borrow().get(&key)) {
+            return cached;
+        }
+        let signature = dynamic_image_signature_uncached(image);
+        OCR_REC_IMAGE_SIGNATURE_CACHE.with(|cache| cache.borrow_mut().put(key, signature));
+        signature
+    } else {
+        dynamic_image_signature_uncached(image)
+    }
+}
+
+fn dynamic_image_signature(image: &DynamicImage) -> u64 {
+    match image {
+        DynamicImage::ImageLuma8(gray) => {
+            let w = gray.width();
+            let h = gray.height();
+            let mut hash = ((w as u64) << 32) | h as u64;
+            let bytes = gray.as_raw();
+            let total = (w as usize).saturating_mul(h as usize).max(1);
+            let step = (total / 64).max(1);
+            for idx in (0..total).step_by(step) {
+                let value = bytes[idx] as u64;
+                hash = hash.wrapping_mul(1_099_511_628_211).wrapping_add(value + 1);
+            }
+            hash
+        }
+        DynamicImage::ImageRgb8(rgb) => {
+            let w = rgb.width();
+            let h = rgb.height();
+            let mut hash = ((w as u64) << 32) | h as u64;
+            let bytes = rgb.as_raw();
+            let total = (w as usize).saturating_mul(h as usize).max(1);
+            let step = (total / 64).max(1);
+            for idx in (0..total).step_by(step) {
+                let base = idx * 3;
+                if base + 2 >= bytes.len() {
+                    break;
+                }
+                let r = bytes[base] as u64;
+                let g = bytes[base + 1] as u64;
+                let b = bytes[base + 2] as u64;
+                let luma = (r * 77 + g * 150 + b * 29) >> 8;
+                hash = hash.wrapping_mul(1_099_511_628_211).wrapping_add(luma + 1);
+            }
+            hash
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let w = rgba.width();
+            let h = rgba.height();
+            let mut hash = ((w as u64) << 32) | h as u64;
+            let bytes = rgba.as_raw();
+            let total = (w as usize).saturating_mul(h as usize).max(1);
+            let step = (total / 64).max(1);
+            for idx in (0..total).step_by(step) {
+                let base = idx * 4;
+                if base + 2 >= bytes.len() {
+                    break;
+                }
+                let r = bytes[base] as u64;
+                let g = bytes[base + 1] as u64;
+                let b = bytes[base + 2] as u64;
+                let luma = (r * 77 + g * 150 + b * 29) >> 8;
+                hash = hash
+                    .wrapping_mul(1_099_511_628_211)
+                    .wrapping_add((luma + 1) ^ (bytes[base + 3] as u64));
+            }
+            hash
+        }
+        _ => {
+            let gray = image.to_luma8();
+            let (w, h) = gray.dimensions();
+            let mut hash = ((w as u64) << 32) | h as u64;
+            let total = (w as usize).saturating_mul(h as usize).max(1);
+            let step = (total / 64).max(1);
+            for idx in (0..total).step_by(step) {
+                hash = hash
+                    .wrapping_mul(1_099_511_628_211)
+                    .wrapping_add(gray.as_raw()[idx] as u64 + 1);
+            }
+            hash
+        }
+    }
+}
+
+fn dynamic_image_signature_cache_key(image: &DynamicImage) -> Option<ImageSignatureCacheKey> {
+    match image {
+        DynamicImage::ImageLuma8(image) => Some(ImageSignatureCacheKey {
+            format: 1,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+        }),
+        DynamicImage::ImageRgb8(image) => Some(ImageSignatureCacheKey {
+            format: 2,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+        }),
+        DynamicImage::ImageRgba8(image) => Some(ImageSignatureCacheKey {
+            format: 3,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+        }),
+        _ => None,
+    }
+}
+
+fn dynamic_image_signature_uncached(image: &DynamicImage) -> u64 {
+    dynamic_image_signature(image)
+}
+
 fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
     let content = if let Some(p) = path {
         std::fs::read_to_string(p).unwrap_or_else(|_| embedded.to_string())
@@ -6711,6 +8156,42 @@ fn load_dict(path: Option<&str>, embedded: &str) -> Vec<String> {
         .map(|line| line.to_string())
         .filter(|line| !line.is_empty())
         .collect()
+}
+
+fn preprocess_rec_image_cached(
+    image: &DynamicImage,
+    target_h: usize,
+    target_w: usize,
+) -> Result<(Arc<Vec<f32>>, Vec<usize>), String> {
+    let image_signature = dynamic_image_signature_cached(image);
+    preprocess_rec_image_cached_with_signature(image, image_signature, target_h, target_w)
+}
+
+fn preprocess_rec_image_cached_with_signature(
+    image: &DynamicImage,
+    image_signature: u64,
+    target_h: usize,
+    target_w: usize,
+) -> Result<(Arc<Vec<f32>>, Vec<usize>), String> {
+    let key = PreprocessCacheKey {
+        image_signature,
+        target_w,
+        target_h,
+    };
+
+    if let Some(cached) = OCR_REC_PREPROCESS_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
+        return Ok((cached.input, cached.shape));
+    }
+
+    let start = Instant::now();
+    let (rec_input, rec_shape) = preprocess_rec_image(image, target_h, target_w)?;
+    OCR_REC_PREPROCESS_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .put(key, rec_input.clone(), rec_shape.clone())
+    });
+    ocr_work_perf_record_preprocess_call(elapsed_ms(start));
+    Ok((Arc::new(rec_input), rec_shape))
 }
 
 fn preprocess_det_image(
@@ -6991,15 +8472,47 @@ fn expand_box(
 
 fn nms_boxes(mut boxes: Vec<BoxRect>, iou_threshold: f32) -> Vec<BoxRect> {
     boxes.retain(|b| b.2 > b.0 && b.3 > b.1);
+    if boxes.is_empty() {
+        return Vec::new();
+    }
     boxes.sort_by(|a, b| box_area(*b).cmp(&box_area(*a)));
 
+    let bucket_count = boxes
+        .iter()
+        .map(|b| b.3)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(BOX_DEDUPE_BUCKET_SIZE.saturating_sub(1))
+        .max(1);
+    let bucket_count = (bucket_count as usize / BOX_DEDUPE_BUCKET_SIZE as usize).saturating_add(1);
+
     let mut kept: Vec<BoxRect> = Vec::new();
+    let mut bucketed_kept: Vec<Vec<usize>> = vec![Vec::new(); bucket_count.max(1)];
     for b in boxes {
-        if kept
-            .iter()
-            .all(|kept_box| box_iou(b, *kept_box) <= iou_threshold)
-        {
-            kept.push(b);
+        let mut redundant = false;
+        let (start_bucket, end_bucket) = box_bucket_range(b, bucketed_kept.len());
+        for bucket_idx in start_bucket..=end_bucket {
+            for &kept_idx in &bucketed_kept[bucket_idx] {
+                if kept_idx >= kept.len() {
+                    continue;
+                }
+                if box_iou(b, kept[kept_idx]) > iou_threshold {
+                    redundant = true;
+                    break;
+                }
+            }
+            if redundant {
+                break;
+            }
+        }
+        if redundant {
+            continue;
+        }
+
+        let kept_idx = kept.len();
+        kept.push(b);
+        for bucket_idx in start_bucket..=end_bucket {
+            bucketed_kept[bucket_idx].push(kept_idx);
         }
     }
     kept.sort_by_key(|b| (b.1, b.0));
@@ -7082,26 +8595,131 @@ fn preprocess_rec_image(
     target_h: usize,
     target_w: usize,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let rgb = to_rgb_on_white(image);
-    let (src_w, src_h) = rgb.dimensions();
+    let (src_w, src_h) = image.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return Err("empty recognition image".to_string());
+    }
+    if target_h == 0 || target_w == 0 {
+        return Err("invalid recognition dimensions".to_string());
+    }
     let ratio = src_w as f32 / src_h as f32;
     let mut resized_w = (ratio * target_h as f32).ceil() as usize;
     resized_w = resized_w.clamp(1, target_w);
-    let resized = image::imageops::resize(
-        &rgb,
-        resized_w as u32,
-        target_h as u32,
-        FilterType::Triangle,
-    );
-
     let mut data = vec![0f32; 1 * 3 * target_h * target_w];
-    for y in 0..target_h {
-        for x in 0..resized_w {
-            let px = resized.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                let v = (px[2 - c] as f32 / 255.0 - 0.5) / 0.5;
-                let idx = c * target_h * target_w + y * target_w + x;
-                data[idx] = v;
+    match image {
+        DynamicImage::ImageLuma8(gray) => {
+            let resized = image::imageops::resize(
+                gray,
+                resized_w as u32,
+                target_h as u32,
+                FilterType::Triangle,
+            );
+            let resized_w = resized_w as usize;
+            let row_len = target_h * target_w;
+            let mid = resized_w.min(target_w);
+            let raw = resized.as_raw();
+            for y in 0..target_h {
+                let row_offset = y * resized_w;
+                let out_base = y * target_w;
+                for x in 0..mid {
+                    let v = (raw[row_offset + x] as f32 - 127.5) / 127.5;
+                    let dst = out_base + x;
+                    data[dst] = v;
+                    data[row_len + dst] = v;
+                    data[row_len * 2 + dst] = v;
+                }
+            }
+        }
+        DynamicImage::ImageRgb8(rgb) => {
+            let resized = image::imageops::resize(
+                rgb,
+                resized_w as u32,
+                target_h as u32,
+                FilterType::Triangle,
+            );
+            let resized_w = resized_w as usize;
+            let row_len = target_h * target_w;
+            let mid = resized_w.min(target_w);
+            let raw = resized.as_raw();
+            for y in 0..target_h {
+                let row_offset = y * resized_w;
+                let out_base = y * target_w;
+                for x in 0..mid {
+                    let src = (row_offset + x) * 3;
+                    let dst = out_base + x;
+                    data[dst] = (raw[src + 2] as f32 - 127.5) / 127.5;
+                    data[row_len + dst] = (raw[src + 1] as f32 - 127.5) / 127.5;
+                    data[row_len * 2 + dst] = (raw[src] as f32 - 127.5) / 127.5;
+                }
+            }
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let resized = image::imageops::resize(
+                rgba,
+                resized_w as u32,
+                target_h as u32,
+                FilterType::Triangle,
+            );
+            let resized_w = resized_w as usize;
+            let row_len = target_h * target_w;
+            let mid = resized_w.min(target_w);
+            let raw = resized.as_raw();
+            for y in 0..target_h {
+                let row_offset = y * resized_w;
+                let out_base = y * target_w;
+                for x in 0..mid {
+                    let src = (row_offset + x) * 4;
+                    let alpha = raw[src + 3] as f32 / 255.0;
+                    let dst = out_base + x;
+                    if alpha >= 1.0 {
+                        data[dst] = (raw[src + 2] as f32 - 127.5) / 127.5;
+                        data[row_len + dst] = (raw[src + 1] as f32 - 127.5) / 127.5;
+                        data[row_len * 2 + dst] = (raw[src] as f32 - 127.5) / 127.5;
+                        continue;
+                    }
+                    let inv_alpha = 1.0 - alpha;
+                    data[dst] =
+                        (((raw[src + 2] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                    data[row_len + dst] =
+                        (((raw[src + 1] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                    data[row_len * 2 + dst] =
+                        (((raw[src] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                }
+            }
+        }
+        _ => {
+            let rgba = image.to_rgba8();
+            let resized = image::imageops::resize(
+                &rgba,
+                resized_w as u32,
+                target_h as u32,
+                FilterType::Triangle,
+            );
+            let resized_w = resized_w as usize;
+            let row_len = target_h * target_w;
+            let mid = resized_w.min(target_w);
+            let raw = resized.as_raw();
+            for y in 0..target_h {
+                let row_offset = y * resized_w;
+                let out_base = y * target_w;
+                for x in 0..mid {
+                    let src = (row_offset + x) * 4;
+                    let alpha = raw[src + 3] as f32 / 255.0;
+                    let dst = out_base + x;
+                    if alpha >= 1.0 {
+                        data[dst] = (raw[src + 2] as f32 - 127.5) / 127.5;
+                        data[row_len + dst] = (raw[src + 1] as f32 - 127.5) / 127.5;
+                        data[row_len * 2 + dst] = (raw[src] as f32 - 127.5) / 127.5;
+                        continue;
+                    }
+                    let inv_alpha = 1.0 - alpha;
+                    data[dst] =
+                        (((raw[src + 2] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                    data[row_len + dst] =
+                        (((raw[src + 1] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                    data[row_len * 2 + dst] =
+                        (((raw[src] as f32) * alpha + 255.0 * inv_alpha) / 255.0) * 2.0 - 1.0;
+                }
             }
         }
     }
@@ -7110,8 +8728,7 @@ fn preprocess_rec_image(
 }
 
 fn dynamic_rec_target_width(image: &DynamicImage, target_h: usize, base_w: usize) -> usize {
-    let gray = to_luma_on_white(image);
-    let (src_w, src_h) = gray.dimensions();
+    let (src_w, src_h) = image.dimensions();
     if src_w == 0 || src_h == 0 {
         return base_w.max(1);
     }
@@ -7125,21 +8742,105 @@ fn to_rgb_on_white(image: &DynamicImage) -> image::RgbImage {
 }
 
 fn to_rgb_on_background(image: &DynamicImage, background: u8) -> image::RgbImage {
-    let rgba = image.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut out = image::RgbImage::new(w, h);
+    to_rgb_on_background_cached(image, background)
+        .as_ref()
+        .clone()
+}
+
+fn to_rgb_on_background_cached(image: &DynamicImage, background: u8) -> Arc<image::RgbImage> {
+    let key = match image_rgb_cache_key(image, background) {
+        Some(key) => {
+            if let Some(image) = OCR_REC_RGB_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
+                return image;
+            }
+            key
+        }
+        None => {
+            return Arc::new(to_rgb_on_background_uncached(image, background));
+        }
+    };
+
+    let rgb = to_rgb_on_background_uncached(image, background);
+    OCR_REC_RGB_CACHE.with(|cache| {
+        cache.borrow_mut().put(key, rgb.clone());
+    });
+    Arc::new(rgb)
+}
+
+fn image_rgb_cache_key(image: &DynamicImage, background: u8) -> Option<ImageRgbCacheKey> {
+    match image {
+        DynamicImage::ImageLuma8(image) => Some(ImageRgbCacheKey {
+            format: 1,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        DynamicImage::ImageRgb8(image) => Some(ImageRgbCacheKey {
+            format: 2,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        DynamicImage::ImageRgba8(image) => Some(ImageRgbCacheKey {
+            format: 3,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        _ => None,
+    }
+}
+
+fn to_rgb_on_background_uncached(image: &DynamicImage, background: u8) -> image::RgbImage {
     let bg = background as f32;
-    for y in 0..h {
-        for x in 0..w {
-            let p = rgba.get_pixel(x, y);
-            let a = p[3] as f32 / 255.0;
-            let r = (p[0] as f32 * a + bg * (1.0 - a)).round() as u8;
-            let g = (p[1] as f32 * a + bg * (1.0 - a)).round() as u8;
-            let b = (p[2] as f32 * a + bg * (1.0 - a)).round() as u8;
-            out.put_pixel(x, y, image::Rgb([r, g, b]));
+    match image {
+        DynamicImage::ImageLuma8(image) => {
+            let mut out = image::RgbImage::new(image.width(), image.height());
+            let src = image.as_raw();
+            let mut dst = out.as_mut().iter_mut();
+            for sample in src.iter() {
+                *dst.next().expect("rgb pixel write") = *sample;
+                *dst.next().expect("rgb pixel write") = *sample;
+                *dst.next().expect("rgb pixel write") = *sample;
+            }
+            out
+        }
+        DynamicImage::ImageRgb8(image) => {
+            let mut out = image::RgbImage::new(image.width(), image.height());
+            if background == 255 {
+                return image.clone();
+            }
+            image.pixels().zip(out.pixels_mut()).for_each(|(src, dst)| {
+                dst.0 = [src.0[0], src.0[1], src.0[2]];
+            });
+            out
+        }
+        DynamicImage::ImageRgba8(image) => {
+            let rgba = image.as_raw();
+            let mut out = Vec::with_capacity(image.width() as usize * image.height() as usize * 3);
+            for rgba in rgba.chunks_exact(4) {
+                let alpha = rgba[3] as f32 / 255.0;
+                let inv_alpha = 1.0 - alpha;
+                out.extend_from_slice(&[
+                    ((rgba[0] as f32 * alpha + bg * inv_alpha).round() as u8),
+                    ((rgba[1] as f32 * alpha + bg * inv_alpha).round() as u8),
+                    ((rgba[2] as f32 * alpha + bg * inv_alpha).round() as u8),
+                ]);
+            }
+            image::RgbImage::from_raw(image.width(), image.height(), out)
+                .expect("rgb buffer has expected size")
+        }
+        _ => {
+            let rgba = image.to_rgba8();
+            to_rgb_on_background_uncached(&DynamicImage::ImageRgba8(rgba), background)
         }
     }
-    out
 }
 
 fn to_luma_on_white(image: &DynamicImage) -> GrayImage {
@@ -7147,12 +8848,88 @@ fn to_luma_on_white(image: &DynamicImage) -> GrayImage {
 }
 
 fn to_luma_on_background(image: &DynamicImage, background: u8) -> GrayImage {
-    DynamicImage::ImageRgb8(to_rgb_on_background(image, background)).to_luma8()
+    to_luma_on_background_cached(image, background)
+        .as_ref()
+        .clone()
+}
+
+fn to_luma_on_background_cached(image: &DynamicImage, background: u8) -> Arc<GrayImage> {
+    let key = match image_luma_cache_key(image, background) {
+        Some(key) => {
+            if let Some(image) = OCR_REC_LUMA_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
+                return image;
+            }
+            key
+        }
+        None => {
+            return Arc::new(to_luma_on_background_uncached(image, background));
+        }
+    };
+
+    let luma = to_luma_on_background_uncached(image, background);
+    OCR_REC_LUMA_CACHE.with(|cache| {
+        cache.borrow_mut().put(key, luma.clone());
+    });
+    Arc::new(luma)
+}
+
+fn image_luma_cache_key(image: &DynamicImage, background: u8) -> Option<ImageLumaCacheKey> {
+    match image {
+        DynamicImage::ImageLuma8(image) => Some(ImageLumaCacheKey {
+            format: 1,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        DynamicImage::ImageRgb8(image) => Some(ImageLumaCacheKey {
+            format: 2,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        DynamicImage::ImageRgba8(image) => Some(ImageLumaCacheKey {
+            format: 3,
+            width: image.width(),
+            height: image.height(),
+            ptr: image.as_ptr() as usize,
+            len: image.as_raw().len(),
+            background,
+        }),
+        _ => None,
+    }
+}
+
+fn to_luma_on_background_uncached(image: &DynamicImage, background: u8) -> GrayImage {
+    match image {
+        DynamicImage::ImageLuma8(image) => image.clone(),
+        _ => to_gray_from_rgb(&to_rgb_on_background_cached(image, background)),
+    }
+}
+
+fn to_gray_from_rgb(rgb: &image::RgbImage) -> GrayImage {
+    let mut out = GrayImage::new(rgb.width(), rgb.height());
+    let raw = rgb.as_raw();
+    let dst = out.as_mut();
+    for i in 0..(rgb.width() as usize).saturating_mul(rgb.height() as usize) {
+        let base = i * 3;
+        let value =
+            ((raw[base] as u16 * 77 + raw[base + 1] as u16 * 150 + raw[base + 2] as u16 * 29) >> 8)
+                as u8;
+        dst[i] = value;
+    }
+    out
 }
 
 fn has_non_opaque_alpha(image: &DynamicImage) -> bool {
-    let rgba = image.to_rgba8();
-    rgba.pixels().any(|p| p[3] < 255)
+    match image {
+        DynamicImage::ImageLuma8(_) | DynamicImage::ImageRgb8(_) => false,
+        DynamicImage::ImageRgba8(image) => image.pixels().any(|p| p[3] < 255),
+        _ => image.to_rgba8().pixels().any(|p| p[3] < 255),
+    }
 }
 
 fn ocr_trace_enabled() -> bool {
@@ -7200,36 +8977,426 @@ fn to_max_channel_gray_on_background(image: &DynamicImage, background: u8) -> Gr
 }
 
 fn enhancement_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
-    let mut out = Vec::new();
-    let mut bases = vec![
-        ("".to_string(), to_luma_on_white(image)),
-        ("hsl-".to_string(), to_hsl_lightness(image)),
-        ("max-".to_string(), to_max_channel_gray(image)),
-    ];
+    enhancement_variants_limited(image, usize::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnhancementBaseVariant {
+    Luma,
+    Hsl,
+    Max,
+    AlphaBlackLuma,
+    AlphaBlackHsl,
+    AlphaBlackMax,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnhancementBaseScore {
+    base: EnhancementBaseVariant,
+    score: i32,
+    order: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnhancementRoi {
+    width: u32,
+    height: u32,
+    area: u64,
+    mean: f32,
+    contrast: f32,
+    foreground_ratio: f32,
+    has_alpha: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LumaSignal {
+    mean: f32,
+    contrast: f32,
+    width: u32,
+    height: u32,
+}
+
+fn luma_signal(gray: &GrayImage) -> LumaSignal {
+    let w = gray.width();
+    let h = gray.height();
+    if w == 0 || h == 0 {
+        return LumaSignal {
+            mean: 127.0,
+            contrast: 64.0,
+            width: w,
+            height: h,
+        };
+    }
+
+    let mut min_v = u8::MAX;
+    let mut max_v = u8::MIN;
+    let mut sum = 0u64;
+    for px in gray.pixels() {
+        let v = px[0];
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+        sum += v as u64;
+    }
+    let total = (w as u64) * (h as u64);
+    let mean = sum as f32 / total as f32;
+
+    LumaSignal {
+        mean,
+        contrast: (max_v as f32 - min_v as f32).max(16.0),
+        width: w,
+        height: h,
+    }
+}
+
+fn enhancement_roi_from_gray(
+    gray: &GrayImage,
+    signal: &LumaSignal,
+    has_alpha: bool,
+) -> EnhancementRoi {
+    let area = (signal.width as u64) * (signal.height as u64);
+    let mut foreground = 0u64;
+    let total = (signal.width as u64) * (signal.height as u64);
+    if total > 0 {
+        for px in gray.pixels() {
+            let delta = (px[0] as f32 - signal.mean).abs();
+            if delta >= 16.0 {
+                foreground += 1;
+            }
+        }
+    }
+    let foreground_ratio = if total > 0 {
+        foreground as f32 / total as f32
+    } else {
+        0.0
+    };
+    EnhancementRoi {
+        width: signal.width,
+        height: signal.height,
+        area,
+        mean: signal.mean,
+        contrast: signal.contrast,
+        foreground_ratio,
+        has_alpha,
+    }
+}
+
+fn enhancement_variant_base_score(
+    base: EnhancementBaseVariant,
+    signal: &LumaSignal,
+    roi: &EnhancementRoi,
+) -> i32 {
+    let area = (signal.width as u64) * (signal.height as u64);
+    match base {
+        EnhancementBaseVariant::Luma => {
+            let mut score = 18;
+            if signal.contrast < 28.0 {
+                score += 12;
+            }
+            if signal.mean >= 130.0 && signal.mean <= 185.0 {
+                score += 4;
+            }
+            if area <= 1_600 {
+                score += 6;
+            }
+            if roi.foreground_ratio < 0.003 {
+                score += 4;
+            }
+            score
+        }
+        EnhancementBaseVariant::Hsl => {
+            let mut score = 10;
+            if signal.contrast >= 40.0 {
+                score += 6;
+            }
+            if signal.mean < 85.0 || signal.mean > 215.0 {
+                score += 8;
+            }
+            if area <= 1_600 {
+                score -= 2;
+            }
+            if roi.foreground_ratio < 0.004 {
+                score -= 2;
+            }
+            score
+        }
+        EnhancementBaseVariant::Max => {
+            let mut score = 6;
+            if signal.contrast >= 52.0 {
+                score += 10;
+            }
+            if signal.mean > 145.0 {
+                score -= 4;
+            }
+            if signal.width <= 72 || signal.height <= 16 {
+                score -= 12;
+            }
+            if roi.contrast < 22.0 {
+                score -= 10;
+            }
+            score
+        }
+        EnhancementBaseVariant::AlphaBlackLuma
+        | EnhancementBaseVariant::AlphaBlackHsl
+        | EnhancementBaseVariant::AlphaBlackMax => {
+            let mut score = 16;
+            if signal.contrast < 36.0 {
+                score += 12;
+            }
+            if signal.mean > 190.0 {
+                score -= 8;
+            }
+            if signal.mean < 60.0 {
+                score += 8;
+            }
+            if !roi.has_alpha {
+                score -= 999;
+            }
+            score
+        }
+    }
+}
+
+fn ranked_enhancement_bases(
+    image: &DynamicImage,
+    variant_budget: usize,
+) -> Vec<EnhancementBaseVariant> {
+    if variant_budget <= 2 {
+        let gray = to_luma_on_white(image);
+        let signal = luma_signal(&gray);
+        let mut first = if signal.mean < 90.0 || signal.mean > 190.0 {
+            EnhancementBaseVariant::Luma
+        } else {
+            EnhancementBaseVariant::Luma
+        };
+        let mut second = if signal.mean < 90.0 {
+            EnhancementBaseVariant::Hsl
+        } else {
+            EnhancementBaseVariant::Luma
+        };
+        if has_non_opaque_alpha(image) {
+            first = if signal.mean < 70.0 {
+                EnhancementBaseVariant::AlphaBlackLuma
+            } else {
+                EnhancementBaseVariant::Luma
+            };
+            second = EnhancementBaseVariant::Luma;
+        }
+        return vec![first, second];
+    }
+
+    let gray = to_luma_on_white(image);
+    let signal = luma_signal(&gray);
+    let roi = enhancement_roi_from_gray(&gray, &signal, has_non_opaque_alpha(image));
+    let mut scored = Vec::new();
+    let mut order = 0usize;
+
+    scored.push(EnhancementBaseScore {
+        base: EnhancementBaseVariant::Luma,
+        score: enhancement_variant_base_score(EnhancementBaseVariant::Luma, &signal, &roi),
+        order,
+    });
+    order += 1;
+    scored.push(EnhancementBaseScore {
+        base: EnhancementBaseVariant::Hsl,
+        score: enhancement_variant_base_score(EnhancementBaseVariant::Hsl, &signal, &roi),
+        order,
+    });
+    order += 1;
+    scored.push(EnhancementBaseScore {
+        base: EnhancementBaseVariant::Max,
+        score: enhancement_variant_base_score(EnhancementBaseVariant::Max, &signal, &roi),
+        order,
+    });
+
     if has_non_opaque_alpha(image) {
-        bases.extend([
-            ("alpha-black-".to_string(), to_luma_on_background(image, 0)),
-            (
-                "alpha-black-hsl-".to_string(),
-                to_hsl_lightness_on_background(image, 0),
+        scored.push(EnhancementBaseScore {
+            base: EnhancementBaseVariant::AlphaBlackLuma,
+            score: enhancement_variant_base_score(
+                EnhancementBaseVariant::AlphaBlackLuma,
+                &signal,
+                &roi,
             ),
-            (
-                "alpha-black-max-".to_string(),
-                to_max_channel_gray_on_background(image, 0),
+            order: order + 3,
+        });
+        scored.push(EnhancementBaseScore {
+            base: EnhancementBaseVariant::AlphaBlackHsl,
+            score: enhancement_variant_base_score(
+                EnhancementBaseVariant::AlphaBlackHsl,
+                &signal,
+                &roi,
             ),
-        ]);
+            order: order + 4,
+        });
+        scored.push(EnhancementBaseScore {
+            base: EnhancementBaseVariant::AlphaBlackMax,
+            score: enhancement_variant_base_score(
+                EnhancementBaseVariant::AlphaBlackMax,
+                &signal,
+                &roi,
+            ),
+            order: order + 5,
+        });
     }
-    for (prefix, base) in bases {
-        push_enhancement_variants(&mut out, &prefix, &base);
+
+    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.order.cmp(&b.order)));
+    if scored.is_empty() {
+        vec![EnhancementBaseVariant::Luma]
+    } else {
+        scored.into_iter().map(|entry| entry.base).collect()
     }
+}
+
+fn enhancement_variant_base_image(image: &DynamicImage, base: EnhancementBaseVariant) -> GrayImage {
+    match base {
+        EnhancementBaseVariant::Luma => to_luma_on_white(image),
+        EnhancementBaseVariant::Hsl => to_hsl_lightness(image),
+        EnhancementBaseVariant::Max => to_max_channel_gray(image),
+        EnhancementBaseVariant::AlphaBlackLuma => to_luma_on_background(image, 0),
+        EnhancementBaseVariant::AlphaBlackHsl => to_hsl_lightness_on_background(image, 0),
+        EnhancementBaseVariant::AlphaBlackMax => to_max_channel_gray_on_background(image, 0),
+    }
+}
+
+fn enhancement_variant_prefix(base: EnhancementBaseVariant) -> &'static str {
+    match base {
+        EnhancementBaseVariant::Luma => "",
+        EnhancementBaseVariant::Hsl => "hsl-",
+        EnhancementBaseVariant::Max => "max-",
+        EnhancementBaseVariant::AlphaBlackLuma => "alpha-black-",
+        EnhancementBaseVariant::AlphaBlackHsl => "alpha-black-hsl-",
+        EnhancementBaseVariant::AlphaBlackMax => "alpha-black-max-",
+    }
+}
+
+fn enhancement_variants_limited(
+    image: &DynamicImage,
+    variant_budget: usize,
+) -> Vec<(String, DynamicImage)> {
+    if variant_budget == 0 {
+        return Vec::new();
+    }
+
+    let has_alpha = has_non_opaque_alpha(image);
+    let gray = to_luma_on_white(image);
+    let signal = luma_signal(&gray);
+    let roi = enhancement_roi_from_gray(&gray, &signal, has_alpha);
+    let full_capacity = if has_alpha { 30 } else { 18 };
+    if variant_budget >= full_capacity {
+        let mut variants = vec![
+            EnhancementBaseVariant::Luma,
+            EnhancementBaseVariant::Hsl,
+            EnhancementBaseVariant::Max,
+        ];
+        if has_alpha {
+            variants.extend([
+                EnhancementBaseVariant::AlphaBlackLuma,
+                EnhancementBaseVariant::AlphaBlackHsl,
+                EnhancementBaseVariant::AlphaBlackMax,
+            ]);
+        }
+
+        return variants
+            .into_iter()
+            .flat_map(|base| {
+                let gray = enhancement_variant_base_image(image, base);
+                let prefix = enhancement_variant_prefix(base);
+                let mut out = Vec::with_capacity(5);
+                push_enhancement_variants_limited(&mut out, prefix, &gray, full_capacity, &roi);
+                out
+            })
+            .take(full_capacity)
+            .collect();
+    }
+
+    let mut out = Vec::with_capacity(variant_budget.min(18));
+    let bases = ranked_enhancement_bases(image, variant_budget);
+    for base in bases {
+        if out.len() >= variant_budget {
+            break;
+        }
+        let gray = enhancement_variant_base_image(image, base);
+        let prefix = enhancement_variant_prefix(base);
+        push_enhancement_variants_limited(&mut out, prefix, &gray, variant_budget, &roi);
+        if out.len() >= variant_budget {
+            break;
+        }
+        if out.len() > 0 && base == EnhancementBaseVariant::Luma && variant_budget <= 3 {
+            break;
+        }
+    }
+
+    out.truncate(variant_budget);
     out
 }
 
-fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
-    let mut out = Vec::new();
-    for variant in foreground_binary_variants(image) {
-        out.push(variant);
+fn push_enhancement_variants_limited(
+    out: &mut Vec<(String, DynamicImage)>,
+    prefix: &str,
+    base: &GrayImage,
+    variant_budget: usize,
+    roi: &EnhancementRoi,
+) {
+    if out.len() >= variant_budget {
+        return;
     }
+    let stretched = contrast_stretch_luma(base);
+    out.push((
+        format!("{prefix}contrast"),
+        DynamicImage::ImageLuma8(stretched.clone()),
+    ));
+    if out.len() >= variant_budget {
+        return;
+    }
+
+    let include_binary = roi.contrast >= 12.0;
+    if !include_binary {
+        return;
+    }
+
+    let binary = adaptive_binary_luma(&stretched, false);
+    out.push((format!("{prefix}binary"), DynamicImage::ImageLuma8(binary)));
+    if out.len() >= variant_budget {
+        return;
+    }
+
+    let include_binary_invert = variant_budget > 1;
+    if include_binary_invert {
+        let binary_invert = adaptive_binary_luma(&stretched, true);
+        out.push((
+            format!("{prefix}binary-invert"),
+            DynamicImage::ImageLuma8(binary_invert),
+        ));
+    }
+    if out.len() >= variant_budget {
+        return;
+    }
+
+    let include_local = roi.area >= 5_000 && roi.contrast >= 18.0 || variant_budget >= 6;
+    if !include_local {
+        return;
+    }
+    let local_binary = local_binary_luma(&stretched, false);
+    out.push((
+        format!("{prefix}local-binary"),
+        DynamicImage::ImageLuma8(local_binary),
+    ));
+    if out.len() >= variant_budget {
+        return;
+    }
+
+    let include_local_invert = variant_budget > 2;
+    if include_local_invert {
+        let local_binary_invert = local_binary_luma(&stretched, true);
+        out.push((
+            format!("{prefix}local-binary-invert"),
+            DynamicImage::ImageLuma8(local_binary_invert),
+        ));
+    }
+}
+
+fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
+    let mut out = Vec::with_capacity(12);
+    out.extend(foreground_binary_variants(image));
 
     let gray = to_luma_on_white(image);
     let stretched = contrast_stretch_luma(&gray);
@@ -7255,9 +9422,53 @@ fn local_recognition_variants(image: &DynamicImage) -> Vec<(String, DynamicImage
     out
 }
 
+fn local_recognition_variants_limited(
+    image: &DynamicImage,
+    max_count: usize,
+) -> Vec<(String, DynamicImage)> {
+    if max_count == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(max_count);
+    out.extend(foreground_binary_variants_limited(image, max_count));
+    if out.len() >= max_count {
+        return dedupe_named_dynamic_variants(out);
+    }
+
+    let gray = to_luma_on_white(image);
+    let stretched = contrast_stretch_luma(&gray);
+    for (name, radius, bias) in [
+        ("local-small", 6usize, 6i16),
+        ("local-medium", 12usize, 8i16),
+        ("local-large", 20usize, 8i16),
+    ] {
+        if out.len() >= max_count {
+            break;
+        }
+        out.push((
+            name.to_string(),
+            DynamicImage::ImageLuma8(local_binary_luma_with_radius(
+                &stretched, false, radius, bias,
+            )),
+        ));
+        if out.len() >= max_count {
+            break;
+        }
+        out.push((
+            format!("{name}-invert"),
+            DynamicImage::ImageLuma8(local_binary_luma_with_radius(
+                &stretched, true, radius, bias,
+            )),
+        ));
+    }
+
+    out.truncate(max_count);
+    dedupe_named_dynamic_variants(out)
+}
+
 fn foreground_binary_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
-    let crop = crop_box(image, image_box(image));
-    let rgb = to_rgb_on_white(&crop);
+    let rgb = to_rgb_on_white(image);
     let (w, h) = rgb.dimensions();
     let mut out = Vec::new();
     if let Some(binary) = binarize_color_region_foreground(image, image_box(image)) {
@@ -7283,6 +9494,58 @@ fn foreground_binary_variants(image: &DynamicImage) -> Vec<(String, DynamicImage
             .is_some_and(|score| score >= -20)
         {
             continue;
+        }
+        if let Some(binary) = dynamic_image_from_foreground_mask(&mask, w as usize, h as usize) {
+            out.push((name.to_string(), binary));
+        }
+    }
+
+    dedupe_named_dynamic_variants(out)
+}
+
+fn foreground_binary_variants_limited(
+    image: &DynamicImage,
+    max_count: usize,
+) -> Vec<(String, DynamicImage)> {
+    if max_count == 0 {
+        return Vec::new();
+    }
+
+    let rgb = to_rgb_on_white(image);
+    let (w, h) = rgb.dimensions();
+    let mut out = Vec::with_capacity(max_count.min(4));
+    if let Some(binary) = binarize_color_region_foreground(image, image_box(image)) {
+        out.push(("foreground-binary".to_string(), binary));
+        if out.len() >= max_count {
+            return out;
+        }
+    }
+
+    for (name, mask) in [
+        ("foreground-mask", foreground_mask_from_rgb(&rgb)),
+        (
+            "foreground-soft-mask",
+            soft_color_foreground_mask_from_rgb(&rgb),
+        ),
+        (
+            "foreground-low-contrast-mask",
+            low_contrast_foreground_mask_from_rgb(&rgb),
+        ),
+        ("foreground-dark-mask", dark_luma_mask_from_rgb(&rgb)),
+    ] {
+        if out.len() >= max_count {
+            break;
+        }
+        let Some(mask) = mask else {
+            continue;
+        };
+        if !foreground_glyph_textness_score(&mask, w as usize, h as usize)
+            .is_some_and(|score| score >= -20)
+        {
+            continue;
+        }
+        if out.len() >= max_count {
+            break;
         }
         if let Some(binary) = dynamic_image_from_foreground_mask(&mask, w as usize, h as usize) {
             out.push((name.to_string(), binary));
@@ -7319,46 +9582,51 @@ fn dedupe_named_dynamic_variants(
     variants: Vec<(String, DynamicImage)>,
 ) -> Vec<(String, DynamicImage)> {
     let mut kept = Vec::new();
-    let mut seen = Vec::<u64>::new();
+    let mut seen = HashSet::<u64>::new();
     for (name, image) in variants {
-        let key = dynamic_image_signature(&image);
+        let key = dynamic_image_signature_cached(&image);
         if seen.contains(&key) {
             continue;
         }
-        seen.push(key);
+        seen.insert(key);
         kept.push((name, image));
     }
     kept
-}
-
-fn dynamic_image_signature(image: &DynamicImage) -> u64 {
-    let gray = image.to_luma8();
-    let (w, h) = gray.dimensions();
-    let mut hash = ((w as u64) << 32) | h as u64;
-    for pixel in gray
-        .pixels()
-        .step_by(((w as usize).saturating_mul(h as usize) / 64).max(1))
-    {
-        hash = hash
-            .wrapping_mul(1_099_511_628_211)
-            .wrapping_add(pixel[0] as u64 + 1);
-    }
-    hash
 }
 
 fn local_recognition_variants_adaptive(
     image: &DynamicImage,
     direct: Option<&RecCandidate>,
 ) -> Vec<(String, DynamicImage)> {
-    let mut variants = local_recognition_variants(image);
+    let mut variant_budget = local_recognition_variant_budget(direct);
     if let Some(candidate) = direct
         && candidate.confidence >= MIN_STRONG_REC_CONFIDENCE
         && candidate.avg_margin >= 0.04
         && readable_ratio(&candidate.text) >= 0.65
     {
-        variants.truncate(3);
+        variant_budget = variant_budget.min(3);
     }
-    variants
+    local_recognition_variants_limited(image, variant_budget)
+}
+
+fn local_recognition_variant_budget(direct: Option<&RecCandidate>) -> usize {
+    if let Some(candidate) = direct {
+        let text = normalize_recognized_text(&candidate.text);
+        let text_len = text.chars().count();
+        if is_stable_short_text_candidate(candidate, &text, MAX_FAST_TEXT_CHARS) {
+            return 1;
+        }
+        if candidate.confidence >= MIN_STRONG_REC_CONFIDENCE && candidate.avg_margin >= 0.05 {
+            return if text_len >= 12 { 3 } else { 4 };
+        }
+        if candidate.confidence >= 0.78 || (candidate.avg_margin >= 0.10 && text_len >= 8) {
+            return 4;
+        }
+        if candidate.confidence < 0.45 && text_len < 6 {
+            return 8;
+        }
+    }
+    7
 }
 
 fn should_try_local_recognition_variants(
@@ -7368,6 +9636,10 @@ fn should_try_local_recognition_variants(
     let Some(candidate) = direct else {
         return true;
     };
+    let text = normalize_recognized_text(&candidate.text);
+    if is_stable_short_text_candidate(candidate, &text, MAX_FAST_TEXT_CHARS.saturating_sub(2)) {
+        return false;
+    }
     let text = normalize_recognized_text(&candidate.text);
     if recognized_box_needs_repair(image_box(image), &text, candidate.confidence) {
         return true;
@@ -7381,33 +9653,105 @@ fn should_try_local_recognition_variants(
     false
 }
 
-fn push_enhancement_variants(
-    out: &mut Vec<(String, DynamicImage)>,
-    prefix: &str,
-    base: &GrayImage,
-) {
-    let stretched = contrast_stretch_luma(base);
-    let binary = adaptive_binary_luma(&stretched, false);
-    let binary_invert = adaptive_binary_luma(&stretched, true);
-    let local_binary = local_binary_luma(&stretched, false);
-    let local_binary_invert = local_binary_luma(&stretched, true);
-    out.push((
-        format!("{prefix}contrast"),
-        DynamicImage::ImageLuma8(stretched),
-    ));
-    out.push((format!("{prefix}binary"), DynamicImage::ImageLuma8(binary)));
-    out.push((
-        format!("{prefix}binary-invert"),
-        DynamicImage::ImageLuma8(binary_invert),
-    ));
-    out.push((
-        format!("{prefix}local-binary"),
-        DynamicImage::ImageLuma8(local_binary),
-    ));
-    out.push((
-        format!("{prefix}local-binary-invert"),
-        DynamicImage::ImageLuma8(local_binary_invert),
-    ));
+fn should_try_crop_enhancement_variants(direct: Option<&RecCandidate>) -> bool {
+    let Some(candidate) = direct else {
+        return true;
+    };
+    if !is_usable_recognition(candidate) {
+        return true;
+    }
+    let text = normalize_recognized_text(&candidate.text);
+    if is_stable_short_text_candidate(candidate, &text, MAX_FAST_TEXT_CHARS.saturating_sub(2)) {
+        return false;
+    }
+    if candidate.confidence < 0.78 {
+        return true;
+    }
+    if candidate.avg_margin < 0.08 || candidate.min_margin < 0.03 {
+        return true;
+    }
+    let readable_ratio = readable_ratio(&text);
+    let text_len = text.chars().count();
+    if candidate.confidence >= 0.90
+        && candidate.avg_margin >= 0.12
+        && readable_ratio >= 0.82
+        && text_len <= 6
+    {
+        return false;
+    }
+    if readable_ratio < 0.65 {
+        return true;
+    }
+    if dominant_char_ratio(&text) >= 0.60 || punctuation_ratio(&text) > 0.55 {
+        return true;
+    }
+    false
+}
+
+#[inline]
+fn crop_enhancement_candidate_is_final(candidate: &RecCandidate) -> bool {
+    if !is_usable_recognition(candidate) || candidate.confidence < 0.96 {
+        return false;
+    }
+    if candidate.avg_margin < 0.14 || candidate.min_margin < 0.05 {
+        return false;
+    }
+    let text = normalize_recognized_text(&candidate.text);
+    if text.chars().count() <= 1 {
+        return false;
+    }
+    readable_ratio(&text) >= 0.90 && candidate.char_min_confidence >= 0.95
+}
+
+fn crop_enhancement_variant_budget(image: &DynamicImage, direct: Option<&RecCandidate>) -> usize {
+    if !should_try_crop_enhancement_variants(direct) {
+        return 0;
+    }
+
+    let (w, h) = image.dimensions();
+    let area = (w as u64).saturating_mul(h as u64);
+    let mut budget = match area {
+        area if area <= 5_000 => 1,
+        area if area <= 22_000 => 2,
+        area if area <= 96_000 => 3,
+        _ => MAX_ENHANCEMENT_VARIANTS_PER_PASS,
+    };
+
+    if let Some(candidate) = direct {
+        let normalized = normalize_recognized_text(&candidate.text);
+        let direct_readable_ratio = readable_ratio(&normalized);
+        let text_len = normalized.chars().count();
+        if is_stable_short_text_candidate(
+            candidate,
+            &normalized,
+            MAX_FAST_TEXT_CHARS.saturating_sub(2),
+        ) {
+            budget = budget.min(1);
+        }
+        let quality_visible = candidate.confidence >= 0.86
+            && candidate.avg_margin >= 0.10
+            && candidate.min_margin >= 0.03
+            && direct_readable_ratio >= 0.75;
+        let long_text = text_len >= 18;
+        if quality_visible && !long_text {
+            budget = budget.min(2);
+        }
+        if area > 22_000 {
+            if candidate.confidence < 0.78
+                || candidate.avg_margin < 0.08
+                || candidate.min_margin < 0.03
+            {
+                budget = MAX_ENHANCEMENT_VARIANTS_PER_PASS;
+            } else if candidate.confidence < 0.86
+                || candidate.avg_margin < 0.10
+                || direct_readable_ratio < 0.75
+            {
+                budget = budget.max(3);
+            }
+        }
+    }
+
+    budget
 }
 
 fn upscale_variants(image: &DynamicImage) -> Vec<(String, DynamicImage)> {
@@ -7959,8 +10303,9 @@ fn split_text_box_into_color_region_boxes(image: &DynamicImage, bbox: BoxRect) -
             )
         })
         .collect::<Vec<_>>();
-    boxes.sort_by_key(|b| (b.1 / 8, b.0));
-    boxes.truncate(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS);
+    boxes = sort_and_truncate_by(boxes, MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS, |a, b| {
+        (a.1 / 8, a.0).cmp(&(b.1 / 8, b.0))
+    });
     if boxes.len() < 2 {
         return Vec::new();
     }
@@ -8524,8 +10869,7 @@ fn line_boxes_from_foreground_mask(
         ));
     }
 
-    boxes.sort_by_key(|b| (b.1, b.0));
-    boxes.truncate(max_boxes);
+    boxes = sort_and_truncate_by(boxes, max_boxes, |a, b| (a.1, a.0).cmp(&(b.1, b.0)));
     boxes
 }
 
@@ -8765,11 +11109,7 @@ fn ctc_path_beam_decode_with_stats(
     for t in 0..steps {
         let top = ctc_top_classes(logits, t, steps, classes, channel_first, CTC_TOP_K);
         let mut active = beams.into_iter().collect::<Vec<_>>();
-        active.sort_by(|a, b| {
-            ctc_prefix_total_score(&b.1)
-                .partial_cmp(&ctc_prefix_total_score(&a.1))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        active.sort_by(|a, b| compare_ctc_prefix_states(&a.1, &b.1));
         active.truncate(CTC_BEAM_SIZE);
 
         let mut next: HashMap<Vec<usize>, CtcPrefixState> = HashMap::new();
@@ -8830,11 +11170,7 @@ fn ctc_path_beam_decode_with_stats(
             }
         }
         let mut kept = next.into_iter().collect::<Vec<_>>();
-        kept.sort_by(|a, b| {
-            ctc_prefix_total_score(&b.1)
-                .partial_cmp(&ctc_prefix_total_score(&a.1))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        kept.sort_by(|a, b| compare_ctc_prefix_states(&a.1, &b.1));
         kept.truncate(CTC_BEAM_SIZE);
         beams = kept.into_iter().collect();
     }
@@ -8857,7 +11193,7 @@ fn ctc_path_beam_decode_with_stats(
             .retain(|(existing, existing_score, _)| existing != &text || *existing_score > score);
         collapsed.push((text, score, path));
     }
-    collapsed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    collapsed.sort_by(|a, b| total_cmp_desc(a.1, b.1));
     let (_, _, ids) = collapsed.first()?;
     Some(ctc_stats_for_path(
         logits,
@@ -8892,6 +11228,18 @@ impl CtcPrefixState {
 
 fn ctc_prefix_total_score(state: &CtcPrefixState) -> f32 {
     log_sum_exp2(state.p_blank, state.p_non_blank)
+}
+
+#[inline]
+fn compare_ctc_prefix_states(a: &CtcPrefixState, b: &CtcPrefixState) -> std::cmp::Ordering {
+    total_cmp_desc(ctc_prefix_total_score(a), ctc_prefix_total_score(b))
+}
+
+#[inline]
+fn total_cmp_desc(lhs: f32, rhs: f32) -> std::cmp::Ordering {
+    let lhs = if lhs == -0.0 { 0.0 } else { lhs };
+    let rhs = if rhs == -0.0 { 0.0 } else { rhs };
+    rhs.total_cmp(&lhs)
 }
 
 fn ctc_update_blank_state(
@@ -9242,6 +11590,33 @@ fn is_usable_recognition(candidate: &RecCandidate) -> bool {
     true
 }
 
+#[inline]
+fn is_stable_short_text_candidate(candidate: &RecCandidate, text: &str, max_chars: usize) -> bool {
+    let text_len = recognized_char_count(text);
+    if text_len == 0 || text_len > max_chars {
+        return false;
+    }
+    if candidate.confidence < STABLE_TEXT_CONFIDENCE {
+        return false;
+    }
+    if candidate.avg_margin < STABLE_TEXT_AVG_MARGIN {
+        return false;
+    }
+    if candidate.min_margin < STABLE_TEXT_MIN_MARGIN {
+        return false;
+    }
+    if readable_ratio(text) < STABLE_TEXT_READABLE_RATIO {
+        return false;
+    }
+    if dominant_char_ratio(text) > STABLE_TEXT_DOMINANT_RATIO {
+        return false;
+    }
+    if punctuation_ratio(text) > STABLE_TEXT_PUNCTUATION_RATIO {
+        return false;
+    }
+    true
+}
+
 fn ascii_ratio(text: &str) -> f32 {
     let mut total = 0usize;
     let mut ascii = 0usize;
@@ -9551,6 +11926,18 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_box_candidates_removes_nested_overlaps() {
+        let boxes = vec![
+            (0, 0, 120, 28),
+            (0, 0, 118, 26),
+            (60, 0, 140, 24),
+            (30, 4, 90, 20),
+        ];
+        let kept = dedupe_box_candidates(boxes);
+        assert_eq!(kept, vec![(0, 0, 120, 28), (60, 0, 140, 24)]);
+    }
+
+    #[test]
     fn raw_split_detection_candidates_keep_merged_and_parts() {
         let rgb = image::RgbImage::from_pixel(128, 24, image::Rgb([255, 255, 255]));
         let raw = vec![(0, 0, 40, 12), (46, 0, 104, 12)];
@@ -9707,6 +12094,75 @@ mod tests {
             "",
             2,
             0,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn supplement_pass_progress_detects_meaningful_gain() {
+        assert!(supplement_pass_made_progress(
+            "Alpha",
+            0.61,
+            1,
+            "AlphaBeta",
+            0.61,
+            1
+        ));
+        assert!(supplement_pass_made_progress(
+            "Alpha", 0.61, 1, "Alfa", 0.63, 1
+        ));
+        assert!(supplement_pass_made_progress(
+            "Alpha", 0.61, 1, "Alpha", 0.63, 2
+        ));
+        assert!(!supplement_pass_made_progress(
+            "Alpha", 0.61, 1, "Alpha", 0.61, 1
+        ));
+    }
+
+    #[test]
+    fn supplement_pass_continue_requires_progress_or_repairable_lines() {
+        let weak_regions = vec![ocr_region_with_line(
+            [0, 0, 120, 24],
+            "WeakText",
+            0.38,
+            "det",
+        )];
+        let strong_regions = vec![ocr_region_with_line(
+            [0, 0, 120, 24],
+            "StrongText",
+            0.92,
+            "det",
+        )];
+
+        assert!(should_continue_eager_supplement_pass(
+            "Alpha",
+            0.61,
+            4,
+            1,
+            &weak_regions,
+            "Alpha",
+            0.61,
+            1,
+        ));
+        assert!(!should_continue_eager_supplement_pass(
+            "Alpha",
+            0.61,
+            4,
+            1,
+            &strong_regions,
+            "Alpha",
+            0.61,
+            1,
+        ));
+    }
+
+    #[test]
+    fn should_continue_eager_supplements_short_circuit_for_high_confidence() {
+        assert!(!should_continue_eager_supplements(
+            "AlphaBeta",
+            0.96,
+            4,
+            2,
             &[]
         ));
     }
@@ -10272,6 +12728,15 @@ mod tests {
     #[test]
     fn alt_recognition_is_skipped_for_strong_non_ascii_primary() {
         let mut primary = rec_candidate("测试文本", 0.84, RecVariant::Primary);
+        primary.avg_margin = 0.12;
+        primary.min_margin = 0.08;
+
+        assert!(!should_try_alt_recognition(&primary));
+    }
+
+    #[test]
+    fn alt_recognition_is_skipped_for_stable_short_candidate() {
+        let mut primary = rec_candidate("Alpha", 0.93, RecVariant::Primary);
         primary.avg_margin = 0.12;
         primary.min_margin = 0.08;
 
@@ -10935,6 +13400,32 @@ mod tests {
     }
 
     #[test]
+    fn supplement_box_is_redundant_when_overlap_is_high() {
+        let seen = vec![
+            SupplementSeenBox {
+                bbox: (16, 20, 188, 44),
+                has_reliable_text: true,
+            },
+            SupplementSeenBox {
+                bbox: (240, 24, 324, 48),
+                has_reliable_text: true,
+            },
+        ];
+        assert!(supplement_box_is_redundant((18, 21, 186, 43), &seen));
+        assert!(!supplement_box_is_redundant((10, 18, 36, 36), &seen));
+        assert!(!supplement_box_is_redundant((220, 12, 300, 40), &seen));
+    }
+
+    #[test]
+    fn supplement_box_is_not_redundant_until_reliable() {
+        let seen = vec![SupplementSeenBox {
+            bbox: (16, 20, 188, 44),
+            has_reliable_text: false,
+        }];
+        assert!(!supplement_box_is_redundant((18, 21, 186, 43), &seen));
+    }
+
+    #[test]
     fn supplement_candidate_priority_prefers_focus_boxes_over_higher_scored_sidebar_boxes() {
         let focus_band = Some((120, 420));
         let mut scored = vec![
@@ -11012,6 +13503,21 @@ mod tests {
     }
 
     #[test]
+    fn foreground_binary_variants_limited_respects_budget() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 24, Luma([220])));
+        let variants = foreground_binary_variants_limited(&img, 1);
+        assert!(variants.len() <= 1);
+    }
+
+    #[test]
+    fn local_recognition_variants_limited_respects_budget() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 24, Luma([220])));
+        let variants = local_recognition_variants_limited(&img, 1);
+        assert_eq!(variants.len(), 1);
+        assert!(local_recognition_variants_limited(&img, 2).len() <= 2);
+    }
+
+    #[test]
     fn local_recognition_variants_skip_when_direct_is_stable() {
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(120, 32, Luma([255])));
         let mut stable = rec_candidate("Stable text", 0.86, RecVariant::Primary);
@@ -11032,6 +13538,102 @@ mod tests {
 
         assert!(variants.len() <= 3);
         assert!(!variants.is_empty());
+    }
+
+    #[test]
+    fn local_recognition_candidate_is_final_returns_false_for_weak_candidates() {
+        let mut candidate = rec_candidate("测试", 0.91, RecVariant::Primary);
+        assert!(!local_recognition_candidate_is_final(&candidate));
+
+        candidate.confidence = 0.95;
+        candidate.avg_margin = 0.16;
+        candidate.min_margin = 0.10;
+        candidate.char_min_confidence = 0.96;
+        assert!(local_recognition_candidate_is_final(&candidate));
+    }
+
+    #[test]
+    fn quality_fallback_enhancement_variant_budget_scales_with_confidence() {
+        let weak = rec_candidate("AB", 0.36, RecVariant::Primary);
+        let weak_limit =
+            quality_fallback_enhancement_variant_budget(&weak.text, weak.confidence, 8, 1);
+        assert_eq!(weak_limit, MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS);
+
+        let strong_limit = quality_fallback_enhancement_variant_budget("标题", 0.89, 2, 2);
+        assert_eq!(strong_limit, MAX_ENHANCEMENT_VARIANTS_PER_PASS);
+    }
+
+    #[test]
+    fn crop_enhancement_variants_skip_for_strong_direct_candidate() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(220, 40, Luma([220])));
+        let mut candidate = rec_candidate("AB", 0.93, RecVariant::Primary);
+        candidate.avg_margin = 0.15;
+        candidate.min_margin = 0.10;
+        assert!(!should_try_crop_enhancement_variants(Some(&candidate)));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 0);
+    }
+
+    #[test]
+    fn crop_enhancement_variants_keep_for_uncertain_direct_candidate() {
+        let candidate = rec_candidate("Unstable text", 0.72, RecVariant::Primary);
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(360, 100, Luma([220])));
+        assert!(should_try_crop_enhancement_variants(Some(&candidate)));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 4);
+    }
+
+    #[test]
+    fn crop_enhancement_variants_limit_small_crops_even_when_uncertain() {
+        let candidate = rec_candidate("Maybe", 0.72, RecVariant::Primary);
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(60, 16, Luma([220])));
+        assert!(should_try_crop_enhancement_variants(Some(&candidate)));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 1);
+    }
+
+    #[test]
+    fn crop_enhancement_variants_skip_strong_short_candidate() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(220, 40, Luma([220])));
+        let mut candidate = rec_candidate("AB", 0.93, RecVariant::Primary);
+        candidate.avg_margin = 0.15;
+        candidate.min_margin = 0.10;
+        assert!(!should_try_crop_enhancement_variants(Some(&candidate)));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 0);
+    }
+
+    #[test]
+    fn crop_enhancement_candidate_is_final_requires_high_quality() {
+        let mut candidate = rec_candidate("AB", 0.98, RecVariant::Primary);
+        candidate.avg_margin = 0.16;
+        candidate.min_margin = 0.06;
+        assert!(crop_enhancement_candidate_is_final(&candidate));
+
+        candidate.confidence = 0.95;
+        assert!(!crop_enhancement_candidate_is_final(&candidate));
+    }
+
+    #[test]
+    fn rec_candidate_cache_key_distinguishes_targets_and_variant() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(140, 40, Luma([128])));
+        let cfg = OcrConfig::default();
+        let primary = rec_candidate_cache_key(&img, &cfg, 120, RecVariant::Primary);
+        let primary_fallback = rec_candidate_cache_key(&img, &cfg, 240, RecVariant::Primary);
+        let alt = rec_candidate_cache_key(&img, &cfg, 120, RecVariant::Alt);
+
+        assert_ne!(primary, primary_fallback);
+        assert_ne!(primary, alt);
+    }
+
+    #[test]
+    fn rec_candidate_cache_reuses_inserted_candidate() {
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(80, 20, Luma([128])));
+        let cfg = OcrConfig::default();
+        let key = rec_candidate_cache_key(&img, &cfg, 96, RecVariant::Primary);
+        let candidate = rec_candidate("测试", 0.91, RecVariant::Primary);
+
+        let mut cache = RecCandidateCache::default();
+        cache.put(key, candidate.clone());
+
+        assert_eq!(cache.get(&key).map(|it| it.text.as_str()), Some("测试"));
+        assert_eq!(cache.get(&key).map(|it| it.confidence), Some(0.91));
     }
 
     #[test]

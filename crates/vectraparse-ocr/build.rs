@@ -17,10 +17,16 @@ fn main() {
 
     let lib_dir = canon.join("lib");
 
-    let static_lib = canon.join("static").join("lib").join("libonnxruntime_all.a");
+    let static_lib = canon
+        .join("static")
+        .join("lib")
+        .join("libonnxruntime_all.a");
 
     if static_lib.exists() {
-        println!("cargo:rustc-link-search=native={}", static_lib.parent().unwrap().display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            static_lib.parent().unwrap().display()
+        );
         println!("cargo:rustc-link-arg=-Wl,--whole-archive");
         println!("cargo:rustc-link-lib=static=onnxruntime_all");
         println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
