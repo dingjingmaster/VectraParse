@@ -66,6 +66,8 @@ const BOX_DEDUPE_BUCKET_SIZE: u32 = 64;
 const LOCAL_RECOGNITION_TINY_CROP_AREA: u64 = 3_000;
 const LOCAL_RECOGNITION_SMALL_CROP_AREA: u64 = 10_000;
 const MAX_FAST_TEXT_CHARS: usize = 10;
+const CROP_ENHANCE_TINY_AREA: u64 = 4_000;
+const CROP_ENHANCE_SMALL_AREA: u64 = 8_000;
 const STABLE_TEXT_CONFIDENCE: f32 = 0.90;
 const STABLE_TEXT_AVG_MARGIN: f32 = 0.10;
 const STABLE_TEXT_MIN_MARGIN: f32 = 0.05;
@@ -9744,6 +9746,15 @@ fn crop_enhancement_variant_budget(image: &DynamicImage, direct: Option<&RecCand
         let normalized = normalize_recognized_text(&candidate.text);
         let direct_readable_ratio = readable_ratio(&normalized);
         let text_len = normalized.chars().count();
+        if area <= CROP_ENHANCE_TINY_AREA && text_len <= 6 {
+            return 1;
+        }
+        if area <= CROP_ENHANCE_SMALL_AREA && text_len <= 4 {
+            return 1;
+        }
+        if area <= CROP_ENHANCE_SMALL_AREA && text_len <= 8 {
+            budget = budget.min(2);
+        }
         if is_stable_short_text_candidate(
             candidate,
             &normalized,
@@ -13626,6 +13637,13 @@ mod tests {
         let candidate = rec_candidate("Maybe", 0.72, RecVariant::Primary);
         let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(60, 16, Luma([220])));
         assert!(should_try_crop_enhancement_variants(Some(&candidate)));
+        assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 1);
+    }
+
+    #[test]
+    fn crop_enhancement_variants_limit_short_text_in_small_box() {
+        let candidate = rec_candidate("短字", 0.72, RecVariant::Primary);
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(75, 80, Luma([220])));
         assert_eq!(crop_enhancement_variant_budget(&img, Some(&candidate)), 1);
     }
 
