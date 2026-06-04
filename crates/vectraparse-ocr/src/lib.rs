@@ -68,6 +68,8 @@ const LOCAL_RECOGNITION_SMALL_CROP_AREA: u64 = 10_000;
 const MAX_FAST_TEXT_CHARS: usize = 10;
 const CROP_ENHANCE_TINY_AREA: u64 = 4_000;
 const CROP_ENHANCE_SMALL_AREA: u64 = 8_000;
+const QUALITY_FALLBACK_TINY_AREA: u64 = 5_000;
+const QUALITY_FALLBACK_SMALL_AREA: u64 = 20_000;
 const STABLE_TEXT_CONFIDENCE: f32 = 0.90;
 const STABLE_TEXT_AVG_MARGIN: f32 = 0.10;
 const STABLE_TEXT_MIN_MARGIN: f32 = 0.05;
@@ -1993,6 +1995,7 @@ impl OrtOcrEngine {
             return Ok(());
         }
         let enhancement_limit = quality_fallback_enhancement_variant_budget(
+            img,
             text,
             *confidence,
             det_box_count,
@@ -5739,11 +5742,16 @@ fn quality_fallback_family_budget(text: &str) -> usize {
 }
 
 fn quality_fallback_enhancement_variant_budget(
+    image: &DynamicImage,
     text: &str,
     confidence: f32,
     det_box_count: usize,
     line_count: usize,
 ) -> usize {
+    let (w, h) = image.dimensions();
+    let area = (w as u64).saturating_mul(h as u64);
+    let text_len = recognized_char_count(text);
+
     if text.trim().is_empty() {
         return MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS;
     }
@@ -5753,10 +5761,21 @@ fn quality_fallback_enhancement_variant_budget(
     if confidence < 0.58 || det_box_count >= 6 || line_count == 0 {
         return (MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS - 1).max(1);
     }
-    if line_count >= det_box_count.max(1) {
-        return 4;
+    let mut budget = if line_count >= det_box_count.max(1) {
+        4
+    } else {
+        MAX_ENHANCEMENT_VARIANTS_PER_PASS
+    };
+
+    if area <= QUALITY_FALLBACK_TINY_AREA {
+        if text_len <= 4 {
+            return 1;
+        }
+        budget = budget.min(2);
+    } else if area <= QUALITY_FALLBACK_SMALL_AREA && text_len <= 6 {
+        budget = budget.min(2);
     }
-    MAX_ENHANCEMENT_VARIANTS_PER_PASS
+    budget
 }
 
 fn consume_quality_fallback_family(budget: &mut usize) -> bool {
@@ -13616,13 +13635,25 @@ mod tests {
 
     #[test]
     fn quality_fallback_enhancement_variant_budget_scales_with_confidence() {
+        let large_image = DynamicImage::ImageLuma8(GrayImage::from_pixel(200, 200, Luma([220])));
         let weak = rec_candidate("AB", 0.36, RecVariant::Primary);
-        let weak_limit =
-            quality_fallback_enhancement_variant_budget(&weak.text, weak.confidence, 8, 1);
+        let weak_limit = quality_fallback_enhancement_variant_budget(
+            &large_image,
+            &weak.text,
+            weak.confidence,
+            8,
+            1,
+        );
         assert_eq!(weak_limit, MAX_QUALITY_FALLBACK_ENHANCEMENT_VARIANTS);
 
-        let strong_limit = quality_fallback_enhancement_variant_budget("标题", 0.89, 2, 2);
+        let strong_limit =
+            quality_fallback_enhancement_variant_budget(&large_image, "标题", 0.89, 2, 2);
         assert_eq!(strong_limit, MAX_ENHANCEMENT_VARIANTS_PER_PASS);
+
+        let tiny_image = DynamicImage::ImageLuma8(GrayImage::from_pixel(48, 48, Luma([220])));
+        let tiny_short =
+            quality_fallback_enhancement_variant_budget(&tiny_image, "ABC", 0.86, 2, 2);
+        assert_eq!(tiny_short, 1);
     }
 
     #[test]
