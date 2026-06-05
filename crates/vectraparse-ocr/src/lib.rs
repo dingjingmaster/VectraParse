@@ -10,8 +10,8 @@ use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 
 mod ort;
 
-const EMBED_DET_ONNX: &[u8] = include_bytes!("../../../data/det.onnx");
-const EMBED_REC_ZH_ONNX: &[u8] = include_bytes!("../../../data/chinese/rec.onnx");
+const EMBED_DET_ONNX: &[u8] = include_bytes!("../../../data/ppocrv5-mobile/det.onnx");
+const EMBED_REC_ZH_ONNX: &[u8] = include_bytes!("../../../data/ppocrv5-mobile/rec.onnx");
 const EMBED_REC_EN_ONNX: &[u8] = include_bytes!("../../../data/english/rec.onnx");
 const EMBED_DICT_ZH: &str = include_str!("../../../data/chinese/dict.txt");
 const EMBED_DICT_EN: &str = include_str!("../../../data/english/dict.txt");
@@ -97,14 +97,23 @@ pub struct OcrConfig {
 
 impl Default for OcrConfig {
     fn default() -> Self {
+        let det_model_path = std::env::var("VECTRAPARSE_OCR_DET_MODEL_PATH").ok();
+        let rec_model_path = std::env::var("VECTRAPARSE_OCR_REC_MODEL_PATH").ok();
+        let rec_dict_path = std::env::var("VECTRAPARSE_OCR_REC_DICT_PATH").ok();
+        let rec_alt_model_path = std::env::var("VECTRAPARSE_OCR_REC_ALT_MODEL_PATH")
+            .ok()
+            .or_else(|| Some("data/english/rec.onnx".to_string()));
+        let rec_alt_dict_path = std::env::var("VECTRAPARSE_OCR_REC_ALT_DICT_PATH")
+            .ok()
+            .or_else(|| Some("data/english/dict.txt".to_string()));
         Self {
-            det_model_path: None,
-            rec_model_path: None,
-            rec_dict_path: None,
+            det_model_path,
+            rec_model_path,
+            rec_dict_path,
             rec_img_h: 48,
             rec_img_w: 320,
-            rec_alt_model_path: Some("data/english/rec.onnx".to_string()),
-            rec_alt_dict_path: Some("data/english/dict.txt".to_string()),
+            rec_alt_model_path,
+            rec_alt_dict_path,
             det_img_side: 960,
             det_box_thresh: 0.20,
             det_min_box_area: 20,
@@ -813,10 +822,12 @@ impl OrtOcrEngine {
 
     fn infer_image(&self, img: &DynamicImage, cfg: &OcrConfig) -> Result<OcrResult, String> {
         let total_start = Instant::now();
-        eprintln!("[{}] [OCR] stage=infer-image start", local_timestamp());
         let _rec_cache_scope = OcrWorkContextScope::enter();
         reset_ocr_rec_perf();
         let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!("[{}] [OCR] stage=infer-image start", local_timestamp());
+        }
         let (_, img_h) = img.dimensions();
         let source_has_alpha = has_non_opaque_alpha(img);
         if trace_enabled {
@@ -824,16 +835,20 @@ impl OrtOcrEngine {
             eprintln!("[OCR_TRACE] start dims={w}x{h} alpha={source_has_alpha}");
         }
         let det_start = Instant::now();
-        eprintln!("[{}] [OCR] stage=detected-text start", local_timestamp());
+        if trace_enabled {
+            eprintln!("[{}] [OCR] stage=detected-text start", local_timestamp());
+        }
         let detected = self
             .recognize_detected_text(img, cfg, true, "det", BboxTransform::Identity)
             .map_err(|e| format!("detect: {e}"))?;
         let det_ms = elapsed_ms(det_start);
-        eprintln!(
-            "[{}] [OCR] stage=detected-text done ({}ms)",
-            local_timestamp(),
-            det_ms
-        );
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR] stage=detected-text done ({}ms)",
+                local_timestamp(),
+                det_ms
+            );
+        }
         let det_box_count = detected.det_box_count;
         let detect_used_whole_image_box = det_box_count == 0;
         let mut text = detected.recognized.text.clone();
@@ -884,21 +899,25 @@ impl OrtOcrEngine {
                 &regions,
             )
         {
-            eprintln!(
-                "[{}] [OCR_STATS] page-regions budget=n/a remaining_rec_budget={}",
-                local_timestamp(),
-                remaining_supplement_rec_budget
-            );
-            eprintln!("[{}] [OCR] stage=page-regions start", local_timestamp());
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR_STATS] page-regions budget=n/a remaining_rec_budget={}",
+                    local_timestamp(),
+                    remaining_supplement_rec_budget
+                );
+                eprintln!("[{}] [OCR] stage=page-regions start", local_timestamp());
+            }
             let page_region_start = Instant::now();
             let (page_region_count, page_region_candidate) =
                 self.recognize_page_regions(img, cfg, &detected.boxes)?;
             trace.timing.page_region_ms = elapsed_ms(page_region_start);
-            eprintln!(
-                "[{}] [OCR] stage=page-regions done ({}ms)",
-                local_timestamp(),
-                trace.timing.page_region_ms
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=page-regions done ({}ms)",
+                    local_timestamp(),
+                    trace.timing.page_region_ms
+                );
+            }
             if page_region_count > 0 {
                 trace.det_pass_count += page_region_count;
                 let candidate = if text.trim().is_empty() {
@@ -954,21 +973,25 @@ impl OrtOcrEngine {
             )
             && !should_skip_followup_passes(&text, confidence, det_box_count, line_count, &regions)
         {
-            eprintln!(
-                "[{}] [OCR_STATS] high-res-tiles budget=n/a remaining_rec_budget={}",
-                local_timestamp(),
-                remaining_supplement_rec_budget
-            );
-            eprintln!("[{}] [OCR] stage=high-res-tiles start", local_timestamp());
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR_STATS] high-res-tiles budget=n/a remaining_rec_budget={}",
+                    local_timestamp(),
+                    remaining_supplement_rec_budget
+                );
+                eprintln!("[{}] [OCR] stage=high-res-tiles start", local_timestamp());
+            }
             let tile_start = Instant::now();
             let (tile_region_count, tile_region_candidate) =
                 self.recognize_high_res_tiles(img, cfg, &regions)?;
             trace.timing.tile_ms = elapsed_ms(tile_start);
-            eprintln!(
-                "[{}] [OCR] stage=high-res-tiles done ({}ms)",
-                local_timestamp(),
-                trace.timing.tile_ms
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=high-res-tiles done ({}ms)",
+                    local_timestamp(),
+                    trace.timing.tile_ms
+                );
+            }
             if tile_region_count > 0 {
                 trace.det_pass_count += tile_region_count;
                 maybe_adopt_recognized_traced(
@@ -1030,22 +1053,26 @@ impl OrtOcrEngine {
             && !should_skip_followup_passes(&text, confidence, det_box_count, line_count, &regions)
             && remaining_supplement_rec_budget > 0
         {
-            eprintln!(
-                "[{}] [OCR] stage=uncovered-color-regions start",
-                local_timestamp()
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=uncovered-color-regions start",
+                    local_timestamp()
+                );
+            }
             let color_before_text = text.clone();
             let color_before_confidence = confidence;
             let color_before_line_count = line_count;
             let color_region_start = Instant::now();
             let color_limit =
                 MAX_EAGER_COLOR_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
-            eprintln!(
-                "[{}] [OCR_STATS] color-regions budget={} remaining_rec_budget={}",
-                local_timestamp(),
-                color_limit,
-                remaining_supplement_rec_budget
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR_STATS] color-regions budget={} remaining_rec_budget={}",
+                    local_timestamp(),
+                    color_limit,
+                    remaining_supplement_rec_budget
+                );
+            }
             let (candidate_count, attempted, candidate) = self.recognize_uncovered_color_regions(
                 img,
                 cfg,
@@ -1084,11 +1111,13 @@ impl OrtOcrEngine {
             );
             color_region_count = candidate_count;
             trace.timing.color_region_ms = elapsed_ms(color_region_start);
-            eprintln!(
-                "[{}] [OCR] stage=uncovered-color-regions done ({}ms)",
-                local_timestamp(),
-                trace.timing.color_region_ms
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=uncovered-color-regions done ({}ms)",
+                    local_timestamp(),
+                    trace.timing.color_region_ms
+                );
+            }
 
             enforce_visual_progress = should_continue_eager_supplement_pass(
                 &text,
@@ -1123,22 +1152,26 @@ impl OrtOcrEngine {
                 &regions,
             ) && remaining_supplement_det_budget > 0
             {
-                eprintln!(
-                    "[{}] [OCR] stage=uncovered-color-region-detections start",
-                    local_timestamp()
-                );
+                if trace_enabled {
+                    eprintln!(
+                        "[{}] [OCR] stage=uncovered-color-region-detections start",
+                        local_timestamp()
+                    );
+                }
                 let det_before_text = text.clone();
                 let det_before_confidence = confidence;
                 let det_before_line_count = line_count;
                 let det_color_region_start = Instant::now();
                 let det_limit =
                     MAX_EAGER_COLOR_REGION_DET_PASSES.min(remaining_supplement_det_budget);
-                eprintln!(
-                    "[{}] [OCR_STATS] color-region-det budget={} remaining_det_budget={}",
-                    local_timestamp(),
-                    det_limit,
-                    remaining_supplement_det_budget
-                );
+                if trace_enabled {
+                    eprintln!(
+                        "[{}] [OCR_STATS] color-region-det budget={} remaining_det_budget={}",
+                        local_timestamp(),
+                        det_limit,
+                        remaining_supplement_det_budget
+                    );
+                }
                 let (det_color_region_count, det_pass_count, candidate) = self
                     .recognize_uncovered_color_region_detections(
                         img,
@@ -1152,11 +1185,13 @@ impl OrtOcrEngine {
                     .timing
                     .color_region_ms
                     .saturating_add(elapsed_ms(det_color_region_start));
-                eprintln!(
-                    "[{}] [OCR] stage=uncovered-color-region-detections done ({}ms)",
-                    local_timestamp(),
-                    elapsed_ms(det_color_region_start)
-                );
+                if trace_enabled {
+                    eprintln!(
+                        "[{}] [OCR] stage=uncovered-color-region-detections done ({}ms)",
+                        local_timestamp(),
+                        elapsed_ms(det_color_region_start)
+                    );
+                }
                 color_region_count = color_region_count.max(det_color_region_count);
                 if det_pass_count > 0 {
                     trace.det_pass_count += det_pass_count;
@@ -1228,16 +1263,18 @@ impl OrtOcrEngine {
                 }
                 let layered_limit =
                     MAX_EAGER_LAYERED_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
-                eprintln!(
-                    "[{}] [OCR_STATS] layered-color-regions budget={} remaining_rec_budget={}",
-                    local_timestamp(),
-                    layered_limit,
-                    remaining_supplement_rec_budget
-                );
-                eprintln!(
-                    "[{}] [OCR] stage=layered-color-regions start",
-                    local_timestamp()
-                );
+                if trace_enabled {
+                    eprintln!(
+                        "[{}] [OCR_STATS] layered-color-regions budget={} remaining_rec_budget={}",
+                        local_timestamp(),
+                        layered_limit,
+                        remaining_supplement_rec_budget
+                    );
+                    eprintln!(
+                        "[{}] [OCR] stage=layered-color-regions start",
+                        local_timestamp()
+                    );
+                }
                 let layered_before_text = text.clone();
                 let layered_before_confidence = confidence;
                 let layered_before_line_count = line_count;
@@ -1252,11 +1289,13 @@ impl OrtOcrEngine {
                         &mut supplement_seen_boxes,
                     );
                 trace.timing.layered_region_ms = elapsed_ms(layered_region_start);
-                eprintln!(
-                    "[{}] [OCR] stage=layered-color-regions done ({}ms)",
-                    local_timestamp(),
-                    trace.timing.layered_region_ms
-                );
+                if trace_enabled {
+                    eprintln!(
+                        "[{}] [OCR] stage=layered-color-regions done ({}ms)",
+                        local_timestamp(),
+                        trace.timing.layered_region_ms
+                    );
+                }
                 color_region_count = color_region_count.max(layered_region_count);
                 maybe_adopt_recognized_traced(
                     &mut text,
@@ -1337,16 +1376,18 @@ impl OrtOcrEngine {
         if can_run_visual {
             let visual_limit =
                 MAX_EAGER_VISUAL_REGION_RECOGNITIONS.min(remaining_supplement_rec_budget);
-            eprintln!(
-                "[{}] [OCR_STATS] visual-regions budget={} remaining_rec_budget={}",
-                local_timestamp(),
-                visual_limit,
-                remaining_supplement_rec_budget
-            );
-            eprintln!(
-                "[{}] [OCR] stage=uncovered-visual-regions start",
-                local_timestamp()
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR_STATS] visual-regions budget={} remaining_rec_budget={}",
+                    local_timestamp(),
+                    visual_limit,
+                    remaining_supplement_rec_budget
+                );
+                eprintln!(
+                    "[{}] [OCR] stage=uncovered-visual-regions start",
+                    local_timestamp()
+                );
+            }
             let visual_start = Instant::now();
             let (_attempted, visual_candidate) = self.recognize_uncovered_visual_regions(
                 img,
@@ -1357,11 +1398,13 @@ impl OrtOcrEngine {
                 &mut supplement_seen_boxes,
             );
             trace.timing.visual_region_ms = elapsed_ms(visual_start);
-            eprintln!(
-                "[{}] [OCR] stage=uncovered-visual-regions done ({}ms)",
-                local_timestamp(),
-                trace.timing.visual_region_ms
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=uncovered-visual-regions done ({}ms)",
+                    local_timestamp(),
+                    trace.timing.visual_region_ms
+                );
+            }
             maybe_adopt_recognized_traced(
                 &mut text,
                 &mut confidence,
@@ -1393,10 +1436,12 @@ impl OrtOcrEngine {
         if needs_quality_fallback(&text, confidence, det_box_count, line_count)
             && !should_skip_followup_passes(&text, confidence, det_box_count, line_count, &regions)
         {
-            eprintln!(
-                "[{}] [OCR] stage=quality-fallbacks start",
-                local_timestamp()
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=quality-fallbacks start",
+                    local_timestamp()
+                );
+            }
             let fallback_start = Instant::now();
             self.apply_quality_fallbacks(
                 img,
@@ -1414,11 +1459,13 @@ impl OrtOcrEngine {
                 &mut candidate_pool,
             )?;
             trace.timing.fallback_ms = elapsed_ms(fallback_start);
-            eprintln!(
-                "[{}] [OCR] stage=quality-fallbacks done ({}ms)",
-                local_timestamp(),
-                trace.timing.fallback_ms
-            );
+            if trace_enabled {
+                eprintln!(
+                    "[{}] [OCR] stage=quality-fallbacks done ({}ms)",
+                        local_timestamp(),
+                        trace.timing.fallback_ms
+                );
+            }
         }
 
         let warning = if self.alphabet.is_empty() {
@@ -1508,11 +1555,13 @@ impl OrtOcrEngine {
                 trace.timing.rec_alt_ms
             );
         }
-        eprintln!(
-            "[{}] [OCR] stage=infer-image done ({}ms)",
-            local_timestamp(),
-            elapsed_ms(total_start)
-        );
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR] stage=infer-image done ({}ms)",
+                local_timestamp(),
+                elapsed_ms(total_start)
+            );
+        }
 
         Ok(OcrResult {
             text,
@@ -1554,17 +1603,19 @@ impl OrtOcrEngine {
             0
         };
         let alternative_box_count: usize = boxes.iter().map(|b| b.alternatives.len()).sum();
-        eprintln!(
-            "[{}] [OCR_STATS] det-pass source={} boxes={} alternative_boxes={} budget_crop={} budget_split={} budget_repair={}",
-            local_timestamp(),
-            box_source,
-            boxes.len(),
-            alternative_box_count,
-            crop_budget,
-            split_line_budget,
-            line_repair_budget
-        );
         let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR_STATS] det-pass source={} boxes={} alternative_boxes={} budget_crop={} budget_split={} budget_repair={}",
+                local_timestamp(),
+                box_source,
+                boxes.len(),
+                alternative_box_count,
+                crop_budget,
+                split_line_budget,
+                line_repair_budget
+            );
+        }
         if trace_enabled {
             eprintln!(
                 "[OCR_TRACE] det-pass source={} boxes={} crop_enhance_budget={} split_budget={} repair_budget={}",
@@ -1617,17 +1668,19 @@ impl OrtOcrEngine {
                 );
             }
         }
-        eprintln!(
-            "[{}] [OCR_STATS] det-pass-summary source={} boxes={} alternative_boxes={} budget_crop={} budget_split={} budget_repair={} repeat_split_boxes={}",
-            local_timestamp(),
-            box_source,
-            boxes.len(),
-            alternative_box_count,
-            crop_budget,
-            split_line_budget,
-            line_repair_budget,
-            repeat_split_box_count
-        );
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR_STATS] det-pass-summary source={} boxes={} alternative_boxes={} budget_crop={} budget_split={} budget_repair={} repeat_split_boxes={}",
+                local_timestamp(),
+                box_source,
+                boxes.len(),
+                alternative_box_count,
+                crop_budget,
+                split_line_budget,
+                line_repair_budget,
+                repeat_split_box_count
+            );
+        }
         if trace_enabled {
             eprintln!(
                 "[OCR_TRACE] det-pass-done source={} boxes={} lines={}",
@@ -1657,13 +1710,15 @@ impl OrtOcrEngine {
         base_boxes: &[DetectionBox],
     ) -> Result<(usize, RecognizedText), String> {
         let region_boxes = page_region_boxes(img, base_boxes);
-        eprintln!(
-            "[{}] [OCR_STATS] page-regions candidates={} from_boxes={}",
-            local_timestamp(),
-            region_boxes.len(),
-            base_boxes.len()
-        );
         let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR_STATS] page-regions candidates={} from_boxes={}",
+                local_timestamp(),
+                region_boxes.len(),
+                base_boxes.len()
+            );
+        }
         if trace_enabled {
             eprintln!("[OCR_TRACE] page-regions candidates={}", region_boxes.len());
         }
@@ -1779,12 +1834,14 @@ impl OrtOcrEngine {
         existing_regions: &[OcrTextRegion],
     ) -> Result<(usize, RecognizedText), String> {
         let tile_boxes = high_res_tile_boxes(img, cfg.det_img_side);
-        eprintln!(
-            "[{}] [OCR_STATS] high-res-tiles candidates={}",
-            local_timestamp(),
-            tile_boxes.len()
-        );
         let trace_enabled = ocr_trace_enabled();
+        if trace_enabled {
+            eprintln!(
+                "[{}] [OCR_STATS] high-res-tiles candidates={}",
+                local_timestamp(),
+                tile_boxes.len()
+            );
+        }
         if trace_enabled {
             eprintln!("[OCR_TRACE] high-res-tiles candidates={}", tile_boxes.len());
         }
@@ -1846,55 +1903,25 @@ impl OrtOcrEngine {
         lines: &mut Vec<TextLine>,
         repeat_split_box_count: &mut usize,
     ) {
-        let trace_box_timing = should_log_detected_text_box_timing(source, b);
-        let mut direct_ms = 0u64;
-        let mut split_prepare_ms = 0u64;
-        let mut split_rec_ms = 0u64;
-        let mut forced_split_ms = 0u64;
-        let mut direct_retry_ms = 0u64;
-        let mut enhance_ms = 0u64;
-        let mut repair_ms = 0u64;
-        let mut split_box_count = 0usize;
-        let mut forced_box_count = 0usize;
         let mut forced_boxes_cache: Option<Vec<BoxRect>> = None;
         let per_box_split_budget = split_line_budget_for_box(b, *split_line_rec_budget);
         let direct_crop = crop_box(img, b);
         let mut direct = if should_try_direct_first_for_box(b, source) {
-            let direct_start = Instant::now();
             let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
             let direct_is_strong = direct
                 .as_ref()
                 .is_some_and(|candidate| candidate.confidence >= MIN_STRONG_REC_CONFIDENCE);
-            direct_ms = direct_ms.saturating_add(elapsed_ms(direct_start));
             if allow_crop_enhancement
                 && !direct_is_strong
                 && *crop_enhancement_budget > 0
                 && should_enhance_crop(b)
             {
                 *crop_enhancement_budget -= 1;
-                let enhance_start = Instant::now();
                 direct = self.best_from_crop(&direct_crop, cfg, direct.clone()).or(direct);
-                enhance_ms = enhance_ms.saturating_add(elapsed_ms(enhance_start));
             }
             if let Some(candidate) = direct.as_ref()
                 && direct_candidate_is_good_enough_for_large_box(b, candidate)
             {
-                log_detected_text_box_timing(
-                    trace_box_timing,
-                    source,
-                    b,
-                    "direct-first",
-                    direct_ms,
-                    split_prepare_ms,
-                    split_rec_ms,
-                    forced_split_ms,
-                    direct_retry_ms,
-                    enhance_ms,
-                    repair_ms,
-                    split_box_count,
-                    forced_box_count,
-                    Some(candidate),
-                );
                 lines.extend(candidate_text_lines(img, b, candidate, source, transform));
                 return;
             }
@@ -1905,7 +1932,6 @@ impl OrtOcrEngine {
 
         let using_alternatives =
             alternative_boxes.len() >= 2 && alternative_boxes.len() <= per_box_split_budget;
-        let split_prepare_start = Instant::now();
         let mut split_boxes = if using_alternatives {
             alternative_boxes.to_vec()
         } else {
@@ -1916,11 +1942,10 @@ impl OrtOcrEngine {
             split_boxes = split_text_box_into_line_boxes(img, b);
         }
         split_boxes = dedupe_box_candidates(split_boxes);
-        split_prepare_ms = split_prepare_ms.saturating_add(elapsed_ms(split_prepare_start));
-        split_box_count = split_boxes.len();
+        let split_box_count = split_boxes.len();
         let deduped_split_boxes = split_box_pre_dedupe.saturating_sub(split_boxes.len());
         *repeat_split_box_count = repeat_split_box_count.saturating_add(deduped_split_boxes);
-        if deduped_split_boxes > 0 {
+        if deduped_split_boxes > 0 && ocr_trace_enabled() {
             let (x0, y0, _x1, _y1) = b;
             eprintln!(
                 "[{}] [OCR_STATS] split-boxes-dedupe source={} box={}x{}@{},{} pre_dedupe={} deduped={} post_dedupe={}",
@@ -1936,10 +1961,8 @@ impl OrtOcrEngine {
             );
         }
         if split_boxes.len() >= 2 && split_boxes.len() <= per_box_split_budget {
-            let split_rec_start = Instant::now();
             let split_lines =
                 self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
-            split_rec_ms = split_rec_ms.saturating_add(elapsed_ms(split_rec_start));
             let direct_for_comparison = if using_alternatives {
                 direct
                     .clone()
@@ -1949,42 +1972,10 @@ impl OrtOcrEngine {
             };
             if should_use_split_lines(direct_for_comparison.as_ref(), &split_lines) {
                 *split_line_rec_budget -= split_boxes.len();
-                log_detected_text_box_timing(
-                    trace_box_timing,
-                    source,
-                    b,
-                    "split-lines",
-                    direct_ms,
-                    split_prepare_ms,
-                    split_rec_ms,
-                    forced_split_ms,
-                    direct_retry_ms,
-                    enhance_ms,
-                    repair_ms,
-                    split_box_count,
-                    forced_box_count,
-                    direct_for_comparison.as_ref(),
-                );
                 lines.extend(split_lines);
                 return;
             }
             if let Some(candidate) = direct_for_comparison {
-                log_detected_text_box_timing(
-                    trace_box_timing,
-                    source,
-                    b,
-                    "direct-after-split-compare",
-                    direct_ms,
-                    split_prepare_ms,
-                    split_rec_ms,
-                    forced_split_ms,
-                    direct_retry_ms,
-                    enhance_ms,
-                    repair_ms,
-                    split_box_count,
-                    forced_box_count,
-                    Some(&candidate),
-                );
                 lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
                 return;
             }
@@ -1997,7 +1988,6 @@ impl OrtOcrEngine {
             let forced_boxes = forced_boxes_cache.get_or_insert_with(|| {
                 forced_structural_split_boxes(img, b, forced_budget)
             });
-            forced_box_count = forced_boxes.len();
             if should_try_forced_split(
                 b,
                 direct.as_ref(),
@@ -2005,7 +1995,6 @@ impl OrtOcrEngine {
                 forced_boxes.len(),
             ) {
                 let forced_source = format!("{source}:forced");
-                let forced_split_start = Instant::now();
                 let split_lines = self.recognize_split_line_boxes(
                     img,
                     cfg,
@@ -2013,28 +2002,11 @@ impl OrtOcrEngine {
                     &forced_source,
                     transform,
                 );
-                forced_split_ms = forced_split_ms.saturating_add(elapsed_ms(forced_split_start));
                 if structured_split_lines_are_plausible(b, &split_lines) {
                     consume_recognition_budget(
                         forced_boxes.len(),
                         split_line_rec_budget,
                         line_repair_rec_budget,
-                    );
-                    log_detected_text_box_timing(
-                        trace_box_timing,
-                        source,
-                        b,
-                        "forced-priority-split",
-                        direct_ms,
-                        split_prepare_ms,
-                        split_rec_ms,
-                        forced_split_ms,
-                        direct_retry_ms,
-                        enhance_ms,
-                        repair_ms,
-                        split_box_count,
-                        forced_box_count,
-                        direct.as_ref(),
                     );
                     lines.extend(split_lines);
                     return;
@@ -2043,15 +2015,12 @@ impl OrtOcrEngine {
         }
 
         if direct.is_none() {
-            let direct_retry_start = Instant::now();
             direct = self.best_from_crop_direct(&direct_crop, cfg);
-            direct_retry_ms = direct_retry_ms.saturating_add(elapsed_ms(direct_retry_start));
         }
         if large_text_box_needs_structured_split(b) {
             let forced_boxes = forced_boxes_cache.get_or_insert_with(|| {
                 forced_structural_split_boxes(img, b, forced_budget)
             });
-            forced_box_count = forced_box_count.max(forced_boxes.len());
             if should_try_forced_split(
                 b,
                 direct.as_ref(),
@@ -2059,7 +2028,6 @@ impl OrtOcrEngine {
                 forced_boxes.len(),
             ) {
                 let forced_source = format!("{source}:forced");
-                let forced_split_start = Instant::now();
                 let split_lines = self.recognize_split_line_boxes(
                     img,
                     cfg,
@@ -2067,28 +2035,11 @@ impl OrtOcrEngine {
                     &forced_source,
                     transform,
                 );
-                forced_split_ms = forced_split_ms.saturating_add(elapsed_ms(forced_split_start));
                 if should_use_forced_split_lines(b, direct.as_ref(), &split_lines) {
                     consume_recognition_budget(
                         forced_boxes.len(),
                         split_line_rec_budget,
                         line_repair_rec_budget,
-                    );
-                    log_detected_text_box_timing(
-                        trace_box_timing,
-                        source,
-                        b,
-                        "forced-structured-split",
-                        direct_ms,
-                        split_prepare_ms,
-                        split_rec_ms,
-                        forced_split_ms,
-                        direct_retry_ms,
-                        enhance_ms,
-                        repair_ms,
-                        split_box_count,
-                        forced_box_count,
-                        direct.as_ref(),
                     );
                     lines.extend(split_lines);
                     return;
@@ -2104,14 +2055,11 @@ impl OrtOcrEngine {
             && should_enhance_crop(b)
         {
             *crop_enhancement_budget -= 1;
-            let enhance_start = Instant::now();
             direct = self
                 .best_from_crop(&direct_crop, cfg, direct.clone())
                 .or(direct);
-            enhance_ms = enhance_ms.saturating_add(elapsed_ms(enhance_start));
         };
 
-        let repair_start = Instant::now();
         if let Some(repaired) = self.repair_recognized_box_lines(
             img,
             cfg,
@@ -2127,63 +2075,12 @@ impl OrtOcrEngine {
                 forced_boxes_cache.as_deref()
             },
         ) {
-            repair_ms = repair_ms.saturating_add(elapsed_ms(repair_start));
-            log_detected_text_box_timing(
-                trace_box_timing,
-                source,
-                b,
-                "repair",
-                direct_ms,
-                split_prepare_ms,
-                split_rec_ms,
-                forced_split_ms,
-                direct_retry_ms,
-                enhance_ms,
-                repair_ms,
-                split_box_count,
-                forced_box_count,
-                direct.as_ref(),
-            );
             lines.extend(repaired);
             return;
         }
-        repair_ms = repair_ms.saturating_add(elapsed_ms(repair_start));
 
         if let Some(candidate) = direct {
-            log_detected_text_box_timing(
-                trace_box_timing,
-                source,
-                b,
-                "direct-final",
-                direct_ms,
-                split_prepare_ms,
-                split_rec_ms,
-                forced_split_ms,
-                direct_retry_ms,
-                enhance_ms,
-                repair_ms,
-                split_box_count,
-                forced_box_count,
-                Some(&candidate),
-            );
             lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
-        } else {
-            log_detected_text_box_timing(
-                trace_box_timing,
-                source,
-                b,
-                "no-result",
-                direct_ms,
-                split_prepare_ms,
-                split_rec_ms,
-                forced_split_ms,
-                direct_retry_ms,
-                enhance_ms,
-                repair_ms,
-                split_box_count,
-                forced_box_count,
-                None,
-            );
         }
     }
 
@@ -3112,18 +3009,20 @@ impl OrtOcrEngine {
             }
             supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
-        eprintln!(
-            "[{}] [OCR_STATS] color-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_covered={} skipped_not_worth={} skipped_redundant={}",
-            local_timestamp(),
-            source,
-            raw_boxes.len(),
-            boxes.len(),
-            recognition_limit,
-            attempted,
-            skipped_covered,
-            skipped_not_worth,
-            skipped_redundant
-        );
+        if ocr_trace_enabled() {
+            eprintln!(
+                "[{}] [OCR_STATS] color-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_covered={} skipped_not_worth={} skipped_redundant={}",
+                local_timestamp(),
+                source,
+                raw_boxes.len(),
+                boxes.len(),
+                recognition_limit,
+                attempted,
+                skipped_covered,
+                skipped_not_worth,
+                skipped_redundant
+            );
+        }
         (
             raw_boxes.len(),
             attempted,
@@ -3251,17 +3150,19 @@ impl OrtOcrEngine {
                 no_gain_streak = 0;
             }
         }
-        eprintln!(
-            "[{}] [OCR_STATS] color-region-det source={} raw_candidates={} selected_candidates={} det_limit={} det_calls={} skipped_redundant={} skipped_local_upscale={}",
-            local_timestamp(),
-            source,
-            candidate_count,
-            boxes.len(),
-            recognition_limit,
-            det_pass_count,
-            skipped_redundant,
-            skipped_local_det_upscale
-        );
+        if ocr_trace_enabled() {
+            eprintln!(
+                "[{}] [OCR_STATS] color-region-det source={} raw_candidates={} selected_candidates={} det_limit={} det_calls={} skipped_redundant={} skipped_local_upscale={}",
+                local_timestamp(),
+                source,
+                candidate_count,
+                boxes.len(),
+                recognition_limit,
+                det_pass_count,
+                skipped_redundant,
+                skipped_local_det_upscale
+            );
+        }
 
         (
             candidate_count,
@@ -3315,18 +3216,20 @@ impl OrtOcrEngine {
             }
             supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
-        eprintln!(
-            "[{}] [OCR_STATS] layered-color-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_covered={} skipped_not_worth={} skipped_redundant={}",
-            local_timestamp(),
-            source,
-            candidate_count,
-            boxes.len(),
-            recognition_limit,
-            attempted,
-            skipped_covered,
-            skipped_not_worth,
-            skipped_redundant
-        );
+        if ocr_trace_enabled() {
+            eprintln!(
+                "[{}] [OCR_STATS] layered-color-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_covered={} skipped_not_worth={} skipped_redundant={}",
+                local_timestamp(),
+                source,
+                candidate_count,
+                boxes.len(),
+                recognition_limit,
+                attempted,
+                skipped_covered,
+                skipped_not_worth,
+                skipped_redundant
+            );
+        }
         (
             candidate_count,
             attempted,
@@ -3378,17 +3281,19 @@ impl OrtOcrEngine {
             }
             supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
         }
-        eprintln!(
-            "[{}] [OCR_STATS] visual-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_not_worth={} skipped_redundant={}",
-            local_timestamp(),
-            source,
-            boxes.len(),
-            boxes.len(),
-            recognition_limit,
-            attempted,
-            skipped_not_worth,
-            skipped_redundant
-        );
+        if ocr_trace_enabled() {
+            eprintln!(
+                "[{}] [OCR_STATS] visual-regions source={} raw_candidates={} selected_candidates={} limit={} attempted={} skipped_not_worth={} skipped_redundant={}",
+                local_timestamp(),
+                source,
+                boxes.len(),
+                boxes.len(),
+                recognition_limit,
+                attempted,
+                skipped_not_worth,
+                skipped_redundant
+            );
+        }
         (attempted, recognized_from_text_lines(&mut lines))
     }
 
@@ -7691,62 +7596,6 @@ fn split_line_budget_for_box(b: BoxRect, remaining_budget: usize) -> usize {
     }
 }
 
-fn should_log_detected_text_box_timing(source: &str, b: BoxRect) -> bool {
-    source == "det" && (ultra_wide_text_box(b) || large_text_box_should_prioritize_split(b))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_detected_text_box_timing(
-    enabled: bool,
-    source: &str,
-    b: BoxRect,
-    path: &str,
-    direct_ms: u64,
-    split_prepare_ms: u64,
-    split_rec_ms: u64,
-    forced_split_ms: u64,
-    direct_retry_ms: u64,
-    enhance_ms: u64,
-    repair_ms: u64,
-    split_box_count: usize,
-    forced_box_count: usize,
-    direct: Option<&RecCandidate>,
-) {
-    if !enabled {
-        return;
-    }
-    let (x0, y0, _x1, _y1) = b;
-    let (direct_conf, direct_chars) = direct
-        .map(|candidate| {
-            (
-                candidate.confidence,
-                recognized_char_count(&normalize_recognized_text(&candidate.text)),
-            )
-        })
-        .unwrap_or((0.0, 0));
-    eprintln!(
-        "[{}] [OCR_STATS] det-box-timing source={} box={}x{}@{},{} path={} direct_ms={} split_prepare_ms={} split_rec_ms={} forced_split_ms={} direct_retry_ms={} enhance_ms={} repair_ms={} split_boxes={} forced_boxes={} direct_conf={:.3} direct_chars={}",
-        local_timestamp(),
-        source,
-        box_width(b),
-        box_height(b),
-        x0,
-        y0,
-        path,
-        direct_ms,
-        split_prepare_ms,
-        split_rec_ms,
-        forced_split_ms,
-        direct_retry_ms,
-        enhance_ms,
-        repair_ms,
-        split_box_count,
-        forced_box_count,
-        direct_conf,
-        direct_chars
-    );
-}
-
 fn line_repair_recognition_budget(source: &str) -> usize {
     if source == "det" {
         MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
@@ -8429,21 +8278,23 @@ impl OrtOcrEngine {
         let alternative_box_count: usize = boxes.iter().map(|b| b.alternatives.len()).sum();
         let alternative_drop_count =
             alternative_raw_count.saturating_sub(alternative_deduped_count);
-        eprintln!(
-            "[{}] [OCR_STATS] detect-text-boxes raw={} scaled_before_nms={} scaled_after_nms={} merged_before_dedupe={} merged_after_dedupe={} merged_removed={} alternative_raw={} alternative_deduped={} alternative_removed={} final={} alternatives={}",
-            local_timestamp(),
-            raw_box_count,
-            scaled_before_nms,
-            scaled_after_nms,
-            merged_before_dedupe,
-            merged_after_dedupe,
-            deduped_merge_count,
-            alternative_raw_count,
-            alternative_deduped_count,
-            alternative_drop_count,
-            boxes.len(),
-            alternative_box_count
-        );
+        if ocr_trace_enabled() {
+            eprintln!(
+                "[{}] [OCR_STATS] detect-text-boxes raw={} scaled_before_nms={} scaled_after_nms={} merged_before_dedupe={} merged_after_dedupe={} merged_removed={} alternative_raw={} alternative_deduped={} alternative_removed={} final={} alternatives={}",
+                local_timestamp(),
+                raw_box_count,
+                scaled_before_nms,
+                scaled_after_nms,
+                merged_before_dedupe,
+                merged_after_dedupe,
+                deduped_merge_count,
+                alternative_raw_count,
+                alternative_deduped_count,
+                alternative_drop_count,
+                boxes.len(),
+                alternative_box_count
+            );
+        }
         Ok(boxes)
     }
 }
