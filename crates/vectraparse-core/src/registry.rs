@@ -39,12 +39,7 @@ impl ProviderRegistry {
         reg
     }
 
-    pub fn register_detector(
-        &mut self,
-        name: &str,
-        priority: i32,
-        feature: Option<&str>,
-    ) {
+    pub fn register_detector(&mut self, name: &str, priority: i32, feature: Option<&str>) {
         self.detectors.push(DetectorProvider {
             name: name.to_string(),
             priority,

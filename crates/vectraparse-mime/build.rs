@@ -12,8 +12,10 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn main() {
-    let source = env::var("TIKA_MIME_XML")
-        .unwrap_or_else(|_| "/data/source/tika/tika-core/src/main/resources/org/apache/tika/mime/tika-mimetypes.xml".to_string());
+    let source = env::var("TIKA_MIME_XML").unwrap_or_else(|_| {
+        "/data/source/tika/tika-core/src/main/resources/org/apache/tika/mime/tika-mimetypes.xml"
+            .to_string()
+    });
     println!("cargo:rerun-if-env-changed=TIKA_MIME_XML");
     println!("cargo:rerun-if-changed={source}");
 

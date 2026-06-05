@@ -1,4 +1,4 @@
-use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
@@ -48,7 +48,8 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
     if kind == "ole-unknown" {
         warnings.push("Unsupported".to_string());
     }
-    let (mut text, structured_ok, ocr_warnings) = extract_text_by_kind(capped_input, kind, streams.as_ref());
+    let (mut text, structured_ok, ocr_warnings) =
+        extract_text_by_kind(capped_input, kind, streams.as_ref());
     warnings.extend(ocr_warnings);
     if kind == "msoffice-ownerfile" {
         let normalized = normalize_ownerfile_doc_tail(&text);
@@ -57,7 +58,9 @@ pub fn extract_legacy_mso_text(input: &[u8]) -> Option<LegacyMsoExtract> {
             kind = "doc";
         }
     }
-    if (matches!(kind, "doc" | "xls" | "ppt") && !structured_ok && !text.trim().is_empty()) || capped {
+    if (matches!(kind, "doc" | "xls" | "ppt") && !structured_ok && !text.trim().is_empty())
+        || capped
+    {
         warnings.push("PartialExtracted".to_string());
     }
     Some(LegacyMsoExtract {
@@ -71,11 +74,15 @@ fn normalize_ownerfile_doc_tail(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let has_doc_anchor = text.contains("\n0Table") || text.contains("\n1Table") || text.contains("\nWpsCustomData");
+    let has_doc_anchor =
+        text.contains("\n0Table") || text.contains("\n1Table") || text.contains("\nWpsCustomData");
     if !has_doc_anchor {
         return text.to_string();
     }
-    let mut lines = text.lines().map(|s| s.trim().to_string()).collect::<Vec<_>>();
+    let mut lines = text
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<_>>();
     lines.retain(|s| !s.is_empty());
     let mut cleaned = truncate_doc_tail_noise(lines, "doc");
     cleaned = trim_trailing_noise(cleaned, "doc");
@@ -159,7 +166,10 @@ fn detect_kind(input: &[u8]) -> &'static str {
 }
 
 fn detect_kind_from_streams(kind: &'static str, streams: &[OleStream]) -> &'static str {
-    if streams.iter().any(|s| s.name.eq_ignore_ascii_case("WordDocument")) {
+    if streams
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case("WordDocument"))
+    {
         return "doc";
     }
     if streams
@@ -177,9 +187,15 @@ fn detect_kind_from_streams(kind: &'static str, streams: &[OleStream]) -> &'stat
     kind
 }
 
-fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream>>) -> (String, bool, Vec<String>) {
+fn extract_text_by_kind(
+    input: &[u8],
+    kind: &str,
+    streams: Option<&Vec<OleStream>>,
+) -> (String, bool, Vec<String>) {
     let doc_image_ocr = if kind == "doc" {
-        streams.map(|streams| extract_doc_image_ocr(streams)).unwrap_or_default()
+        streams
+            .map(|streams| extract_doc_image_ocr(streams))
+            .unwrap_or_default()
     } else {
         DocImageOcrExtract::default()
     };
@@ -265,7 +281,11 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
             break;
         }
     }
-    let mut cleaned = if kind == "doc" { out } else { trim_leading_noise(out) };
+    let mut cleaned = if kind == "doc" {
+        out
+    } else {
+        trim_leading_noise(out)
+    };
     cleaned = truncate_doc_tail_noise(cleaned, kind);
     cleaned = trim_trailing_noise(cleaned, kind);
     if kind == "doc" && !doc_image_ocr.lines.is_empty() {
@@ -274,7 +294,10 @@ fn extract_text_by_kind(input: &[u8], kind: &str, streams: Option<&Vec<OleStream
     (cleaned.join("\n"), false, doc_image_ocr.warnings)
 }
 
-fn select_doc_scan_sources<'a>(input: &'a [u8], streams: Option<&'a Vec<OleStream>>) -> Vec<&'a [u8]> {
+fn select_doc_scan_sources<'a>(
+    input: &'a [u8],
+    streams: Option<&'a Vec<OleStream>>,
+) -> Vec<&'a [u8]> {
     let Some(streams) = streams else {
         return vec![input];
     };
@@ -400,7 +423,11 @@ struct PptRecord {
     data: Vec<u8>,
 }
 
-fn walk_ppt_records(input: &[u8], max_depth: usize, max_record_len: usize) -> Option<Vec<PptRecord>> {
+fn walk_ppt_records(
+    input: &[u8],
+    max_depth: usize,
+    max_record_len: usize,
+) -> Option<Vec<PptRecord>> {
     let mut out = Vec::new();
     walk_ppt_records_inner(input, 0, max_depth, max_record_len, &mut out)?;
     Some(out)
@@ -437,7 +464,13 @@ fn walk_ppt_records_inner(
             data: input[data_start..data_end].to_vec(),
         });
         if rec_ver == 0x0F {
-            walk_ppt_records_inner(&input[data_start..data_end], depth + 1, max_depth, max_record_len, out)?;
+            walk_ppt_records_inner(
+                &input[data_start..data_end],
+                depth + 1,
+                max_depth,
+                max_record_len,
+                out,
+            )?;
         }
         pos = data_end;
     }
@@ -513,7 +546,12 @@ fn looks_like_mojibake(s: &str) -> bool {
     }
     let suspicious = s
         .chars()
-        .filter(|c| matches!(*c, 'Ã' | 'Â' | 'â' | '€' | '™' | 'œ' | 'ž' | '¤' | 'ä' | 'å' | 'æ'))
+        .filter(|c| {
+            matches!(
+                *c,
+                'Ã' | 'Â' | 'â' | '€' | '™' | 'œ' | 'ž' | '¤' | 'ä' | 'å' | 'æ'
+            )
+        })
         .count();
     suspicious * 10 >= s.chars().count()
 }
@@ -574,7 +612,9 @@ fn extract_xls_text_structured(streams: &[OleStream]) -> Option<String> {
                 }
             }
             0x00FC => {
-                if let Some(strings) = parse_sst_strings_with_continue(workbook, rec.offset, preferred_encoding) {
+                if let Some(strings) =
+                    parse_sst_strings_with_continue(workbook, rec.offset, preferred_encoding)
+                {
                     sst_strings = strings.clone();
                     sst_preview = strings.into_iter().take(3).collect();
                 }
@@ -734,7 +774,10 @@ fn parse_sst_plain_strings(
             if pos + cch > bytes.len() {
                 break;
             }
-            out.push(decode_bytes_with_strategy(&bytes[pos..pos + cch], preferred));
+            out.push(decode_bytes_with_strategy(
+                &bytes[pos..pos + cch],
+                preferred,
+            ));
             pos += cch;
         }
     }
@@ -882,7 +925,10 @@ fn format_sheet_blocks(mut cells: Vec<XlsCell>) -> Vec<String> {
     blocks
 }
 
-fn parse_label_record(data: &[u8], preferred: Option<&'static Encoding>) -> Option<(u16, u16, String)> {
+fn parse_label_record(
+    data: &[u8],
+    preferred: Option<&'static Encoding>,
+) -> Option<(u16, u16, String)> {
     if data.len() < 8 {
         return None;
     }
@@ -942,7 +988,9 @@ fn parse_formula_cached_record(data: &[u8]) -> Option<(u16, u16, FormulaCachedVa
     if result[6] == 0xFF && result[7] == 0xFF {
         let value = match result[0] {
             0x00 => FormulaCachedValue::StringPending,
-            0x01 => FormulaCachedValue::Boolean(if result[2] == 0 { "FALSE" } else { "TRUE" }.to_string()),
+            0x01 => FormulaCachedValue::Boolean(
+                if result[2] == 0 { "FALSE" } else { "TRUE" }.to_string(),
+            ),
             0x02 => FormulaCachedValue::Error(decode_excel_error(result[2]).to_string()),
             0x03 => FormulaCachedValue::Blank,
             _ => FormulaCachedValue::Blank,
@@ -1141,7 +1189,12 @@ fn parse_doc_piece_table_from_office_core(
     None
 }
 
-fn parse_doc_piece_table_plcf(word: &[u8], plcf: &[u8], ccp_text: usize, fib: DocFib) -> Option<String> {
+fn parse_doc_piece_table_plcf(
+    word: &[u8],
+    plcf: &[u8],
+    ccp_text: usize,
+    fib: DocFib,
+) -> Option<String> {
     if plcf.len() < 16 {
         return None;
     }
@@ -1291,7 +1344,9 @@ fn scan_ascii_runs_from_office_core(bytes: &[u8], min_chars: usize) -> Vec<Strin
             cursor += 1;
         }
         if cursor - start >= min_chars {
-            let text = normalize_text_from_office_core(&decode_single_byte_from_office_core(&bytes[start..cursor]));
+            let text = normalize_text_from_office_core(&decode_single_byte_from_office_core(
+                &bytes[start..cursor],
+            ));
             if !text.is_empty() {
                 runs.push(text);
             }
@@ -1360,7 +1415,10 @@ fn normalize_text_from_office_core(input: &str) -> String {
 }
 
 fn decode_single_byte_from_office_core(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| decode_cp1252_from_office_core(*byte)).collect()
+    bytes
+        .iter()
+        .map(|byte| decode_cp1252_from_office_core(*byte))
+        .collect()
 }
 
 fn decode_cp1252_from_office_core(byte: u8) -> char {
@@ -1417,8 +1475,27 @@ fn is_common_doc_body_char(ch: char) -> bool {
         || ch.is_ascii_punctuation()
         || matches!(
             ch,
-            '，' | '。' | '；' | '：' | '！' | '？' | '（' | '）' | '【' | '】' | '《' | '》' | '、' | '“'
-                | '”' | '‘' | '’' | '￥' | '…' | '·' | '—' | '－'
+            '，' | '。'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '、'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '￥'
+                | '…'
+                | '·'
+                | '—'
+                | '－'
         )
         || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
         || ('\u{3400}'..='\u{4DBF}').contains(&ch)
@@ -1477,7 +1554,8 @@ fn is_doc_mojibake_line(line: &str) -> bool {
     }
     if t.len() >= 32
         && t.len() % 4 == 0
-        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
     {
         return true;
     }
@@ -1493,9 +1571,7 @@ fn is_doc_mojibake_line(line: &str) -> bool {
         .count();
     let ascii_alpha = compact.chars().filter(|c| c.is_ascii_alphabetic()).count();
     let ascii_upper = compact.chars().filter(|c| c.is_ascii_uppercase()).count();
-    if compact.chars().all(|c| c.is_ascii_alphabetic())
-        && compact.eq_ignore_ascii_case("cambria")
-    {
+    if compact.chars().all(|c| c.is_ascii_alphabetic()) && compact.eq_ignore_ascii_case("cambria") {
         return true;
     }
     if cjk >= 2 && ascii_alpha > 0 && len <= 10 && ascii_upper < ascii_alpha {
@@ -1619,7 +1695,10 @@ fn ansi_piece_byte_len(cp_chars: usize, fib: DocFib) -> usize {
 fn is_dbcs_ansi(fib: DocFib) -> bool {
     matches!(fib.chs_tables, 128 | 129 | 134 | 136)
         || matches!(fib.chs, 128 | 129 | 134 | 136)
-        || matches!(fib.lid, 0x0411 | 0x0412 | 0x0404 | 0x0C04 | 0x1404 | 0x0804 | 0x1004)
+        || matches!(
+            fib.lid,
+            0x0411 | 0x0412 | 0x0404 | 0x0C04 | 0x1404 | 0x0804 | 0x1004
+        )
 }
 
 fn select_ansi_encoding(fib: DocFib) -> Option<&'static Encoding> {
@@ -1886,7 +1965,11 @@ struct OleStream {
     data: Vec<u8>,
 }
 
-fn select_scan_bytes<'a>(input: &'a [u8], kind: &str, streams: Option<&'a Vec<OleStream>>) -> &'a [u8] {
+fn select_scan_bytes<'a>(
+    input: &'a [u8],
+    kind: &str,
+    streams: Option<&'a Vec<OleStream>>,
+) -> &'a [u8] {
     let Some(streams) = streams else {
         return input;
     };
@@ -2036,7 +2119,8 @@ fn carve_embedded_images(data: &[u8]) -> Vec<Vec<u8>> {
             }
         }
         if data[i..].starts_with(b"BM") && i + 6 <= data.len() {
-            let sz = u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]) as usize;
+            let sz =
+                u32::from_le_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]) as usize;
             if sz >= 64 && i + sz <= data.len() {
                 out.push(data[i..i + sz].to_vec());
                 i += sz;
@@ -2323,7 +2407,10 @@ impl<'a> Cfb<'a> {
             return self.read_mini_stream(entry);
         }
         let mut bytes = self
-            .read_chain(entry.start_sector, entry.stream_size.min(32 * 1024 * 1024) as usize)
+            .read_chain(
+                entry.start_sector,
+                entry.stream_size.min(32 * 1024 * 1024) as usize,
+            )
             .ok_or(())?;
         bytes.truncate(entry.stream_size as usize);
         Ok(bytes)
@@ -2354,7 +2441,9 @@ impl<'a> Cfb<'a> {
             return Vec::new();
         }
         let max_len = root.stream_size.min(32 * 1024 * 1024) as usize;
-        let mut bytes = self.read_chain(root.start_sector, max_len).unwrap_or_default();
+        let mut bytes = self
+            .read_chain(root.start_sector, max_len)
+            .unwrap_or_default();
         bytes.truncate(root.stream_size as usize);
         bytes
     }
@@ -2443,7 +2532,9 @@ fn le_u32(input: &[u8], offset: usize) -> Option<u32> {
 
 fn le_u64(input: &[u8], offset: usize) -> Option<u64> {
     let b = input.get(offset..offset + 8)?;
-    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn is_end_of_chain(v: u32) -> bool {
@@ -2516,7 +2607,9 @@ fn extract_utf16le_strings(input: &[u8], min_len: usize, max_chars: usize) -> Ve
             buf.push(u);
             continue;
         }
-        if buf.len() >= min_len && let Ok(s) = String::from_utf16(&buf) {
+        if buf.len() >= min_len
+            && let Ok(s) = String::from_utf16(&buf)
+        {
             consumed += s.len();
             out.push(s);
         }
@@ -2594,7 +2687,10 @@ fn truncate_doc_tail_noise(lines: Vec<String>, kind: &str) -> Vec<String> {
         if is_doc_noise_anchor(&line) {
             break;
         }
-        if is_doc_short_noise_line(&line) || is_doc_mojibake_line(&line) || is_trailing_garbage(&line, kind) {
+        if is_doc_short_noise_line(&line)
+            || is_doc_mojibake_line(&line)
+            || is_trailing_garbage(&line, kind)
+        {
             short_noise_streak += 1;
             if short_noise_streak >= 3 {
                 break;
@@ -2711,16 +2807,18 @@ fn is_doc_short_noise_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_piece_byte_len, build_text_blocks, clean_doc_text, decode_ansi_piece, decode_ppt_text_atom, detect_kind,
-        decode_bytes_with_strategy, detect_kind_from_streams, extract_doc_text_from_table, extract_legacy_mso_text,
-        extract_ppt_text_structured, extract_text_by_kind, extract_xls_text_structured, format_excel_number, format_sheet_blocks,
-        carve_embedded_images, find_jpeg_end, find_png_end, group_ppt_slide_text, image_candidate_key,
-        is_doc_mojibake_line, locate_clx, summarize_doc_image_ocr_candidates,
-        locate_clx_in_window, looks_like_mojibake, normalize_ownerfile_doc_tail, parse_boundsheet_name,
-        parse_clx_piece_table, parse_doc_fib, parse_doc_piece_table_window_from_office_core,
-        parse_sst_strings_with_continue, postprocess_doc_structured_text, read_mini_chain,
-        repair_utf8_mojibake, score_text_quality, select_doc_scan_sources, trim_trailing_noise,
-        truncate_doc_tail_noise, walk_ppt_records, DocFib, DocPieceTableWindow, OleStream, PptRecord, XlsCell,
+        DocFib, DocPieceTableWindow, OleStream, PptRecord, XlsCell, ansi_piece_byte_len,
+        build_text_blocks, carve_embedded_images, clean_doc_text, decode_ansi_piece,
+        decode_bytes_with_strategy, decode_ppt_text_atom, detect_kind, detect_kind_from_streams,
+        extract_doc_text_from_table, extract_legacy_mso_text, extract_ppt_text_structured,
+        extract_text_by_kind, extract_xls_text_structured, find_jpeg_end, find_png_end,
+        format_excel_number, format_sheet_blocks, group_ppt_slide_text, image_candidate_key,
+        is_doc_mojibake_line, locate_clx, locate_clx_in_window, looks_like_mojibake,
+        normalize_ownerfile_doc_tail, parse_boundsheet_name, parse_clx_piece_table, parse_doc_fib,
+        parse_doc_piece_table_window_from_office_core, parse_sst_strings_with_continue,
+        postprocess_doc_structured_text, read_mini_chain, repair_utf8_mojibake, score_text_quality,
+        select_doc_scan_sources, summarize_doc_image_ocr_candidates, trim_trailing_noise,
+        truncate_doc_tail_noise, walk_ppt_records,
     };
 
     #[test]
@@ -2735,7 +2833,10 @@ mod tests {
             name: "WordDocument".to_string(),
             data: vec![],
         }];
-        assert_eq!(detect_kind_from_streams("msoffice-ownerfile", &streams), "doc");
+        assert_eq!(
+            detect_kind_from_streams("msoffice-ownerfile", &streams),
+            "doc"
+        );
     }
 
     #[test]
@@ -2830,7 +2931,8 @@ mod tests {
         word[0x34..0x38].copy_from_slice(&5u32.to_le_bytes());
         word[0x160..0x164].copy_from_slice(&12u32.to_le_bytes());
         word[0x164..0x168].copy_from_slice(&16u32.to_le_bytes());
-        let window = parse_doc_piece_table_window_from_office_core(&word).expect("piece table window");
+        let window =
+            parse_doc_piece_table_window_from_office_core(&word).expect("piece table window");
         assert_eq!(window.ccp_text, 5);
         assert_eq!(window.fc_clx, 12);
         assert_eq!(window.lcb_clx, 16);
@@ -3576,7 +3678,10 @@ mod tests {
         ];
         let trimmed = trim_trailing_noise(lines, "doc");
         assert_eq!(trimmed.len(), 4);
-        assert_eq!(trimmed.last().map(String::as_str), Some("说明比较非常参加之后很多教育"));
+        assert_eq!(
+            trimmed.last().map(String::as_str),
+            Some("说明比较非常参加之后很多教育")
+        );
     }
 
     #[test]
@@ -3592,14 +3697,19 @@ mod tests {
             "Data".to_string(),
         ];
         let out = truncate_doc_tail_noise(lines, "doc");
-        assert_eq!(out, vec!["正文第一段".to_string(), "正文第二段".to_string()]);
+        assert_eq!(
+            out,
+            vec!["正文第一段".to_string(), "正文第二段".to_string()]
+        );
     }
 
     #[test]
     fn detects_doc_mojibake_patterns() {
         assert!(is_doc_mojibake_line("瑯楨c"));
         assert!(is_doc_mojibake_line("WPS Office_12.1.0.25225_xxx"));
-        assert!(is_doc_mojibake_line("eyJoZGlkIjoiYmMzODg5NzkzMGI5NDdmZDYwYWZjZGFkZjViMGI1Y2Ii"));
+        assert!(is_doc_mojibake_line(
+            "eyJoZGlkIjoiYmMzODg5NzkzMGI5NDdmZDYwYWZjZGFkZjViMGI1Y2Ii"
+        ));
         assert!(!is_doc_mojibake_line("说明比较非常参加之后很多教育"));
     }
 
@@ -3703,7 +3813,10 @@ mod tests {
         let summary = summarize_doc_image_ocr_candidates(&streams);
         assert_eq!(summary.candidates.len(), 2);
         assert!(summary.warnings.is_empty());
-        assert_eq!(image_candidate_key(&summary.candidates[0]), image_candidate_key(&jpg));
+        assert_eq!(
+            image_candidate_key(&summary.candidates[0]),
+            image_candidate_key(&jpg)
+        );
     }
 
     #[test]
@@ -3715,8 +3828,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let summary = summarize_doc_image_ocr_candidates(&streams);
-        assert_eq!(summary.candidates.len(), crate::MAX_OLE_IMAGE_OCR_CANDIDATES);
-        assert!(summary.warnings.iter().any(|w| w == "ole-image-ocr-budget-hit"));
+        assert_eq!(
+            summary.candidates.len(),
+            crate::MAX_OLE_IMAGE_OCR_CANDIDATES
+        );
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w == "ole-image-ocr-budget-hit")
+        );
     }
 
     #[test]

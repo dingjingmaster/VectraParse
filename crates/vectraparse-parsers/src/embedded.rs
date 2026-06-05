@@ -188,6 +188,10 @@ mod tests {
                 max_files: 10,
             },
         );
-        assert!(warnings.iter().any(|w| w.starts_with("embedded-depth-limit:")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("embedded-depth-limit:"))
+        );
     }
 }

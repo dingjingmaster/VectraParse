@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::sync::OnceLock;
 
 #[derive(Debug, Copy, Clone)]
@@ -32,7 +32,8 @@ fn get_api_ptr() -> Result<ApiPtr, String> {
     if get_api_ptr.is_null() {
         return Err("GetApi function pointer is null".to_string());
     }
-    let get_api: unsafe extern "C" fn(u32) -> *const () = unsafe { std::mem::transmute(get_api_ptr) };
+    let get_api: unsafe extern "C" fn(u32) -> *const () =
+        unsafe { std::mem::transmute(get_api_ptr) };
     let api = unsafe { get_api(ORT_API_VERSION as u32) };
     if api.is_null() {
         return Err(format!("GetApi(version {}) returned null", ORT_API_VERSION));
@@ -45,7 +46,9 @@ pub(crate) fn ensure_initialized() -> Result<(), String> {
         return Ok(());
     }
     let ptr = get_api_ptr()?;
-    API_PTR.set(ptr).map_err(|_| "already initialized".to_string())?;
+    API_PTR
+        .set(ptr)
+        .map_err(|_| "already initialized".to_string())?;
 
     let create_env: unsafe extern "C" fn(u32, *const c_char, *mut *mut c_void) -> *mut c_void =
         api_fn(3);
@@ -84,12 +87,27 @@ fn char_p_to_string(ptr: *const c_char) -> String {
         .into_owned()
 }
 
+pub(crate) fn preferred_intra_threads() -> i32 {
+    let default_threads = std::thread::available_parallelism()
+        .map(|cpus| ((cpus.get() as u32).max(2) / 2).max(1))
+        .unwrap_or(1);
+    let requested = std::env::var("VECTRAPARSE_OCR_INTRA_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(default_threads);
+    (requested.max(1).min(i32::MAX as u32)) as i32
+}
+
 pub(crate) fn create_session_from_memory(model_bytes: &[u8]) -> Result<*mut c_void, String> {
     let create_session_options: unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void = api_fn(10);
     let set_graph_opt: unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void = api_fn(23);
     let set_intra_threads: unsafe extern "C" fn(*mut c_void, i32) -> *mut c_void = api_fn(24);
     let create_session_from_array: unsafe extern "C" fn(
-        *const c_void, *const c_void, usize, *mut c_void, *mut *mut c_void,
+        *const c_void,
+        *const c_void,
+        usize,
+        *mut c_void,
+        *mut *mut c_void,
     ) -> *mut c_void = api_fn(8);
     let release_session_options: unsafe extern "C" fn(*mut c_void) = api_fn(100);
 
@@ -99,7 +117,7 @@ pub(crate) fn create_session_from_memory(model_bytes: &[u8]) -> Result<*mut c_vo
 
     unsafe {
         set_graph_opt(session_options, 1); // ORT_ENABLE_BASIC
-        set_intra_threads(session_options, 1);
+        set_intra_threads(session_options, preferred_intra_threads());
     }
 
     let mut session_ptr: *mut c_void = std::ptr::null_mut();
@@ -162,28 +180,44 @@ pub(crate) fn release_memory_info(mem_info: *mut c_void) {
 
 pub(crate) fn run_session(
     session: &super::OrtSession,
-    inputs: &[Vec<f32>],
-    shapes: &[Vec<usize>],
+    inputs: &[&[f32]],
+    shapes: &[&[usize]],
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<usize>>), String> {
     let sptr = session.session_ptr;
     let alloc = session.allocator_ptr;
 
     let fn_input_count: unsafe extern "C" fn(*const c_void, *mut usize) -> *mut c_void = api_fn(30);
     let fn_input_name: unsafe extern "C" fn(
-        *const c_void, usize, *mut c_void, *mut *mut c_char,
+        *const c_void,
+        usize,
+        *mut c_void,
+        *mut *mut c_char,
     ) -> *mut c_void = api_fn(36);
     let fn_alloc_free: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = api_fn(76);
     let fn_create_tensor: unsafe extern "C" fn(
-        *mut c_void, *const i64, usize, u32, *mut *mut c_void,
+        *mut c_void,
+        *const i64,
+        usize,
+        u32,
+        *mut *mut c_void,
     ) -> *mut c_void = api_fn(48); // CreateTensorAsOrtValue
     let fn_output_count: unsafe extern "C" fn(*const c_void, *mut usize) -> *mut c_void =
         api_fn(31);
     let fn_output_name: unsafe extern "C" fn(
-        *const c_void, usize, *mut c_void, *mut *mut c_char,
+        *const c_void,
+        usize,
+        *mut c_void,
+        *mut *mut c_char,
     ) -> *mut c_void = api_fn(37);
     let fn_run: unsafe extern "C" fn(
-        *mut c_void, *const c_void, *const *const c_char, *const *const c_void, usize,
-        *const *const c_char, usize, *mut *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const *const c_char,
+        *const *const c_void,
+        usize,
+        *const *const c_char,
+        usize,
+        *mut *mut c_void,
     ) -> *mut c_void = api_fn(9);
     let fn_mutable_data: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> *mut c_void =
         api_fn(51);
@@ -207,6 +241,13 @@ pub(crate) fn run_session(
         ));
     }
 
+    if num_inputs != shapes.len() {
+        return Err(format!(
+            "model expects {num_inputs} input shapes, got {}",
+            shapes.len()
+        ));
+    }
+
     let mut input_tensors: Vec<*mut c_void> = Vec::new();
     let mut input_name_cstrs: Vec<CString> = Vec::new();
     let mut input_name_ptrs: Vec<*const c_char> = Vec::new();
@@ -223,8 +264,9 @@ pub(crate) fn run_session(
         input_name_ptrs.push(ptr);
     }
 
-    for (i, data) in inputs.iter().enumerate() {
-        let shape = &shapes[i];
+    for i in 0..num_inputs {
+        let data = inputs[i];
+        let shape = shapes[i];
         let flat: Vec<i64> = shape.iter().map(|d| *d as i64).collect();
         let mut tensor: *mut c_void = std::ptr::null_mut();
         let status = unsafe {
@@ -241,16 +283,13 @@ pub(crate) fn run_session(
         let status = unsafe { fn_mutable_data(tensor, &mut out_data) };
         check_status(status)?;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr() as *const c_void,
-                out_data,
-                data.len() * 4,
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const c_void, out_data, data.len() * 4);
         }
         input_tensors.push(tensor);
     }
 
-    let input_vals: Vec<*const c_void> = input_tensors.iter().map(|t| *t as *const c_void).collect();
+    let input_vals: Vec<*const c_void> =
+        input_tensors.iter().map(|t| *t as *const c_void).collect();
 
     let num_outputs = {
         let mut count: usize = 0;
@@ -300,7 +339,13 @@ pub(crate) fn run_session(
             fn_dim,
             fn_rel_tensor_shape,
         )?;
-        let shape = read_output_shape(*tensor, fn_tensor_shape, fn_dim_count, fn_dim, fn_rel_tensor_shape)?;
+        let shape = read_output_shape(
+            *tensor,
+            fn_tensor_shape,
+            fn_dim_count,
+            fn_dim,
+            fn_rel_tensor_shape,
+        )?;
         unsafe { fn_release_value(*tensor) };
         out_shapes.push(shape);
         results.push(data);

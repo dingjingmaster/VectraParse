@@ -86,11 +86,17 @@ mod tests {
     fn xml_handler_sets_xpath_and_xmp() {
         let out = handle_xml("<xmpmeta><a/></xmpmeta>", Some("/a/b"), 200);
         assert_eq!(
-            out.metadata.values("xpath_filter").and_then(|v| v.first()).map(String::as_str),
+            out.metadata
+                .values("xpath_filter")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("/a/b")
         );
         assert_eq!(
-            out.metadata.values("XMP:present").and_then(|v| v.first()).map(String::as_str),
+            out.metadata
+                .values("XMP:present")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("true")
         );
     }
@@ -99,7 +105,10 @@ mod tests {
     fn html_handler_tag() {
         let out = handle_html("<a href='https://x'>x</a>", 200);
         assert_eq!(
-            out.metadata.values("handler").and_then(|v| v.first()).map(String::as_str),
+            out.metadata
+                .values("handler")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("html")
         );
     }

@@ -25,7 +25,9 @@ impl Parser for DigestHashParser {
         true
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
-        let sum: u64 = input.iter().fold(0u64, |acc, b| acc.wrapping_add(*b as u64));
+        let sum: u64 = input
+            .iter()
+            .fold(0u64, |acc, b| acc.wrapping_add(*b as u64));
         let mut md = Metadata::default();
         md.insert("digest.sum64", format!("{sum:016x}"));
         Some(ParseOutcome {

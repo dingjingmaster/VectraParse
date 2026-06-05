@@ -62,8 +62,8 @@ impl Metadata {
             return Ok(md);
         }
         for pair in split_top_level(body, ',') {
-            let (raw_key, raw_values) =
-                split_top_level_once(pair, ':').ok_or_else(|| MetadataError::InvalidJson(pair.to_string()))?;
+            let (raw_key, raw_values) = split_top_level_once(pair, ':')
+                .ok_or_else(|| MetadataError::InvalidJson(pair.to_string()))?;
             let key = unquote(raw_key.trim())?;
             let values_block = raw_values.trim();
             if !(values_block.starts_with('[') && values_block.ends_with(']')) {
@@ -188,9 +188,7 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Metadata, MetadataError, NS_ACCESS_PERMISSIONS, NS_OFFICE, NS_PDF, NS_XMP,
-    };
+    use super::{Metadata, MetadataError, NS_ACCESS_PERMISSIONS, NS_OFFICE, NS_PDF, NS_XMP};
 
     #[test]
     fn metadata_round_trip_json() {

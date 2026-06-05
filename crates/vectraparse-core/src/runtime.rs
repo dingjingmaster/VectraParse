@@ -112,7 +112,13 @@ mod tests {
             ..ResourceLimits::default()
         };
         let err = validate_input_size(5, &limits).expect_err("must fail");
-        assert_eq!(err, ParseFailure::InputTooLarge { limit: 4, actual: 5 });
+        assert_eq!(
+            err,
+            ParseFailure::InputTooLarge {
+                limit: 4,
+                actual: 5
+            }
+        );
     }
 
     #[test]
@@ -132,7 +138,13 @@ mod tests {
             ..ResourceLimits::default()
         };
         let err = src.read_limited(&limits).expect_err("must fail");
-        assert_eq!(err, ParseFailure::InputTooLarge { limit: 4, actual: 5 });
+        assert_eq!(
+            err,
+            ParseFailure::InputTooLarge {
+                limit: 4,
+                actual: 5
+            }
+        );
     }
 
     #[test]

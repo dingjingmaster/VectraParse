@@ -1,18 +1,18 @@
-use std::ffi::c_char;
 use std::ffi::CStr;
+use std::ffi::c_char;
 use std::fs;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
 use vectraparse_core::result::{ParseTiming, StructuredResult};
-use vectraparse_core::{runtime::ResourceLimits, runtime::validate_input_size, CAPABILITIES_JSON};
+use vectraparse_core::{CAPABILITIES_JSON, runtime::ResourceLimits, runtime::validate_input_size};
 use vectraparse_mime::{DetectHints, detect_media_type};
 use vectraparse_parsers::{
-    CompositeParser, DerivedTextParser, FeedParser, HtmlParser, LegacyDocParser, LightweightSpecializedParser,
-    ImageMetadataParser, MboxParser, MsSpecialParser, OdfParser, OoxmlParser, OleLegacyParser, PackageParser,
-    Parser, PdfParser, Rfc822MimeParser, RtfParser, SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser,
-    XmlParser,
+    CompositeParser, DerivedTextParser, FeedParser, HtmlParser, ImageMetadataParser,
+    LegacyDocParser, LightweightSpecializedParser, MboxParser, MsSpecialParser, OdfParser,
+    OleLegacyParser, OoxmlParser, PackageParser, Parser, PdfParser, Rfc822MimeParser, RtfParser,
+    SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
 };
 
 #[repr(C)]
@@ -108,7 +108,11 @@ fn build_parser_pipeline() -> CompositeParser {
     ])
 }
 
-fn detect_json_runtime(bytes: &[u8], hints: &DetectHints<'_>, limit: usize) -> Result<String, String> {
+fn detect_json_runtime(
+    bytes: &[u8],
+    hints: &DetectHints<'_>,
+    limit: usize,
+) -> Result<String, String> {
     validate_input_size(
         bytes.len(),
         &ResourceLimits {
@@ -342,10 +346,10 @@ pub extern "C" fn vectraparse_capabilities_json(out: *mut VectraParseResult) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_json_runtime, resource_name_from_path,
-        vectraparse_capabilities_json, vectraparse_create_handle, vectraparse_destroy_handle,
-        vectraparse_detect, vectraparse_detect_with_hints, vectraparse_parse, vectraparse_result_free,
         VectraParseError, VectraParseHandle, VectraParseOptions, VectraParseResult,
+        parse_json_runtime, resource_name_from_path, vectraparse_capabilities_json,
+        vectraparse_create_handle, vectraparse_destroy_handle, vectraparse_detect,
+        vectraparse_detect_with_hints, vectraparse_parse, vectraparse_result_free,
     };
     use std::ffi::CString;
     use std::ptr;
@@ -469,9 +473,11 @@ mod tests {
         assert_eq!(out.mime_type, "image/jpeg");
         assert_eq!(out.content, None);
         assert_eq!(out.parser_chain, vec!["ImageMetadataParser".to_string()]);
-        assert!(out.warnings.iter().any(|w| {
-            w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable"
-        }));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| { w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable" })
+        );
         assert_eq!(
             out.metadata
                 .values("image.format")
@@ -479,11 +485,7 @@ mod tests {
                 .map(String::as_str),
             Some("jpeg")
         );
-        if out
-            .warnings
-            .iter()
-            .any(|w| w == "image-ocr-decode-failed")
-        {
+        if out.warnings.iter().any(|w| w == "image-ocr-decode-failed") {
             assert_eq!(
                 out.metadata
                     .values("image.ocr.error_stage")
@@ -496,6 +498,9 @@ mod tests {
 
     #[test]
     fn detect_file_uses_resource_name_extension_for_images() {
-        assert_eq!(resource_name_from_path("/tmp/example.JPG"), Some("example.JPG"));
+        assert_eq!(
+            resource_name_from_path("/tmp/example.JPG"),
+            Some("example.JPG")
+        );
     }
 }

@@ -462,7 +462,10 @@ fn specialize_ole_container(input: &[u8]) -> &'static str {
 }
 
 fn detect_xml_html_or_text(input: &[u8]) -> Option<String> {
-    let s = std::str::from_utf8(input).ok()?.trim_start_matches('\u{feff}').trim_start();
+    let s = std::str::from_utf8(input)
+        .ok()?
+        .trim_start_matches('\u{feff}')
+        .trim_start();
     if s.is_empty() {
         return None;
     }
@@ -667,8 +670,8 @@ fn normalize_media_type(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetectHints, DetectorConfig, MagicMatcher, MagicRule, MediaTypeRegistry, detect_media_type,
-        detect_encoding, detector_provider_names, generated_stats, source_path,
+        DetectHints, DetectorConfig, MagicMatcher, MagicRule, MediaTypeRegistry, detect_encoding,
+        detect_media_type, detector_provider_names, generated_stats, source_path,
     };
 
     #[test]
@@ -701,21 +704,23 @@ mod tests {
     fn registry_supertype_and_specialize_work() {
         let reg = MediaTypeRegistry::from_generated();
         assert_eq!(
-            reg.direct_supertype("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                .as_deref(),
+            reg.direct_supertype(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            .as_deref(),
             Some("application/x-tika-ooxml")
         );
         assert!(
-            reg.supertypes("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                .iter()
-                .any(|v| v == "application/zip")
-        );
-        assert!(
-            reg.is_specialization_of(
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/zip"
+            reg.supertypes(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
+            .iter()
+            .any(|v| v == "application/zip")
         );
+        assert!(reg.is_specialization_of(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip"
+        ));
         assert_eq!(
             reg.specialize(
                 "application/zip",
@@ -765,10 +770,7 @@ mod tests {
             mask: Some(b"\xF0\x0F"),
         }]);
         assert_eq!(matcher.detect(b"\xFA\x0A", 2).mime, "application/masked");
-        assert_eq!(
-            matcher.detect(b"\xFA", 2).mime,
-            "application/octet-stream"
-        );
+        assert_eq!(matcher.detect(b"\xFA", 2).mime, "application/octet-stream");
     }
 
     #[test]
@@ -1002,7 +1004,10 @@ mod tests {
         for c in cases {
             let actual = detect_media_type(c.bytes, &c.hints);
             if actual != c.expected {
-                mismatches.push(format!("{}: expected {}, got {}", c.name, c.expected, actual));
+                mismatches.push(format!(
+                    "{}: expected {}, got {}",
+                    c.name, c.expected, actual
+                ));
             }
         }
         assert!(
@@ -1046,14 +1051,8 @@ mod tests {
             enable_nn_example_detector: true,
             ..DetectorConfig::default()
         };
-        assert!(
-            detector_provider_names(&cfg2)
-                .contains(&"TrainedModelDetector")
-        );
-        assert!(
-            detector_provider_names(&cfg2)
-                .contains(&"NNExampleModelDetector")
-        );
+        assert!(detector_provider_names(&cfg2).contains(&"TrainedModelDetector"));
+        assert!(detector_provider_names(&cfg2).contains(&"NNExampleModelDetector"));
     }
 
     #[test]

@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp", "tiff"] }
+chrono = { version = "0.4.40", default-features = false, features = ["clock"] }

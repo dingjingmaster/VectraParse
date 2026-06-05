@@ -45,7 +45,12 @@ impl CompositeParser {
                 if out.content.is_some() {
                     let mut warnings = std::mem::take(&mut out.warnings);
                     supplement.warnings.append(&mut warnings);
-                    for k in out.metadata.keys().map(ToString::to_string).collect::<Vec<_>>() {
+                    for k in out
+                        .metadata
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                    {
                         if let Some(vals) = out.metadata.values(&k) {
                             for v in vals {
                                 supplement.metadata.insert(k.clone(), v.clone());
@@ -70,7 +75,12 @@ impl CompositeParser {
                     return Some(out);
                 }
                 supplement.warnings.extend(out.warnings);
-                for k in out.metadata.keys().map(ToString::to_string).collect::<Vec<_>>() {
+                for k in out
+                    .metadata
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                {
                     if let Some(vals) = out.metadata.values(&k) {
                         for v in vals {
                             supplement.metadata.insert(k.clone(), v.clone());
@@ -540,7 +550,11 @@ impl Parser for PackageParser {
             }
         }
         Some(ParseOutcome {
-            content: if content.trim().is_empty() { None } else { Some(content) },
+            content: if content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             metadata,
             warnings,
             parser_chain: Vec::new(),
@@ -557,9 +571,7 @@ fn extract_archive_entry_snippet(name: &str, buf: &[u8]) -> Option<String> {
         || lower.ends_with(".xml")
         || lower.ends_with(".html")
         || lower.ends_with(".log");
-    if text_like
-        && let Ok(s) = String::from_utf8(buf.to_vec())
-    {
+    if text_like && let Ok(s) = String::from_utf8(buf.to_vec()) {
         let snippet: String = s.chars().take(1200).collect();
         if !snippet.trim().is_empty() {
             return Some(snippet);
@@ -600,9 +612,11 @@ impl Parser for OoxmlParser {
     }
     fn supports(&self, media_type: &str) -> bool {
         media_type == "application/x-tika-ooxml"
-            || media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            || media_type
+                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             || media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            || media_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            || media_type
+                == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             || media_type == "application/xml"
     }
     fn parse(&self, input: &[u8], _media_type: &str) -> Option<ParseOutcome> {
@@ -655,7 +669,8 @@ impl Parser for OoxmlParser {
         if lower.contains("docprops/core.xml") {
             metadata.insert("ooxml.core_props", "true");
         }
-        let embedded_count = lower.matches("embeddings/").count() + lower.matches("oleobject").count();
+        let embedded_count =
+            lower.matches("embeddings/").count() + lower.matches("oleobject").count();
         metadata.insert("ooxml.embedded_count", embedded_count.to_string());
         let mut warnings = Vec::new();
         if embedded_count > 64 {
@@ -863,7 +878,10 @@ impl Parser for OleLegacyParser {
                 metadata.insert("ole.block.offset", offset.to_string());
             }
         }
-        metadata.insert("ole.block.section_count_distinct", section_names.len().to_string());
+        metadata.insert(
+            "ole.block.section_count_distinct",
+            section_names.len().to_string(),
+        );
         Some(ParseOutcome {
             content: Some(extracted.text),
             metadata,
@@ -936,7 +954,8 @@ impl Parser for RtfParser {
         }
         let mut metadata = Metadata::default();
         metadata.insert("parser", "RtfParser");
-        let object_count = content.matches("\\object").count() + content.matches("\\objdata").count();
+        let object_count =
+            content.matches("\\object").count() + content.matches("\\objdata").count();
         metadata.insert("rtf.object_count", object_count.to_string());
         let embedded_levels = content.matches("\\objdata").count();
         metadata.insert("rtf.object_depth_hint", embedded_levels.to_string());
@@ -1252,7 +1271,6 @@ impl Parser for ImageMetadataParser {
     }
 }
 
-
 fn ocr_engine() -> Option<&'static OrtOcrEngine> {
     static OCR_ENGINE: OnceLock<Option<OrtOcrEngine>> = OnceLock::new();
     OCR_ENGINE
@@ -1278,10 +1296,20 @@ fn classify_ocr_error_stage(err: &str) -> &'static str {
     }
 }
 
-fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String>, ocr: &OcrResult) {
+fn apply_ocr_success_metadata(
+    metadata: &mut Metadata,
+    warnings: &mut Vec<String>,
+    ocr: &OcrResult,
+) {
     metadata.insert("image.ocr.confidence", format!("{:.4}", ocr.confidence));
-    metadata.insert("image.ocr.box_count", ocr.diagnostics.det_box_count.to_string());
-    metadata.insert("image.ocr.line_count", ocr.diagnostics.line_count.to_string());
+    metadata.insert(
+        "image.ocr.box_count",
+        ocr.diagnostics.det_box_count.to_string(),
+    );
+    metadata.insert(
+        "image.ocr.line_count",
+        ocr.diagnostics.line_count.to_string(),
+    );
     metadata.insert(
         "image.ocr.region_count",
         ocr.diagnostics.region_count.to_string(),
@@ -1305,7 +1333,10 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
     if let Some(source) = &ocr.trace.selected_source {
         metadata.insert("image.ocr.selected_source", source.clone());
     }
-    metadata.insert("image.ocr.trace_line_count", ocr.trace.lines.len().to_string());
+    metadata.insert(
+        "image.ocr.trace_line_count",
+        ocr.trace.lines.len().to_string(),
+    );
     metadata.insert(
         "image.ocr.trace_candidate_count",
         ocr.trace.candidates.len().to_string(),
@@ -1333,7 +1364,13 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
         ocr.trace
             .lines
             .iter()
-            .map(|line| line.source.split(':').next().unwrap_or(line.source.as_str()).to_string())
+            .map(|line| {
+                line.source
+                    .split(':')
+                    .next()
+                    .unwrap_or(line.source.as_str())
+                    .to_string()
+            })
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             .to_string(),
@@ -1341,7 +1378,10 @@ fn apply_ocr_success_metadata(metadata: &mut Metadata, warnings: &mut Vec<String
     if let Some(json) = &ocr.trace.json {
         metadata.insert("image.ocr.trace_json", json.clone());
     }
-    metadata.insert("image.ocr.empty_result", ocr.diagnostics.empty_result.to_string());
+    metadata.insert(
+        "image.ocr.empty_result",
+        ocr.diagnostics.empty_result.to_string(),
+    );
     metadata.insert(
         "image.ocr.source_has_alpha",
         ocr.diagnostics.source_has_alpha.to_string(),
@@ -1425,14 +1465,14 @@ impl Parser for VideoMetadataParser {
         let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
         let mut metadata = Metadata::default();
         metadata.insert("parser", "VideoMetadataParser");
-        let format = if media_type == "video/mp4" || lower.contains("ftyp") || lower.contains("moov")
-        {
-            "mp4"
-        } else if media_type == "video/x-flv" || input.starts_with(b"FLV") {
-            "flv"
-        } else {
-            "video"
-        };
+        let format =
+            if media_type == "video/mp4" || lower.contains("ftyp") || lower.contains("moov") {
+                "mp4"
+            } else if media_type == "video/x-flv" || input.starts_with(b"FLV") {
+                "flv"
+            } else {
+                "video"
+            };
         metadata.insert("video.format", format);
         metadata.insert("video.byte_length", input.len().to_string());
         let mut warnings = Vec::new();
@@ -1623,10 +1663,13 @@ impl Parser for GeoEngineeringParser {
         metadata.insert("parser", "GeoEngineeringParser");
         let kind = if media_type == "application/x-gdal" || lower.contains("gdal") {
             "gdal"
-        } else if media_type == "application/acad" || lower.contains("autocad") || lower.contains("dwg")
+        } else if media_type == "application/acad"
+            || lower.contains("autocad")
+            || lower.contains("dwg")
         {
             "dwg"
-        } else if lower.contains("epsg:") || lower.contains("geometry") || lower.contains("geojson") {
+        } else if lower.contains("epsg:") || lower.contains("geometry") || lower.contains("geojson")
+        {
             "geo"
         } else {
             "geographic-information"
@@ -1702,7 +1745,10 @@ impl Parser for CryptoSecurityParser {
         "CryptoSecurityParser"
     }
     fn supports(&self, media_type: &str) -> bool {
-        matches!(media_type, "application/pkcs7-mime" | "application/x-tsd" | "application/x-encrypted")
+        matches!(
+            media_type,
+            "application/pkcs7-mime" | "application/x-tsd" | "application/x-encrypted"
+        )
     }
     fn parse(&self, input: &[u8], media_type: &str) -> Option<ParseOutcome> {
         if input.is_empty() {
@@ -1721,7 +1767,11 @@ impl Parser for CryptoSecurityParser {
         metadata.insert("crypto.kind", kind);
         metadata.insert(
             "crypto.provider",
-            if lower.contains("provider:bc") { "bouncycastle" } else { "default" },
+            if lower.contains("provider:bc") {
+                "bouncycastle"
+            } else {
+                "default"
+            },
         );
         if lower.contains("perm:read-only") {
             metadata.insert("crypto.permission", "read-only");
@@ -1764,7 +1814,9 @@ impl Parser for BinaryFontParser {
         let lower = String::from_utf8_lossy(input).to_ascii_lowercase();
         let mut metadata = Metadata::default();
         metadata.insert("parser", "BinaryFontParser");
-        let kind = if media_type == "application/java-vm" || input.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) {
+        let kind = if media_type == "application/java-vm"
+            || input.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
+        {
             "java-class"
         } else if media_type == "application/x-executable"
             || input.starts_with(b"\x7FELF")
@@ -1894,7 +1946,11 @@ impl Parser for TranslationProviderParser {
         metadata.insert("translation.provider", provider);
         metadata.insert(
             "translation.cache",
-            if lower.contains("cache=on") { "enabled" } else { "disabled" },
+            if lower.contains("cache=on") {
+                "enabled"
+            } else {
+                "disabled"
+            },
         );
         let mut warnings = Vec::new();
         if lower.contains("api_key=missing") {
@@ -2573,17 +2629,16 @@ fn extract_latin1_strings(input: &[u8], min_len: usize, max_chars: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_ocr_success_metadata, CompositeParser, DerivedTextParser, FeedParser, HtmlParser,
-        MetadataOnlyParser, Parser,
-        EpubParser, IworkParser, LightweightSpecializedParser, OdfParser, OoxmlParser, PackageParser,
-        LegacyDocParser, MboxParser, MsSpecialParser, OleLegacyParser, OutlookMailboxParser,
-        AudioMetadataParser, ImageMetadataParser, PdfParser, Rfc822MimeParser, RtfParser,
-        DatabaseTabularParser, VideoMetadataParser, VisionBridgeParser,
-        BinaryFontParser, CryptoSecurityParser, GeoEngineeringParser, ScienceDataParser,
-        LanguageIdParser, LanguageProviderParser, SpecialistFormatParser,
-        TranslationProviderParser, NlpNerParser, CtakesParser, DlVisionModelParser,
-        OcrExternalParser, XmpNormalizeParser, JsonSchemaCompatParser,
-        SourceCodeParser, StringsParser, TextAndCsvParser, TxtParser, XmlParser,
+        AudioMetadataParser, BinaryFontParser, CompositeParser, CryptoSecurityParser, CtakesParser,
+        DatabaseTabularParser, DerivedTextParser, DlVisionModelParser, EpubParser, FeedParser,
+        GeoEngineeringParser, HtmlParser, ImageMetadataParser, IworkParser, JsonSchemaCompatParser,
+        LanguageIdParser, LanguageProviderParser, LegacyDocParser, LightweightSpecializedParser,
+        MboxParser, MetadataOnlyParser, MsSpecialParser, NlpNerParser, OcrExternalParser,
+        OdfParser, OleLegacyParser, OoxmlParser, OutlookMailboxParser, PackageParser, Parser,
+        PdfParser, Rfc822MimeParser, RtfParser, ScienceDataParser, SourceCodeParser,
+        SpecialistFormatParser, StringsParser, TextAndCsvParser, TranslationProviderParser,
+        TxtParser, VideoMetadataParser, VisionBridgeParser, XmlParser, XmpNormalizeParser,
+        apply_ocr_success_metadata,
     };
     use vectraparse_core::metadata::Metadata;
     use vectraparse_ocr::{OcrDiagnostics, OcrResult};
@@ -2649,7 +2704,9 @@ mod tests {
         );
         assert!(out.warnings.iter().any(|w| w == "csv-bad-row-detected"));
 
-        let tsv = p.parse(b"a\tb\n1\t2", "text/tab-separated-values").expect("tsv");
+        let tsv = p
+            .parse(b"a\tb\n1\t2", "text/tab-separated-values")
+            .expect("tsv");
         assert_eq!(
             tsv.metadata
                 .values("csv.delimiter")
@@ -2703,7 +2760,10 @@ mod tests {
     fn xml_parser_extracts_root_and_blocks_xxe() {
         let p = XmlParser;
         let out = p
-            .parse(b"<?xml version='1.0'?><FictionBook><body>x</body></FictionBook>", "application/xml")
+            .parse(
+                b"<?xml version='1.0'?><FictionBook><body>x</body></FictionBook>",
+                "application/xml",
+            )
             .expect("xml");
         assert_eq!(
             out.metadata
@@ -2791,7 +2851,10 @@ mod tests {
             Some("atom")
         );
         let bad = p
-            .parse(br#"<?xml version="1.0"?><feed><title>bad"#, "application/xml")
+            .parse(
+                br#"<?xml version="1.0"?><feed><title>bad"#,
+                "application/xml",
+            )
             .expect("bad");
         assert!(bad.warnings.iter().any(|w| w == "feed-malformed-xml"));
     }
@@ -2799,7 +2862,12 @@ mod tests {
     #[test]
     fn derived_text_parser_detects_min_formats() {
         let p = DerivedTextParser;
-        let xliff = p.parse(b"<xliff version=\"1.2\"></xliff>", "application/x-xliff+xml").expect("x");
+        let xliff = p
+            .parse(
+                b"<xliff version=\"1.2\"></xliff>",
+                "application/x-xliff+xml",
+            )
+            .expect("x");
         assert_eq!(
             xliff
                 .metadata
@@ -2832,7 +2900,10 @@ mod tests {
     fn lightweight_specialized_parser_profiles_match() {
         let p = LightweightSpecializedParser;
         let plist = p
-            .parse(b"<?xml version='1.0'?><plist><dict/></plist>", "application/x-plist")
+            .parse(
+                b"<?xml version='1.0'?><plist><dict/></plist>",
+                "application/x-plist",
+            )
             .expect("plist");
         assert_eq!(
             plist
@@ -2852,7 +2923,9 @@ mod tests {
                 .map(String::as_str),
             Some("FictionBook")
         );
-        let dc = p.parse(b"<dc:title>x</dc:title>", "application/xml").expect("dc");
+        let dc = p
+            .parse(b"<dc:title>x</dc:title>", "application/xml")
+            .expect("dc");
         assert_eq!(
             dc.metadata
                 .values("lightweight.profile")
@@ -2948,11 +3021,12 @@ mod tests {
                 .map(String::as_str),
             Some("docx")
         );
-        assert!(out
-            .content
-            .as_deref()
-            .unwrap_or("")
-            .contains("Hello DOCX Text"));
+        assert!(
+            out.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Hello DOCX Text")
+        );
     }
 
     #[test]
@@ -3120,7 +3194,11 @@ mod tests {
         assert!(doc.warnings.iter().any(|w| w == "ole-embedded-object"));
         assert!(doc.metadata.values("ole.block_count").is_some());
         assert!(doc.metadata.values("ole.block.text_len_total").is_some());
-        assert!(doc.metadata.values("ole.block.section_count_distinct").is_some());
+        assert!(
+            doc.metadata
+                .values("ole.block.section_count_distinct")
+                .is_some()
+        );
 
         let xls = p
             .parse(
@@ -3154,45 +3232,74 @@ mod tests {
     #[test]
     fn ms_special_parser_detects_onenote_access_tnef_emf_wmf_msg_pst() {
         let p = MsSpecialParser;
-        let one = p.parse(b"...OneNote section...", "application/x-tika-msoffice").expect("one");
+        let one = p
+            .parse(b"...OneNote section...", "application/x-tika-msoffice")
+            .expect("one");
         assert_eq!(
-            one.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            one.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("onenote")
         );
         let access = p
-            .parse(b"...Standard Jet DB...MSysObjects...", "application/x-tika-msoffice")
+            .parse(
+                b"...Standard Jet DB...MSysObjects...",
+                "application/x-tika-msoffice",
+            )
             .expect("access");
         assert_eq!(
-            access.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            access
+                .metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("access")
         );
-        let tnef = p.parse(b"...winmail.dat...TNEF...", "application/x-tnef").expect("tnef");
+        let tnef = p
+            .parse(b"...winmail.dat...TNEF...", "application/x-tnef")
+            .expect("tnef");
         assert_eq!(
-            tnef.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            tnef.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("tnef")
         );
         let emf = p.parse(b"... EMF+ ...", "image/emf").expect("emf");
         assert_eq!(
-            emf.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            emf.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("emf")
         );
         let wmf = p.parse(b"...metafile...WMF...", "image/wmf").expect("wmf");
         assert_eq!(
-            wmf.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            wmf.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("wmf")
         );
         let msg = p
             .parse(b"...__substg1.0_...attach...", "application/vnd.ms-outlook")
             .expect("msg");
         assert_eq!(
-            msg.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            msg.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("msg")
         );
         let pst = p
             .parse(b"...!BDN...attach...", "application/vnd.ms-outlook")
             .expect("pst");
         assert_eq!(
-            pst.metadata.values("ms.kind").and_then(|v| v.first()).map(String::as_str),
+            pst.metadata
+                .values("ms.kind")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("pst")
         );
     }
@@ -3220,7 +3327,10 @@ mod tests {
     fn legacy_doc_parser_detects_hwp_chm_wordperfect_quattro() {
         let p = LegacyDocParser;
         let hwp = p
-            .parse(b"...HWP Document...Hangul Word Processor...", "application/x-hwp")
+            .parse(
+                b"...HWP Document...Hangul Word Processor...",
+                "application/x-hwp",
+            )
             .expect("hwp");
         assert_eq!(
             hwp.metadata
@@ -3271,11 +3381,17 @@ mod tests {
             )
             .expect("mail");
         assert_eq!(
-            out.metadata.values("mail.from").and_then(|v| v.first()).map(String::as_str),
+            out.metadata
+                .values("mail.from")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("a@example.com")
         );
         assert_eq!(
-            out.metadata.values("mail.charset").and_then(|v| v.first()).map(String::as_str),
+            out.metadata
+                .values("mail.charset")
+                .and_then(|v| v.first())
+                .map(String::as_str),
             Some("utf-8")
         );
         assert_eq!(
@@ -3334,7 +3450,9 @@ mod tests {
         for _ in 0..257 {
             mail.push_str("Content-Disposition: attachment; filename=a.bin\n");
         }
-        let out = p.parse(mail.as_bytes(), "application/x-mbox").expect("mbox");
+        let out = p
+            .parse(mail.as_bytes(), "application/x-mbox")
+            .expect("mbox");
         assert!(out.warnings.iter().any(|w| w == "mail-attachment-limit"));
     }
 
@@ -3355,7 +3473,10 @@ mod tests {
             Some("msg")
         );
         let pst = p
-            .parse(b"...!BDN...pst...Subject: a\nSubject: b\nattach...", "application/vnd.ms-outlook")
+            .parse(
+                b"...!BDN...pst...Subject: a\nSubject: b\nattach...",
+                "application/vnd.ms-outlook",
+            )
             .expect("pst");
         assert_eq!(
             pst.metadata
@@ -3383,10 +3504,7 @@ mod tests {
     fn image_metadata_parser_extracts_format_and_embedded_metadata_flags() {
         let p = ImageMetadataParser;
         let out = p
-            .parse(
-                b"\xFF\xD8\xFF....EXIF....<x:xmpmeta>..IPTC..",
-                "image/jpeg",
-            )
+            .parse(b"\xFF\xD8\xFF....EXIF....<x:xmpmeta>..IPTC..", "image/jpeg")
             .expect("jpeg");
         assert_eq!(
             out.metadata
@@ -3422,10 +3540,11 @@ mod tests {
     fn image_metadata_parser_warns_on_unknown_signature() {
         let p = ImageMetadataParser;
         let out = p.parse(b"not-an-image", "image/webp").expect("image");
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w == "image-corrupted-or-unknown"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "image-corrupted-or-unknown")
+        );
     }
 
     #[test]
@@ -3478,14 +3597,16 @@ mod tests {
         let p = ImageMetadataParser;
         let out = p.parse(b"not-an-image", "image/png").expect("image");
         assert_eq!(out.content, None);
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w == "image-corrupted-or-unknown"));
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "image-corrupted-or-unknown")
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "image-ocr-decode-failed" || w == "image-ocr-model-unavailable")
+        );
         assert_eq!(
             out.metadata
                 .values("image.mime")
@@ -3493,11 +3614,7 @@ mod tests {
                 .map(String::as_str),
             Some("image/png")
         );
-        if out
-            .warnings
-            .iter()
-            .any(|w| w == "image-ocr-decode-failed")
-        {
+        if out.warnings.iter().any(|w| w == "image-ocr-decode-failed") {
             assert_eq!(
                 out.metadata
                     .values("image.ocr.enabled")
@@ -3808,28 +3925,29 @@ mod tests {
         let p = VideoMetadataParser;
         let huge = vec![b'a'; 17 * 1024 * 1024];
         let out = p.parse(&huge, "video/mp4").expect("video");
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w == "video-read-window-applied"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "video-read-window-applied")
+        );
     }
 
     #[test]
     fn vision_bridge_parser_handles_disabled_timeout_and_failure_degrade() {
         let p = VisionBridgeParser;
-        let disabled = p
-            .parse(b"caption:disable", "image/jpeg")
-            .expect("disabled");
+        let disabled = p.parse(b"caption:disable", "image/jpeg").expect("disabled");
         assert!(disabled.warnings.iter().any(|w| w == "vision-disabled"));
 
         let timeout = p.parse(b"caption:timeout", "video/mp4").expect("timeout");
         assert!(timeout.warnings.iter().any(|w| w == "vision-timeout"));
 
         let failed = p.parse(b"recognition:fail", "image/webp").expect("fail");
-        assert!(failed
-            .warnings
-            .iter()
-            .any(|w| w == "vision-failed-degraded"));
+        assert!(
+            failed
+                .warnings
+                .iter()
+                .any(|w| w == "vision-failed-degraded")
+        );
     }
 
     #[test]
@@ -3852,14 +3970,12 @@ mod tests {
                 "application/x-jdbc",
             )
             .expect("jdbc");
-        assert!(jdbc
-            .warnings
-            .iter()
-            .any(|w| w == "db-connection-disabled-by-default"));
-        assert!(jdbc
-            .warnings
-            .iter()
-            .any(|w| w == "db-jdbc-config-detected"));
+        assert!(
+            jdbc.warnings
+                .iter()
+                .any(|w| w == "db-connection-disabled-by-default")
+        );
+        assert!(jdbc.warnings.iter().any(|w| w == "db-jdbc-config-detected"));
     }
 
     #[test]
@@ -3877,16 +3993,19 @@ mod tests {
             Some("netcdf")
         );
         let hdf = p.parse(b"HDF5...", "application/x-hdf").expect("hdf");
-        assert!(hdf
-            .warnings
-            .iter()
-            .any(|w| w == "science-native-dependency-optional"));
+        assert!(
+            hdf.warnings
+                .iter()
+                .any(|w| w == "science-native-dependency-optional")
+        );
     }
 
     #[test]
     fn geo_engineering_parser_detects_gdal_dwg_and_geo() {
         let p = GeoEngineeringParser;
-        let gdal = p.parse(b"GDAL dataset", "application/x-gdal").expect("gdal");
+        let gdal = p
+            .parse(b"GDAL dataset", "application/x-gdal")
+            .expect("gdal");
         assert_eq!(
             gdal.metadata
                 .values("geo.kind")
@@ -3895,12 +4014,16 @@ mod tests {
             Some("gdal")
         );
         let dwg = p.parse(b"AutoCAD DWG", "application/acad").expect("dwg");
-        assert!(dwg
-            .warnings
-            .iter()
-            .any(|w| w == "geo-native-dependency-optional"));
+        assert!(
+            dwg.warnings
+                .iter()
+                .any(|w| w == "geo-native-dependency-optional")
+        );
         let geo = p
-            .parse(b"{\"type\":\"Feature\",\"crs\":\"EPSG:4326\"}", "application/x-geodata")
+            .parse(
+                b"{\"type\":\"Feature\",\"crs\":\"EPSG:4326\"}",
+                "application/x-geodata",
+            )
             .expect("geo");
         assert_eq!(
             geo.metadata
@@ -3915,7 +4038,10 @@ mod tests {
     fn specialist_format_parser_detects_kind_and_service_degrade() {
         let p = SpecialistFormatParser;
         let isa = p
-            .parse(b"investigation.txt study.txt assay.txt", "application/x-isatab")
+            .parse(
+                b"investigation.txt study.txt assay.txt",
+                "application/x-isatab",
+            )
             .expect("isa");
         assert_eq!(
             isa.metadata
@@ -3930,21 +4056,28 @@ mod tests {
                 "application/x-grobid-tei",
             )
             .expect("grobid");
-        assert!(grobid
-            .warnings
-            .iter()
-            .any(|w| w == "special-external-service-disabled"));
-        assert!(grobid
-            .warnings
-            .iter()
-            .any(|w| w == "special-external-service-timeout"));
+        assert!(
+            grobid
+                .warnings
+                .iter()
+                .any(|w| w == "special-external-service-disabled")
+        );
+        assert!(
+            grobid
+                .warnings
+                .iter()
+                .any(|w| w == "special-external-service-timeout")
+        );
     }
 
     #[test]
     fn crypto_security_parser_handles_password_and_permission_states() {
         let p = CryptoSecurityParser;
         let ok = p
-            .parse(b"pkcs7 provider:bc password:ok perm:read-only", "application/pkcs7-mime")
+            .parse(
+                b"pkcs7 provider:bc password:ok perm:read-only",
+                "application/pkcs7-mime",
+            )
             .expect("ok");
         assert_eq!(
             ok.metadata
@@ -3963,10 +4096,7 @@ mod tests {
         let bad = p
             .parse(b"encrypted blob password:wrong", "application/x-encrypted")
             .expect("bad");
-        assert!(bad
-            .warnings
-            .iter()
-            .any(|w| w == "crypto-password-invalid"));
+        assert!(bad.warnings.iter().any(|w| w == "crypto-password-invalid"));
     }
 
     #[test]
@@ -3984,10 +4114,11 @@ mod tests {
             Some("java-class")
         );
         let exe = p.parse(b"MZ....", "application/x-executable").expect("exe");
-        assert!(exe
-            .warnings
-            .iter()
-            .any(|w| w == "binary-security-scan-limited"));
+        assert!(
+            exe.warnings
+                .iter()
+                .any(|w| w == "binary-security-scan-limited")
+        );
         let afm = p
             .parse(b"StartFontMetrics 4.1", "application/x-font-afm")
             .expect("afm");
@@ -4004,7 +4135,10 @@ mod tests {
     fn language_id_parser_detects_language_and_low_confidence_paths() {
         let p = LanguageIdParser;
         let en = p
-            .parse(b"This is the document and this is the second line.", "text/plain")
+            .parse(
+                b"This is the document and this is the second line.",
+                "text/plain",
+            )
             .expect("en");
         assert_eq!(
             en.metadata
@@ -4014,17 +4148,17 @@ mod tests {
             Some("en")
         );
         let short = p.parse(b"hi", "text/plain").expect("short");
-        assert!(short
-            .warnings
-            .iter()
-            .any(|w| w == "lang-low-confidence"));
+        assert!(short.warnings.iter().any(|w| w == "lang-low-confidence"));
     }
 
     #[test]
     fn language_provider_parser_handles_switch_disable_and_bad_config() {
         let p = LanguageProviderParser;
         let opt = p
-            .parse(b"provider=optimaize enabled=true", "application/lang-provider")
+            .parse(
+                b"provider=optimaize enabled=true",
+                "application/lang-provider",
+            )
             .expect("opt");
         assert_eq!(
             opt.metadata
@@ -4039,14 +4173,12 @@ mod tests {
                 "application/lang-provider",
             )
             .expect("bad");
-        assert!(bad
-            .warnings
-            .iter()
-            .any(|w| w == "lang-provider-disabled"));
-        assert!(bad
-            .warnings
-            .iter()
-            .any(|w| w == "lang-provider-config-invalid"));
+        assert!(bad.warnings.iter().any(|w| w == "lang-provider-disabled"));
+        assert!(
+            bad.warnings
+                .iter()
+                .any(|w| w == "lang-provider-config-invalid")
+        );
     }
 
     #[test]
@@ -4102,10 +4234,12 @@ mod tests {
         let degraded = p
             .parse(b"backend=opennlp model=missing", "application/nlp-ner")
             .expect("degraded");
-        assert!(degraded
-            .warnings
-            .iter()
-            .any(|w| w == "nlp-model-missing-degraded"));
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|w| w == "nlp-model-missing-degraded")
+        );
     }
 
     #[test]
@@ -4127,10 +4261,12 @@ mod tests {
         let disabled = p
             .parse(b"service=off dependency=off", "application/ctakes")
             .expect("disabled");
-        assert!(disabled
-            .warnings
-            .iter()
-            .any(|w| w == "ctakes-dependency-disabled"));
+        assert!(
+            disabled
+                .warnings
+                .iter()
+                .any(|w| w == "ctakes-dependency-disabled")
+        );
     }
 
     #[test]
@@ -4150,16 +4286,23 @@ mod tests {
             Some("captioning")
         );
         let degraded = p
-            .parse(b"mode=recognition model=missing run=failed", "application/dl-vision")
+            .parse(
+                b"mode=recognition model=missing run=failed",
+                "application/dl-vision",
+            )
             .expect("degraded");
-        assert!(degraded
-            .warnings
-            .iter()
-            .any(|w| w == "dl-model-missing-degraded"));
-        assert!(degraded
-            .warnings
-            .iter()
-            .any(|w| w == "dl-inference-failed-degraded"));
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|w| w == "dl-model-missing-degraded")
+        );
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|w| w == "dl-inference-failed-degraded")
+        );
     }
 
     #[test]
@@ -4223,10 +4366,11 @@ mod tests {
                 .map(String::as_str),
             Some("2")
         );
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w == "json-legacy-compat-applied"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "json-legacy-compat-applied")
+        );
     }
 
     #[test]
@@ -4277,7 +4421,9 @@ mod tests {
                 mismatches.push(format!("{parser_name}: metadata key missing {key}"));
             }
             if !out.parser_chain.is_empty() {
-                mismatches.push(format!("{parser_name}: parser_chain should be empty at leaf"));
+                mismatches.push(format!(
+                    "{parser_name}: parser_chain should be empty at leaf"
+                ));
             }
         }
         assert!(
@@ -4295,10 +4441,11 @@ mod tests {
                 "application/zip",
             )
             .expect("pkg");
-        assert!(pkg
-            .warnings
-            .iter()
-            .any(|w| w == "package-path-traversal-blocked"));
+        assert!(
+            pkg.warnings
+                .iter()
+                .any(|w| w == "package-path-traversal-blocked")
+        );
 
         let xxe = XmlParser
             .parse(
@@ -4308,10 +4455,9 @@ mod tests {
             .expect("xxe");
         assert!(xxe.warnings.iter().any(|w| w == "xxe-blocked"));
 
-        let bad_pdf = PdfParser.parse(b"not-a-pdf", "application/pdf").expect("pdf");
-        assert!(bad_pdf
-            .warnings
-            .iter()
-            .any(|w| w == "pdf-invalid-header"));
+        let bad_pdf = PdfParser
+            .parse(b"not-a-pdf", "application/pdf")
+            .expect("pdf");
+        assert!(bad_pdf.warnings.iter().any(|w| w == "pdf-invalid-header"));
     }
 }
