@@ -89,6 +89,7 @@
   - 超宽框单独限流 split budget，并禁止局部 det upscale。
   - ORT 默认线程数改为更保守的 quarter-core capped-at-4 策略。
   - 基于真实样本回归分析，单独回调 `color-region-det`：放宽 followup 触发门槛，并降低超宽/大背景 ROI 的 worth-det 过滤强度，优先恢复长背景框内文本的局部二次 det 机会。
+  - 继续只优化 `color-region-det` 内部：候选改为按收益优先处理，不再被阅读顺序重排；当前面候选已经产出高收益文本时，后续低收益 det pass 提前停止。
 - 计划偏差：
   - 无。
 - 安全门禁执行结果：

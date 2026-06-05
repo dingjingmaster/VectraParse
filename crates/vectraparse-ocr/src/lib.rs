@@ -2966,12 +2966,17 @@ impl OrtOcrEngine {
         let mut skipped_redundant = 0usize;
         let mut skipped_local_det_upscale = 0usize;
         let mut no_gain_streak = 0usize;
+        let mut high_yield_hit = false;
         for (idx, b) in boxes.iter().enumerate() {
             if supplement_seen_boxes.is_redundant(*b) {
                 skipped_redundant += 1;
                 continue;
             }
             let lines_before = lines.len();
+            let chars_before = lines
+                .iter()
+                .map(|line: &TextLine| recognized_char_count(&line.text))
+                .sum::<usize>();
             let mut found_reliable = false;
             let crop = crop_box(img, *b);
             let source = format!("{source}:{}", idx + 1);
@@ -3039,6 +3044,18 @@ impl OrtOcrEngine {
                 skipped_local_det_upscale += 1;
             }
             supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
+            let lines_added = lines.len().saturating_sub(lines_before);
+            let chars_after = lines
+                .iter()
+                .map(|line: &TextLine| recognized_char_count(&line.text))
+                .sum::<usize>();
+            let chars_added = chars_after.saturating_sub(chars_before);
+            if found_reliable && (lines_added >= 3 || chars_added >= 12) {
+                high_yield_hit = true;
+            }
+            if high_yield_hit && (!found_reliable || (lines_added <= 1 && chars_added <= 4)) {
+                break;
+            }
             if lines.len() == lines_before && !found_reliable {
                 no_gain_streak = no_gain_streak.saturating_add(1);
                 if no_gain_streak >= 2 {
@@ -7365,9 +7382,20 @@ fn color_region_det_candidate_boxes(
         return (total, Vec::new());
     }
     scored = retain_top_scored_candidates(scored, max_boxes);
+    let mut score_map = HashMap::with_capacity(scored.len());
+    for (b, score) in &scored {
+        score_map.insert(*b, *score);
+    }
     let mut boxes = scored.into_iter().map(|(b, _)| b).collect::<Vec<_>>();
     boxes = dedupe_box_candidates(boxes);
-    boxes = sort_and_truncate_by(boxes, max_boxes, reading_box_order);
+    boxes = sort_and_truncate_by(boxes, max_boxes, |a, b| {
+        score_map
+            .get(b)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&score_map.get(a).copied().unwrap_or_default())
+            .then_with(|| reading_box_order(a, b))
+    });
     (total, boxes)
 }
 
