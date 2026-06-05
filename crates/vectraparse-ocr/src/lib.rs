@@ -874,7 +874,16 @@ impl OrtOcrEngine {
             &regions,
         );
 
-        if can_run_high_cost_supplement {
+        if can_run_high_cost_supplement
+            && should_use_page_region_supplement(
+                img,
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
+            )
+        {
             eprintln!(
                 "[{}] [OCR_STATS] page-regions budget=n/a remaining_rec_budget={}",
                 local_timestamp(),
@@ -1106,6 +1115,12 @@ impl OrtOcrEngine {
                 &color_before_text,
                 color_before_confidence,
                 color_before_line_count,
+            ) && should_run_color_region_det_followup(
+                &text,
+                confidence,
+                det_box_count,
+                line_count,
+                &regions,
             ) && remaining_supplement_det_budget > 0
             {
                 eprintln!(
@@ -1831,17 +1846,41 @@ impl OrtOcrEngine {
         lines: &mut Vec<TextLine>,
         repeat_split_box_count: &mut usize,
     ) {
+        let per_box_split_budget = split_line_budget_for_box(b, *split_line_rec_budget);
+        let direct_crop = crop_box(img, b);
+        let mut direct = if should_try_direct_first_for_box(b, source) {
+            let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
+            let direct_is_strong = direct
+                .as_ref()
+                .is_some_and(|candidate| candidate.confidence >= MIN_STRONG_REC_CONFIDENCE);
+            if allow_crop_enhancement
+                && !direct_is_strong
+                && *crop_enhancement_budget > 0
+                && should_enhance_crop(b)
+            {
+                *crop_enhancement_budget -= 1;
+                direct = self.best_from_crop(&direct_crop, cfg, direct.clone()).or(direct);
+            }
+            if let Some(candidate) = direct.as_ref()
+                && direct_candidate_is_good_enough_for_large_box(b, candidate)
+            {
+                lines.extend(candidate_text_lines(img, b, candidate, source, transform));
+                return;
+            }
+            direct
+        } else {
+            None
+        };
+
         let using_alternatives =
-            alternative_boxes.len() >= 2 && alternative_boxes.len() <= *split_line_rec_budget;
+            alternative_boxes.len() >= 2 && alternative_boxes.len() <= per_box_split_budget;
         let mut split_boxes = if using_alternatives {
             alternative_boxes.to_vec()
         } else {
             split_text_box_into_color_region_boxes(img, b)
         };
         let split_box_pre_dedupe = split_boxes.len();
-        if !using_alternatives
-            && (split_boxes.len() < 2 || split_boxes.len() > *split_line_rec_budget)
-        {
+        if !using_alternatives && (split_boxes.len() < 2 || split_boxes.len() > per_box_split_budget) {
             split_boxes = split_text_box_into_line_boxes(img, b);
         }
         split_boxes = dedupe_box_candidates(split_boxes);
@@ -1862,14 +1901,15 @@ impl OrtOcrEngine {
                 split_boxes.len()
             );
         }
-        if split_boxes.len() >= 2 && split_boxes.len() <= *split_line_rec_budget {
+        if split_boxes.len() >= 2 && split_boxes.len() <= per_box_split_budget {
             let split_lines =
                 self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
             let direct_for_comparison = if using_alternatives {
-                let direct_crop = crop_box(img, b);
-                self.best_from_crop_direct(&direct_crop, cfg)
+                direct
+                    .clone()
+                    .or_else(|| self.best_from_crop_direct(&direct_crop, cfg))
             } else {
-                None
+                direct.clone()
             };
             if should_use_split_lines(direct_for_comparison.as_ref(), &split_lines) {
                 *split_line_rec_budget -= split_boxes.len();
@@ -1882,7 +1922,7 @@ impl OrtOcrEngine {
             }
         }
 
-        let forced_budget = (*split_line_rec_budget)
+        let forced_budget = per_box_split_budget
             .saturating_add(*line_repair_rec_budget)
             .min(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS + MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS);
         if large_text_box_should_prioritize_split(b) && forced_budget >= 2 {
@@ -1908,8 +1948,9 @@ impl OrtOcrEngine {
             }
         }
 
-        let direct_crop = crop_box(img, b);
-        let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
+        if direct.is_none() {
+            direct = self.best_from_crop_direct(&direct_crop, cfg);
+        }
         if large_text_box_needs_structured_split(b) {
             let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
             if forced_boxes.len() >= 2 {
@@ -2924,11 +2965,13 @@ impl OrtOcrEngine {
         let mut det_pass_count = 0usize;
         let mut skipped_redundant = 0usize;
         let mut skipped_local_det_upscale = 0usize;
+        let mut no_gain_streak = 0usize;
         for (idx, b) in boxes.iter().enumerate() {
             if supplement_seen_boxes.is_redundant(*b) {
                 skipped_redundant += 1;
                 continue;
             }
+            let lines_before = lines.len();
             let mut found_reliable = false;
             let crop = crop_box(img, *b);
             let source = format!("{source}:{}", idx + 1);
@@ -2996,6 +3039,14 @@ impl OrtOcrEngine {
                 skipped_local_det_upscale += 1;
             }
             supplement_seen_boxes.insert_if_reliable(*b, found_reliable);
+            if lines.len() == lines_before && !found_reliable {
+                no_gain_streak = no_gain_streak.saturating_add(1);
+                if no_gain_streak >= 2 {
+                    break;
+                }
+            } else {
+                no_gain_streak = 0;
+            }
         }
         eprintln!(
             "[{}] [OCR_STATS] color-region-det source={} raw_candidates={} selected_candidates={} det_limit={} det_calls={} skipped_redundant={} skipped_local_upscale={}",
@@ -5847,6 +5898,9 @@ fn color_region_direct_result_stable(result: &RecognizedText, lines: &[TextLine]
 }
 
 fn should_try_local_det_upscale_for_supplement(lines: &[TextLine], box_bbox: BoxRect) -> bool {
+    if ultra_wide_text_box(box_bbox) || box_area(box_bbox) >= 180_000 {
+        return false;
+    }
     if lines.is_empty() {
         return true;
     }
@@ -7305,6 +7359,7 @@ fn color_region_det_candidate_boxes(
         .filter(|b| box_width(*b) >= 48 && box_height(*b) >= 16)
         .filter(|b| !color_region_det_box_covered_by_reliable_text(*b, existing_regions))
         .filter_map(|b| supplemental_text_candidate_score(image, b).map(|score| (b, score)))
+        .filter(|(b, score)| color_region_det_box_is_worth_detection(image, *b, *score))
         .collect::<Vec<_>>();
     if scored.is_empty() {
         return (total, Vec::new());
@@ -7353,6 +7408,28 @@ fn color_region_det_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextR
     box_height(b) <= line_like_h && box_width(b) <= line_like_w
 }
 
+fn color_region_det_box_is_worth_detection(
+    image: &DynamicImage,
+    b: BoxRect,
+    score: i64,
+) -> bool {
+    let img_box = image_box(image);
+    let img_area = box_area(img_box).max(1);
+    let area = box_area(b);
+    let width_ratio = box_width(b) as f32 / box_width(img_box).max(1) as f32;
+    let height_ratio = box_height(b) as f32 / box_height(img_box).max(1) as f32;
+    if area.saturating_mul(100) >= img_area.saturating_mul(45) && score < 260 {
+        return false;
+    }
+    if width_ratio >= 0.82 && height_ratio >= 0.16 && score < 180 {
+        return false;
+    }
+    if ultra_wide_text_box(b) && score < 120 {
+        return false;
+    }
+    true
+}
+
 fn color_region_box_covered_by_reliable_text(b: BoxRect, regions: &[OcrTextRegion]) -> bool {
     for region in regions {
         if region.lines.is_empty() {
@@ -7390,6 +7467,16 @@ fn split_line_recognition_budget(source: &str) -> usize {
     }
 }
 
+fn split_line_budget_for_box(b: BoxRect, remaining_budget: usize) -> usize {
+    if ultra_wide_text_box(b) {
+        remaining_budget.min(2)
+    } else if large_text_box_should_prioritize_split(b) {
+        remaining_budget.min(4)
+    } else {
+        remaining_budget
+    }
+}
+
 fn line_repair_recognition_budget(source: &str) -> usize {
     if source == "det" {
         MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
@@ -7402,6 +7489,49 @@ fn line_repair_recognition_budget(source: &str) -> usize {
     } else {
         0
     }
+}
+
+fn should_use_page_region_supplement(
+    img: &DynamicImage,
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    if text.trim().is_empty() || line_count == 0 {
+        return true;
+    }
+    if should_skip_followup_passes(text, confidence, det_box_count, line_count, regions) {
+        return false;
+    }
+
+    let normalized = normalize_recognized_text(text);
+    let chars = recognized_char_count(&normalized);
+    let readable = readable_ratio(&normalized);
+    let repairable = regions_have_repairable_lines(regions);
+    let (w, h) = img.dimensions();
+    let large_canvas = w >= 960 && h >= 480;
+
+    if line_count >= 12 && chars >= 80 && readable >= 0.68 {
+        return false;
+    }
+    if confidence >= 0.72 && line_count >= 8 && chars >= 48 && !repairable {
+        return false;
+    }
+    if !large_canvas && confidence >= 0.66 && line_count >= 4 && chars >= 32 && readable >= 0.64 {
+        return false;
+    }
+    if confidence < 0.50 {
+        return true;
+    }
+    if det_box_count >= 18 && line_count * 2 <= det_box_count {
+        return true;
+    }
+    if chars < 16 && det_box_count >= 6 {
+        return true;
+    }
+    repairable
 }
 
 fn should_use_high_res_tile_supplement(
@@ -7482,6 +7612,32 @@ fn should_use_uncovered_visual_supplement(
         return true;
     }
     regions_have_repairable_lines(regions)
+}
+
+fn should_run_color_region_det_followup(
+    text: &str,
+    confidence: f32,
+    det_box_count: usize,
+    line_count: usize,
+    regions: &[OcrTextRegion],
+) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    let chars = recognized_char_count(text);
+    if regions_have_repairable_lines(regions) {
+        return true;
+    }
+    if confidence >= 0.84 && chars >= 96 && line_count >= 12 {
+        return false;
+    }
+    if confidence >= 0.78 && chars >= 72 && line_count >= 10 && det_box_count <= 12 {
+        return false;
+    }
+    if det_box_count >= 28 && line_count >= 14 && chars >= 96 {
+        return false;
+    }
+    confidence < 0.62 || chars < 40 || line_count < 8 || det_box_count >= 10
 }
 
 fn should_skip_high_cost_followup_passes(
@@ -7572,6 +7728,30 @@ fn should_continue_eager_supplements(
         return true;
     }
     regions_have_repairable_lines(regions)
+}
+
+fn should_try_direct_first_for_box(b: BoxRect, source: &str) -> bool {
+    (source == "det" || source.starts_with("page-region:") || source.starts_with("color-region-det:"))
+        && (ultra_wide_text_box(b) || large_text_box_should_prioritize_split(b))
+}
+
+fn direct_candidate_is_good_enough_for_large_box(b: BoxRect, candidate: &RecCandidate) -> bool {
+    if local_recognition_candidate_is_final(candidate) {
+        return true;
+    }
+    let text = normalize_recognized_text(&candidate.text);
+    if recognized_box_needs_repair(b, &text, candidate.confidence) {
+        return false;
+    }
+    let chars = recognized_char_count(&text);
+    if chars < 8 {
+        return false;
+    }
+    let readable = readable_ratio(&text);
+    if ultra_wide_text_box(b) {
+        return candidate.confidence >= 0.72 && readable >= 0.70;
+    }
+    candidate.confidence >= 0.78 && readable >= 0.74
 }
 
 fn should_split_panel_region(recognized: &RecognizedText) -> bool {
@@ -11519,6 +11699,13 @@ fn large_text_box_needs_structured_split(b: BoxRect) -> bool {
         || (w >= 420 && h >= 72)
         || (aspect >= 12.0 && h >= 40)
         || box_area(b) >= 90_000
+}
+
+fn ultra_wide_text_box(b: BoxRect) -> bool {
+    let w = box_width(b);
+    let h = box_height(b).max(1);
+    let aspect = w as f32 / h as f32;
+    (w >= 880 && h >= 52) || (w >= 720 && aspect >= 14.0) || aspect >= 22.0
 }
 
 fn large_text_box_should_prioritize_split(b: BoxRect) -> bool {

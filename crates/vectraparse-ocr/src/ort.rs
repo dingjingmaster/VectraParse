@@ -89,7 +89,7 @@ fn char_p_to_string(ptr: *const c_char) -> String {
 
 pub(crate) fn preferred_intra_threads() -> i32 {
     let default_threads = std::thread::available_parallelism()
-        .map(|cpus| ((cpus.get() as u32).max(2) / 2).max(1))
+        .map(|cpus| ((cpus.get() as u32).saturating_add(3) / 4).clamp(1, 4))
         .unwrap_or(1);
     let requested = std::env::var("VECTRAPARSE_OCR_INTRA_THREADS")
         .ok()
