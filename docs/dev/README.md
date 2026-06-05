@@ -25,3 +25,4 @@
 | 5 | 2026-06-02 | L2 | task | [5-task-ort-static-linkage.md](5-task-ort-static-linkage.md) | 已完成 | 打通 ONNX Runtime 静态构建、项目静态归并产物和 C 消费侧链接链路，去掉对 `libonnxruntime.so` 的运行时依赖。 |
 | 6 | 2026-06-02 | L2 | task | [6-task-ocr-speed-optimization.md](6-task-ocr-speed-optimization.md) | 已完成 | 为 OCR 主链路补阶段耗时，收紧 eager supplement / fallback 触发，并减少主备识别模型重复运行。 |
 | 7 | 2026-06-02 | L2 | fix | [7-fix-ocr-region-sort-total-order.md](7-fix-ocr-region-sort-total-order.md) | 已完成 | 修复 OCR 区域排序比较器非全序导致的复杂截图运行时 panic。 |
+| 8 | 2026-06-05 | L2 | fix | [8-fix-compile-warnings.md](8-fix-compile-warnings.md) | 已完成 | 清理当前工作区 `cargo check --workspace` 暴露的编译错误与 warning，不代跑测试。 |
