@@ -90,6 +90,9 @@
   - ORT 默认线程数改为更保守的 quarter-core capped-at-4 策略。
   - 基于真实样本回归分析，单独回调 `color-region-det`：放宽 followup 触发门槛，并降低超宽/大背景 ROI 的 worth-det 过滤强度，优先恢复长背景框内文本的局部二次 det 机会。
   - 继续只优化 `color-region-det` 内部：候选改为按收益优先处理，不再被阅读顺序重排；当前面候选已经产出高收益文本时，后续低收益 det pass 提前停止。
+  - 为 `detected-text` 主链路补充大框分项耗时观测：对 `det` 来源的大框输出 `direct/split/forced-split/repair` 汇总耗时，后续再基于真实热点决定是否继续动 heuristics。
+  - 基于大框 trace 收紧 `forced-priority-split`：仅跳过“超宽框且 direct 几乎无有效信号”的高成本强拆，避免主链路在极低收益框上反复消耗 0.5s~1.6s。
+  - 对超宽框加入局部候选复用：`push_recognized_box_lines` 内部复用已算出的 `split_boxes` / `forced_boxes` / `direct_crop` 给 repair 路径，减少同一框上重复的切框与裁剪工作。
 - 计划偏差：
   - 无。
 - 安全门禁执行结果：
@@ -111,6 +114,7 @@
   - 单元测试 / 集成测试
 - 残余风险：
   - 触发门槛收紧后，少量依赖 page-region 或 color-region-det 补扫的边缘样本可能回退，需要用真实截图验证。
+  - 新增的 `det-box-timing` 诊断日志会在 `det` 来源的大框上额外输出一行 `OCR_STATS`，便于定位热点，但会略微增加日志噪声。
 
 ## 8. 总结
 

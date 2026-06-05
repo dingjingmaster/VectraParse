@@ -1846,24 +1846,55 @@ impl OrtOcrEngine {
         lines: &mut Vec<TextLine>,
         repeat_split_box_count: &mut usize,
     ) {
+        let trace_box_timing = should_log_detected_text_box_timing(source, b);
+        let mut direct_ms = 0u64;
+        let mut split_prepare_ms = 0u64;
+        let mut split_rec_ms = 0u64;
+        let mut forced_split_ms = 0u64;
+        let mut direct_retry_ms = 0u64;
+        let mut enhance_ms = 0u64;
+        let mut repair_ms = 0u64;
+        let mut split_box_count = 0usize;
+        let mut forced_box_count = 0usize;
+        let mut forced_boxes_cache: Option<Vec<BoxRect>> = None;
         let per_box_split_budget = split_line_budget_for_box(b, *split_line_rec_budget);
         let direct_crop = crop_box(img, b);
         let mut direct = if should_try_direct_first_for_box(b, source) {
+            let direct_start = Instant::now();
             let mut direct = self.best_from_crop_direct(&direct_crop, cfg);
             let direct_is_strong = direct
                 .as_ref()
                 .is_some_and(|candidate| candidate.confidence >= MIN_STRONG_REC_CONFIDENCE);
+            direct_ms = direct_ms.saturating_add(elapsed_ms(direct_start));
             if allow_crop_enhancement
                 && !direct_is_strong
                 && *crop_enhancement_budget > 0
                 && should_enhance_crop(b)
             {
                 *crop_enhancement_budget -= 1;
+                let enhance_start = Instant::now();
                 direct = self.best_from_crop(&direct_crop, cfg, direct.clone()).or(direct);
+                enhance_ms = enhance_ms.saturating_add(elapsed_ms(enhance_start));
             }
             if let Some(candidate) = direct.as_ref()
                 && direct_candidate_is_good_enough_for_large_box(b, candidate)
             {
+                log_detected_text_box_timing(
+                    trace_box_timing,
+                    source,
+                    b,
+                    "direct-first",
+                    direct_ms,
+                    split_prepare_ms,
+                    split_rec_ms,
+                    forced_split_ms,
+                    direct_retry_ms,
+                    enhance_ms,
+                    repair_ms,
+                    split_box_count,
+                    forced_box_count,
+                    Some(candidate),
+                );
                 lines.extend(candidate_text_lines(img, b, candidate, source, transform));
                 return;
             }
@@ -1874,6 +1905,7 @@ impl OrtOcrEngine {
 
         let using_alternatives =
             alternative_boxes.len() >= 2 && alternative_boxes.len() <= per_box_split_budget;
+        let split_prepare_start = Instant::now();
         let mut split_boxes = if using_alternatives {
             alternative_boxes.to_vec()
         } else {
@@ -1884,6 +1916,8 @@ impl OrtOcrEngine {
             split_boxes = split_text_box_into_line_boxes(img, b);
         }
         split_boxes = dedupe_box_candidates(split_boxes);
+        split_prepare_ms = split_prepare_ms.saturating_add(elapsed_ms(split_prepare_start));
+        split_box_count = split_boxes.len();
         let deduped_split_boxes = split_box_pre_dedupe.saturating_sub(split_boxes.len());
         *repeat_split_box_count = repeat_split_box_count.saturating_add(deduped_split_boxes);
         if deduped_split_boxes > 0 {
@@ -1902,8 +1936,10 @@ impl OrtOcrEngine {
             );
         }
         if split_boxes.len() >= 2 && split_boxes.len() <= per_box_split_budget {
+            let split_rec_start = Instant::now();
             let split_lines =
                 self.recognize_split_line_boxes(img, cfg, &split_boxes, source, transform);
+            split_rec_ms = split_rec_ms.saturating_add(elapsed_ms(split_rec_start));
             let direct_for_comparison = if using_alternatives {
                 direct
                     .clone()
@@ -1913,10 +1949,42 @@ impl OrtOcrEngine {
             };
             if should_use_split_lines(direct_for_comparison.as_ref(), &split_lines) {
                 *split_line_rec_budget -= split_boxes.len();
+                log_detected_text_box_timing(
+                    trace_box_timing,
+                    source,
+                    b,
+                    "split-lines",
+                    direct_ms,
+                    split_prepare_ms,
+                    split_rec_ms,
+                    forced_split_ms,
+                    direct_retry_ms,
+                    enhance_ms,
+                    repair_ms,
+                    split_box_count,
+                    forced_box_count,
+                    direct_for_comparison.as_ref(),
+                );
                 lines.extend(split_lines);
                 return;
             }
             if let Some(candidate) = direct_for_comparison {
+                log_detected_text_box_timing(
+                    trace_box_timing,
+                    source,
+                    b,
+                    "direct-after-split-compare",
+                    direct_ms,
+                    split_prepare_ms,
+                    split_rec_ms,
+                    forced_split_ms,
+                    direct_retry_ms,
+                    enhance_ms,
+                    repair_ms,
+                    split_box_count,
+                    forced_box_count,
+                    Some(&candidate),
+                );
                 lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
                 return;
             }
@@ -1926,9 +1994,18 @@ impl OrtOcrEngine {
             .saturating_add(*line_repair_rec_budget)
             .min(MAX_SPLIT_LINE_RECOGNITIONS_PER_PASS + MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS);
         if large_text_box_should_prioritize_split(b) && forced_budget >= 2 {
-            let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
-            if forced_boxes.len() >= 2 {
+            let forced_boxes = forced_boxes_cache.get_or_insert_with(|| {
+                forced_structural_split_boxes(img, b, forced_budget)
+            });
+            forced_box_count = forced_boxes.len();
+            if should_try_forced_split(
+                b,
+                direct.as_ref(),
+                split_box_count,
+                forced_boxes.len(),
+            ) {
                 let forced_source = format!("{source}:forced");
+                let forced_split_start = Instant::now();
                 let split_lines = self.recognize_split_line_boxes(
                     img,
                     cfg,
@@ -1936,11 +2013,28 @@ impl OrtOcrEngine {
                     &forced_source,
                     transform,
                 );
+                forced_split_ms = forced_split_ms.saturating_add(elapsed_ms(forced_split_start));
                 if structured_split_lines_are_plausible(b, &split_lines) {
                     consume_recognition_budget(
                         forced_boxes.len(),
                         split_line_rec_budget,
                         line_repair_rec_budget,
+                    );
+                    log_detected_text_box_timing(
+                        trace_box_timing,
+                        source,
+                        b,
+                        "forced-priority-split",
+                        direct_ms,
+                        split_prepare_ms,
+                        split_rec_ms,
+                        forced_split_ms,
+                        direct_retry_ms,
+                        enhance_ms,
+                        repair_ms,
+                        split_box_count,
+                        forced_box_count,
+                        direct.as_ref(),
                     );
                     lines.extend(split_lines);
                     return;
@@ -1949,12 +2043,23 @@ impl OrtOcrEngine {
         }
 
         if direct.is_none() {
+            let direct_retry_start = Instant::now();
             direct = self.best_from_crop_direct(&direct_crop, cfg);
+            direct_retry_ms = direct_retry_ms.saturating_add(elapsed_ms(direct_retry_start));
         }
         if large_text_box_needs_structured_split(b) {
-            let forced_boxes = forced_structural_split_boxes(img, b, forced_budget);
-            if forced_boxes.len() >= 2 {
+            let forced_boxes = forced_boxes_cache.get_or_insert_with(|| {
+                forced_structural_split_boxes(img, b, forced_budget)
+            });
+            forced_box_count = forced_box_count.max(forced_boxes.len());
+            if should_try_forced_split(
+                b,
+                direct.as_ref(),
+                split_box_count,
+                forced_boxes.len(),
+            ) {
                 let forced_source = format!("{source}:forced");
+                let forced_split_start = Instant::now();
                 let split_lines = self.recognize_split_line_boxes(
                     img,
                     cfg,
@@ -1962,11 +2067,28 @@ impl OrtOcrEngine {
                     &forced_source,
                     transform,
                 );
+                forced_split_ms = forced_split_ms.saturating_add(elapsed_ms(forced_split_start));
                 if should_use_forced_split_lines(b, direct.as_ref(), &split_lines) {
                     consume_recognition_budget(
                         forced_boxes.len(),
                         split_line_rec_budget,
                         line_repair_rec_budget,
+                    );
+                    log_detected_text_box_timing(
+                        trace_box_timing,
+                        source,
+                        b,
+                        "forced-structured-split",
+                        direct_ms,
+                        split_prepare_ms,
+                        split_rec_ms,
+                        forced_split_ms,
+                        direct_retry_ms,
+                        enhance_ms,
+                        repair_ms,
+                        split_box_count,
+                        forced_box_count,
+                        direct.as_ref(),
                     );
                     lines.extend(split_lines);
                     return;
@@ -1982,26 +2104,86 @@ impl OrtOcrEngine {
             && should_enhance_crop(b)
         {
             *crop_enhancement_budget -= 1;
+            let enhance_start = Instant::now();
             direct = self
                 .best_from_crop(&direct_crop, cfg, direct.clone())
                 .or(direct);
+            enhance_ms = enhance_ms.saturating_add(elapsed_ms(enhance_start));
         };
 
+        let repair_start = Instant::now();
         if let Some(repaired) = self.repair_recognized_box_lines(
             img,
             cfg,
             b,
+            &direct_crop,
             direct.as_ref(),
             source,
             transform,
             line_repair_rec_budget,
+            if split_boxes.len() >= 2 {
+                Some(split_boxes.as_slice())
+            } else {
+                forced_boxes_cache.as_deref()
+            },
         ) {
+            repair_ms = repair_ms.saturating_add(elapsed_ms(repair_start));
+            log_detected_text_box_timing(
+                trace_box_timing,
+                source,
+                b,
+                "repair",
+                direct_ms,
+                split_prepare_ms,
+                split_rec_ms,
+                forced_split_ms,
+                direct_retry_ms,
+                enhance_ms,
+                repair_ms,
+                split_box_count,
+                forced_box_count,
+                direct.as_ref(),
+            );
             lines.extend(repaired);
             return;
         }
+        repair_ms = repair_ms.saturating_add(elapsed_ms(repair_start));
 
         if let Some(candidate) = direct {
+            log_detected_text_box_timing(
+                trace_box_timing,
+                source,
+                b,
+                "direct-final",
+                direct_ms,
+                split_prepare_ms,
+                split_rec_ms,
+                forced_split_ms,
+                direct_retry_ms,
+                enhance_ms,
+                repair_ms,
+                split_box_count,
+                forced_box_count,
+                Some(&candidate),
+            );
             lines.extend(candidate_text_lines(img, b, &candidate, source, transform));
+        } else {
+            log_detected_text_box_timing(
+                trace_box_timing,
+                source,
+                b,
+                "no-result",
+                direct_ms,
+                split_prepare_ms,
+                split_rec_ms,
+                forced_split_ms,
+                direct_retry_ms,
+                enhance_ms,
+                repair_ms,
+                split_box_count,
+                forced_box_count,
+                None,
+            );
         }
     }
 
@@ -2010,10 +2192,12 @@ impl OrtOcrEngine {
         img: &DynamicImage,
         cfg: &OcrConfig,
         b: BoxRect,
+        direct_crop: &DynamicImage,
         direct: Option<&RecCandidate>,
         source: &str,
         transform: BboxTransform,
         line_repair_rec_budget: &mut usize,
+        cached_split_boxes: Option<&[BoxRect]>,
     ) -> Option<Vec<TextLine>> {
         if *line_repair_rec_budget == 0 {
             return None;
@@ -2025,7 +2209,10 @@ impl OrtOcrEngine {
             }
         }
 
-        let split_boxes = repair_split_boxes(img, b, *line_repair_rec_budget);
+        let split_boxes = cached_split_boxes
+            .filter(|boxes| boxes.len() >= 2 && boxes.len() <= *line_repair_rec_budget)
+            .map(|boxes| boxes.to_vec())
+            .unwrap_or_else(|| repair_split_boxes(img, b, *line_repair_rec_budget));
         if split_boxes.len() >= 2 {
             let split_source = format!("{source}:repair");
             let split_lines =
@@ -2049,8 +2236,7 @@ impl OrtOcrEngine {
             return Some(wide_lines);
         }
 
-        let crop = crop_box(img, b);
-        if let Some(candidate) = self.best_from_crop_local_preprocessed(&crop, cfg)
+        if let Some(candidate) = self.best_from_crop_local_preprocessed(direct_crop, cfg)
             && repair_candidate_is_better(direct, &candidate)
         {
             *line_repair_rec_budget = (*line_repair_rec_budget).saturating_sub(1);
@@ -7505,6 +7691,62 @@ fn split_line_budget_for_box(b: BoxRect, remaining_budget: usize) -> usize {
     }
 }
 
+fn should_log_detected_text_box_timing(source: &str, b: BoxRect) -> bool {
+    source == "det" && (ultra_wide_text_box(b) || large_text_box_should_prioritize_split(b))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_detected_text_box_timing(
+    enabled: bool,
+    source: &str,
+    b: BoxRect,
+    path: &str,
+    direct_ms: u64,
+    split_prepare_ms: u64,
+    split_rec_ms: u64,
+    forced_split_ms: u64,
+    direct_retry_ms: u64,
+    enhance_ms: u64,
+    repair_ms: u64,
+    split_box_count: usize,
+    forced_box_count: usize,
+    direct: Option<&RecCandidate>,
+) {
+    if !enabled {
+        return;
+    }
+    let (x0, y0, _x1, _y1) = b;
+    let (direct_conf, direct_chars) = direct
+        .map(|candidate| {
+            (
+                candidate.confidence,
+                recognized_char_count(&normalize_recognized_text(&candidate.text)),
+            )
+        })
+        .unwrap_or((0.0, 0));
+    eprintln!(
+        "[{}] [OCR_STATS] det-box-timing source={} box={}x{}@{},{} path={} direct_ms={} split_prepare_ms={} split_rec_ms={} forced_split_ms={} direct_retry_ms={} enhance_ms={} repair_ms={} split_boxes={} forced_boxes={} direct_conf={:.3} direct_chars={}",
+        local_timestamp(),
+        source,
+        box_width(b),
+        box_height(b),
+        x0,
+        y0,
+        path,
+        direct_ms,
+        split_prepare_ms,
+        split_rec_ms,
+        forced_split_ms,
+        direct_retry_ms,
+        enhance_ms,
+        repair_ms,
+        split_box_count,
+        forced_box_count,
+        direct_conf,
+        direct_chars
+    );
+}
+
 fn line_repair_recognition_budget(source: &str) -> usize {
     if source == "det" {
         MAX_LINE_REPAIR_RECOGNITIONS_PER_PASS
@@ -11743,6 +11985,37 @@ fn large_text_box_should_prioritize_split(b: BoxRect) -> bool {
     h >= 180 || box_area(b) >= 180_000 || (w >= 760 && h >= 72) || (aspect >= 18.0 && h >= 48)
 }
 
+fn should_try_forced_split(
+    bbox: BoxRect,
+    direct: Option<&RecCandidate>,
+    split_box_count: usize,
+    forced_box_count: usize,
+) -> bool {
+    if forced_box_count < 2 {
+        return false;
+    }
+    if !ultra_wide_text_box(bbox) {
+        return true;
+    }
+
+    let Some(direct) = direct else {
+        return false;
+    };
+    let direct_text = normalize_recognized_text(&direct.text);
+    let direct_chars = recognized_char_count(&direct_text);
+
+    if forced_box_count >= 3 && direct.confidence < 0.30 && direct_chars < 4 {
+        return false;
+    }
+    if forced_box_count == 2 && direct.confidence < 0.10 && direct_chars == 0 {
+        return false;
+    }
+    if split_box_count >= forced_box_count && direct.confidence < 0.24 && direct_chars <= 1 {
+        return false;
+    }
+    true
+}
+
 fn structured_split_lines_are_plausible(b: BoxRect, split_lines: &[TextLine]) -> bool {
     if split_lines.len() < 2 {
         return false;
@@ -15928,6 +16201,32 @@ mod tests {
         assert!(large_text_box_should_prioritize_split((0, 0, 900, 120)));
         assert!(large_text_box_should_prioritize_split((0, 0, 520, 420)));
         assert!(!large_text_box_should_prioritize_split((0, 0, 640, 35)));
+    }
+
+    #[test]
+    fn forced_split_skips_ultra_wide_low_signal_boxes() {
+        let weak = rec_candidate("x", 0.26, RecVariant::Primary);
+        let empty = rec_candidate("", 0.0, RecVariant::Primary);
+        let usable = rec_candidate("Alpha row", 0.44, RecVariant::Primary);
+
+        assert!(!should_try_forced_split(
+            (0, 0, 1102, 109),
+            Some(&weak),
+            3,
+            3
+        ));
+        assert!(!should_try_forced_split(
+            (0, 0, 1023, 104),
+            Some(&empty),
+            2,
+            2
+        ));
+        assert!(should_try_forced_split(
+            (0, 0, 761, 105),
+            Some(&usable),
+            3,
+            3
+        ));
     }
 
     #[test]
